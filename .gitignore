@@ -7,7 +7,11 @@ docs/
 dist/
 release/
 *.exe
-netkitd
+# ★ 只忽略根目录下编译出来的二进制。
+#   早先这里写的是裸 `netkitd`，它把 backend/cmd/netkitd/ **目录**也一起忽略了，
+#   结果推上去的仓库没有程序入口、编不出可执行文件。
+/netkitd
+/backend/netkitd
 
 # 密钥：任何情况下都不进仓库
 keys/
