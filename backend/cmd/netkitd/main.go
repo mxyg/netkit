@@ -15,11 +15,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"net.yuhox.com/netkit/internal/api"
 	"net.yuhox.com/netkit/internal/mcp"
 	"net.yuhox.com/netkit/internal/ots"
+	"net.yuhox.com/netkit/internal/state"
 	"net.yuhox.com/netkit/internal/tools"
 )
 
@@ -28,15 +30,40 @@ var Version = "dev"
 
 func main() {
 	var (
-		asMCP     = flag.Bool("mcp", false, "在 stdin/stdout 上跑 MCP 服务（给 AI 调用）")
-		addr      = flag.String("addr", "127.0.0.1:0", "HTTP API 监听地址。非回环地址必须同时给 -token")
-		token     = flag.String("token", "", "调用令牌。监听非回环地址时必填")
-		mutations = flag.Bool("mutations", false,
+		asMCP      = flag.Bool("mcp", false, "在 stdin/stdout 上跑 MCP 服务（给 AI 调用）")
+		addr       = flag.String("addr", "127.0.0.1:0", "HTTP API 监听地址。非回环地址必须同时给 -token")
+		token      = flag.String("token", "", "调用令牌。监听非回环地址时必填")
+		approveURL = flag.String("approve-url", "",
+			"批准端点（界面开的）。★ 不给 = 没有批准渠道 = 改系统的工具一律拒绝执行")
+		journalPath = flag.String("journal", "", "改动账本路径。默认放用户配置目录")
+		mutations   = flag.Bool("mutations", false,
 			"启用会改系统的工具。★ 一期不要开：改系统的工具必须等「先登记后执行、能还原」机制落地")
 	)
 	flag.Parse()
 
 	reg := ots.NewRegistry(*mutations)
+
+	// ★ 改系统的功能必须先有账本（先登记后执行、崩了能还原）。
+	//   账本开不了就**不启用** mutate —— 而不是"没账本也照改"。
+	jp := *journalPath
+	if jp == "" {
+		dir, err := os.UserConfigDir()
+		if err == nil {
+			jp = filepath.Join(dir, "yuhox-netkit", "changes.json")
+		}
+	}
+	if jp != "" {
+		if j, err := state.Open(jp); err != nil {
+			fmt.Fprintln(os.Stderr, "打不开改动账本，改系统的功能将不可用：", err)
+		} else {
+			tools.SetJournal(j)
+			tools.RestoreOnStart(slog.Default())
+		}
+	}
+	if *approveURL != "" {
+		reg.SetApprover(&api.HTTPApprover{URL: *approveURL})
+	}
+
 	tools.Register(reg)
 
 	if *asMCP {

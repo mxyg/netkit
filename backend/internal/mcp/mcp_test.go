@@ -248,8 +248,9 @@ func TestMCP层也不暴露停用的改系统工具(t *testing.T) {
 	tools.Register(reg)
 	reg.MustRegister(ots.Tool{
 		Name: "test.mutate", Class: ots.ClassMutate, Summary: "测试用的改系统工具",
-		Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
-		Invoke: func(context.Context, json.RawMessage) (any, error) { return ots.Verdict{Code: "done"}, nil },
+		Schema:   json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		Describe: func(json.RawMessage) string { return "测试用：不会真改任何东西" },
+		Invoke:   func(context.Context, json.RawMessage) (any, error) { return ots.Verdict{Code: "done"}, nil },
 	})
 	s := New(reg, "t", "t")
 	var out bytes.Buffer

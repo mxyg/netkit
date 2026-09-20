@@ -48,7 +48,8 @@ func do(t *testing.T, h http.Handler, method, path, body string) (int, map[strin
 // 一个假的改系统工具，用来测 mutate 相关的规则。
 var fakeMutate = ots.Tool{
 	Name: "test.mutate", Class: ots.ClassMutate, Summary: "测试用的改系统工具",
-	Schema: json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	Schema:   json.RawMessage(`{"type":"object","additionalProperties":false}`),
+	Describe: func(json.RawMessage) string { return "测试用：不会真改任何东西" },
 	Invoke: func(context.Context, json.RawMessage) (any, error) {
 		return ots.Verdict{Code: "done"}, nil
 	},
@@ -274,4 +275,33 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// ★★ 界面是 file:// 页面，调这套 API 属于跨源请求。没有 CORS 头，
+// 浏览器会把每一次调用都拦下来 —— 表现成「窗口开着、按钮点了没反应」，
+// 而从外面看不到任何错误。2026-09-20 就是这么漏掉的。
+func Test跨源头必须有否则界面点不动(t *testing.T) {
+	h := rig(t, false)
+
+	req := httptest.NewRequest("GET", "/tools", nil)
+	req.Header.Set("Origin", "null") // file:// 页面的 Origin 就是 null
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got == "" {
+		t.Error("没有 Access-Control-Allow-Origin —— 界面的每次调用都会被浏览器拦下")
+	}
+
+	// 预检也要过，而且必须允许 Authorization（带令牌那条路靠它）
+	pre := httptest.NewRequest("OPTIONS", "/tools/net.interfaces", nil)
+	pre.Header.Set("Origin", "null")
+	pre.Header.Set("Access-Control-Request-Method", "POST")
+	pre.Header.Set("Access-Control-Request-Headers", "content-type, authorization")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, pre)
+	if rec2.Code >= 400 {
+		t.Errorf("预检被拒：%d", rec2.Code)
+	}
+	if !strings.Contains(strings.ToLower(rec2.Header().Get("Access-Control-Allow-Headers")), "authorization") {
+		t.Error("预检没允许 Authorization —— 带令牌的调用会被挡掉")
+	}
 }

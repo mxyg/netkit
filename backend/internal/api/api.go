@@ -102,7 +102,7 @@ func (s *Server) Listen() (string, error) {
 	}
 	s.ln = ln
 	s.srv = &http.Server{
-		Handler:           s.auth(s.mux),
+		Handler:           cors(s.auth(s.mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -122,7 +122,33 @@ func (s *Server) Close() error {
 }
 
 // Handler 暴露处理器，给测试和进程内调用用（界面可以不走网络）。
-func (s *Server) Handler() http.Handler { return s.auth(s.mux) }
+func (s *Server) Handler() http.Handler { return cors(s.auth(s.mux)) }
+
+// cors 让本地界面能调这套 API。
+//
+// ★★ 为什么非有不可：Electron 的界面是 `file://` 页面，它 fetch
+//
+//	`http://127.0.0.1:端口` 属于**跨源请求**。没有这几个头，浏览器会把每一次调用
+//	都拦下来 —— 表现成"窗口开着、按钮点了没反应"，而控制台之外看不到任何错误。
+//	（2026-09-20 就是这么漏掉的：窗口起来了，就以为界面通了。）
+//
+// ★ 放开到什么程度：这套 API 默认只听回环，绑非回环必须带令牌（见 New）。
+//
+//	所以这里允许任意来源是安全的 —— 能连上这个端口的，本来就已经在这台机器上了。
+//	★ 但 `Authorization` 必须在允许的头里，否则带令牌那条路会被预检挡掉。
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", "*")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // auth 令牌校验。[OTS-11.3]
 func (s *Server) auth(next http.Handler) http.Handler {

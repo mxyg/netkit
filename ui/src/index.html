@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>昱弘网通 NetKit</title>
+<style>
+  /* ★ 现场用的工具：字要大、对比要够。笔记本屏幕 + 机房灯光下要看得清 */
+  :root{
+    --bg:#0f1115; --panel:#171a21; --line:#272b35; --fg:#e8eaf0; --muted:#8b93a7;
+    --accent:#e0a33a;            /* 昱弘曦金 */
+    --ok:#4ec98a; --warn:#e0a33a; --bad:#e8604c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:14px;padding:12px 18px;
+         border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  .tag{font-size:12px;color:var(--muted)}
+  nav{display:flex;gap:4px;padding:10px 14px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  nav button{background:transparent;border:1px solid transparent;color:var(--muted);
+             padding:7px 14px;border-radius:7px;cursor:pointer;font-size:14px}
+  nav button:hover{color:var(--fg)}
+  nav button.on{background:#20242e;color:var(--fg);border-color:var(--line)}
+  main{padding:18px 20px;max-width:1100px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin-bottom:14px}
+  .card h2{margin:0 0 4px;font-size:15px}
+  .hint{color:var(--muted);font-size:13px;margin:0 0 12px}
+  button.go{background:var(--accent);border:0;color:#1a1200;padding:9px 18px;
+            border-radius:7px;cursor:pointer;font-size:14px;font-weight:600}
+  button.go:disabled{opacity:.45;cursor:default}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);
+               padding:8px 14px;border-radius:7px;cursor:pointer}
+  button.danger{background:transparent;border:1px solid var(--bad);color:var(--bad)}
+  label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+  input,select{background:#0c0e13;border:1px solid var(--line);color:var(--fg);
+               padding:8px 10px;border-radius:6px;font-size:14px;width:100%}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row>div{flex:1;min-width:150px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;color:var(--muted);font-weight:500;font-size:12px;
+     padding:8px 10px;border-bottom:1px solid var(--line)}
+  td{padding:9px 10px;border-bottom:1px solid #1d2028}
+  tr.fresh td{background:#1d2a20}   /* ★ 新接入的设备高亮 */
+  code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+  .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px}
+  .pill.ok{background:#12301f;color:var(--ok)}
+  .pill.warn{background:#312712;color:var(--warn)}
+  .pill.bad{background:#331a16;color:var(--bad)}
+  .out{background:#0c0e13;border:1px solid var(--line);border-radius:8px;
+       padding:12px;white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;
+       font-size:12.5px;color:var(--muted);max-height:320px;overflow:auto}
+  .empty{color:var(--muted);padding:16px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>昱弘网通 <span class="tag">Yuhox NetKit</span></h1>
+  <span class="tag" id="conn">连接中…</span>
+</header>
+<nav id="nav"></nav>
+<main id="main"></main>
+<script src="app.js"></script>
+</body>
+</html>

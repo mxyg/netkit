@@ -17,3 +17,7 @@ release/
 keys/
 *.key
 *.pem
+
+# 界面依赖与构建产物
+ui/node_modules/
+ui/build/yuhox-kit/

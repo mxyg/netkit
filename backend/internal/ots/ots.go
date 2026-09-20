@@ -174,6 +174,26 @@ type Tool struct {
 	// Invoke 执行。args 是原始 JSON，由工具自己解。
 	// 返回值会被 JSON 序列化；返回 error 时应当是 *ots.Error。
 	Invoke func(ctx context.Context, args json.RawMessage) (any, error)
+	// Describe 把这一次调用要改什么说成一句人话，给批准框用。
+	//
+	// ★ [OTS-7.2] 批准请求必须说明将要作出的更改。mutate 工具必须实现它 ——
+	//   弹一个只写着"是否允许执行 net.dhcp.serve"的框，等于没说，
+	//   人点同意时并不知道自己同意了什么。
+	Describe func(args json.RawMessage) string
+}
+
+// Approver 向操作者要一次批准。
+//
+// ★★ [OTS-7.1] [OTS-7.3]：**授权只能来自人的动作，不能来自调用参数。**
+//
+//	what 是给人看的那句话（必须说清楚要改什么，[OTS-7.2]）。
+//	返回 true 表示人点了同意。
+//
+// ★ 界面会实现它（弹一个框）。没有实现时 = 没有批准渠道，
+//
+//	改系统的工具一律拒绝执行 —— **不是默认放行**。
+type Approver interface {
+	Approve(ctx context.Context, tool, what string, args json.RawMessage) (bool, error)
 }
 
 // Registry 工具注册表。
@@ -184,6 +204,15 @@ type Registry struct {
 	// ★ [OTS-4.4] 实现必须能在全部 mutate 停用的情况下继续提供全部 read。
 	//   所以这是个总开关，而不是「注册时决定」。
 	mutations bool
+	// approver 批准渠道。★ 为空 = 没有渠道 = 改系统的工具一律拒绝。
+	approver Approver
+}
+
+// SetApprover 装上批准渠道（界面启动时调）。
+func (r *Registry) SetApprover(a Approver) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.approver = a
 }
 
 // NewRegistry 建一个注册表。mutations=false 时 mutate 工具一律不对外提供。
@@ -210,6 +239,10 @@ func (r *Registry) Register(t Tool) error {
 	if t.Summary == "" {
 		// 工具描述就是给 AI 的说明书。没有描述的工具，AI 选不准。
 		return fmt.Errorf("工具 %s 没有说明 —— 说明是给调用方看的选择依据，不是可选项", t.Name)
+	}
+	if t.Class == ClassMutate && t.Describe == nil {
+		return fmt.Errorf("改系统的工具 %s 没有 Describe —— "+
+			"批准框里要显示「这一次具体要改什么」，缺了它，人点同意时并不知道同意了什么", t.Name)
 	}
 	if len(t.Schema) == 0 {
 		return fmt.Errorf("工具 %s 没有入参 schema —— 调用方只能靠它知道怎么调，"+
@@ -284,6 +317,26 @@ func (r *Registry) Invoke(ctx context.Context, name string, args json.RawMessage
 	if !ok {
 		return nil, Errf(ErrInvalidArgument, "没有叫 %s 的工具", name)
 	}
+	// ★★ [OTS-7.1] 改系统之前必须拿到**人**的批准。
+	//   [OTS-7.3] 调用方传什么都不算数 —— 这里根本不看 args 里有没有
+	//   user_approved/confirmed/force 之类的字段。
+	if t.Class == ClassMutate {
+		r.mu.RLock()
+		ap := r.approver
+		r.mu.RUnlock()
+		if ap == nil {
+			return nil, Errf(ErrApprovalRequired,
+				"%s 会改这台机器的配置，需要有人在界面上确认；而当前没有可用的批准渠道（界面没连上）", t.Name)
+		}
+		ok, err := ap.Approve(ctx, t.Name, t.Describe(args), args)
+		if err != nil {
+			return nil, Errf(ErrInternal, "要批准时出错：%s", err)
+		}
+		if !ok {
+			return nil, Errf(ErrApprovalDenied, "操作者拒绝了这次改动")
+		}
+	}
+
 	out, err := t.Invoke(ctx, args)
 	if err != nil {
 		return nil, AsError(err)

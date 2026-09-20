@@ -1,0 +1,103 @@
+{
+  "name": "yuhox-netkit-ui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "昱弘网通 NetKit",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack:mac": "electron-builder --mac",
+    "pack:win": "electron-builder --win",
+    "pack:linux": "electron-builder --linux"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.yuhox.netkit",
+    "productName": "昱弘网通",
+    "extraMetadata": {
+      "//": "★ Windows 安装目录用这个名字。不设的话会是 yuhox-netkit-ui（包名），客户看到一个古怪的目录",
+      "name": "YuhoxNetKit"
+    },
+    "copyright": "Copyright © 2026 辽宁昱弘智能科技有限公司",
+    "directories": {
+      "//": "★ 图标与向导图一律来自 08-品牌资产 的下发（部署子项目标识.py），不许在这里手改",
+      "buildResources": "assets",
+      "output": "../dist/installer"
+    },
+    "files": [
+      "src/**/*",
+      "assets/icon.png"
+    ],
+    "extraResources": [
+      {
+        "//": "★ Go 后端跟着装。按平台放对应那一份 —— 装错架构的包表现成「装上了打不开」",
+        "from": "../dist/release/${os}-${arch}",
+        "to": ".",
+        "filter": [
+          "netkitd*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ]
+    },
+    "win": {
+      "//": "★★ 主线包只给 Win10+。Win7 另出一份，见下面 win7 的说明",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "linux": {
+      "//": "Linux 按老板 2026-09-14 定的：不进桶不登记，客户要时单独发",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "Network"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": true,
+      "//": "★ include 的是统一件所在的那份脚本：安装日志、E3xx 错误码、分步提示、Win7 分包检查都在里面",
+      "include": "build/installer.nsh",
+      "installerIcon": "assets/installerIcon.ico",
+      "uninstallerIcon": "assets/uninstallerIcon.ico",
+      "installerHeader": "assets/installerHeader.bmp",
+      "installerSidebar": "assets/installerSidebar.bmp",
+      "uninstallerSidebar": "assets/uninstallerSidebar.bmp"
+    }
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  }
+}
