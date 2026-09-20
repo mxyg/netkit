@@ -30,10 +30,13 @@ function backendPath() {
  * 拉起后端并等它报出监听地址。
  *
  * ★ 后端把地址打在 stderr 的启动日志里（stdout 留给 MCP 协议，见 cmd/netkitd）。
+ * ★ approvePort：批准渠道的地址要**在启动参数里**交给后端 ——
+ *   不给 -approve-url = 后端没有批准渠道 = 改系统的工具一律拒绝（不是默认放行）。
  */
-function startBackend() {
+function startBackend(approvePort) {
   return new Promise((resolve, reject) => {
-    const child = spawn(backendPath(), ['-addr', '127.0.0.1:0', '-mutations'], {
+    const child = spawn(backendPath(), ['-addr', '127.0.0.1:0', '-mutations',
+      '-approve-url', `http://127.0.0.1:${approvePort}/approve`], {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let buf = '';
@@ -71,39 +74,44 @@ async function createWindow() {
  * 所以这段代码只做一件事：把后端给的那句话原样弹给人看，把人的选择原样回去。
  * **不许在这里替人做任何判断**（比如"这个看起来没风险就自动同意"）。
  */
-function serveApproval(port) {
-  const srv = http.createServer((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/approve') {
-      res.writeHead(404).end();
-      return;
-    }
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', async () => {
-      let ask = {};
-      try { ask = JSON.parse(body); } catch { /* 下面按空的处理 */ }
-      const r = await dialog.showMessageBox(win, {
-        type: 'warning',
-        buttons: ['取消', '确认执行'],
-        defaultId: 0,          // ★ 默认停在"取消"：回车不该等于同意
-        cancelId: 0,
-        title: '这个操作会改动这台机器',
-        message: ask.tool || '改动确认',
-        detail: (ask.what || '(没有说明要改什么)') +
-          '\n\n请求来自：' + (ask.caller || '未知') +
-          '\n\n确认后会立刻执行，改动会被记录，可以还原。',
+function serveApproval() {
+  return new Promise((resolve) => {
+    const srv = http.createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== '/approve') {
+        res.writeHead(404).end();
+        return;
+      }
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', async () => {
+        let ask = {};
+        try { ask = JSON.parse(body); } catch { /* 下面按空的处理 */ }
+        const opts = {
+          type: 'warning',
+          buttons: ['取消', '确认执行'],
+          defaultId: 0,          // ★ 默认停在"取消"：回车不该等于同意
+          cancelId: 0,
+          title: '这个操作会改动机器',
+          message: ask.tool || '改动确认',
+          detail: (ask.what || '(没有说明要改什么)') +
+            '\n\n请求来自：' + (ask.caller || '未知') +
+            '\n\n确认后会立刻执行，改动会被记录，可以还原。',
+        };
+        const r = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ approved: r.response === 1 }));
       });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ approved: r.response === 1 }));
     });
+    // 端口 0 = 让系统挑一个，免得和机器上别的东西撞
+    srv.listen(0, '127.0.0.1', () => resolve(srv));
   });
-  srv.listen(port, '127.0.0.1');
-  return srv;
 }
 
 app.whenReady().then(async () => {
+  // ★ 先开批准渠道再拉后端：后端要拿着它的地址启动
+  const approval = await serveApproval();
   try {
-    const r = await startBackend();
+    const r = await startBackend(approval.address().port);
     backend = r.child;
     apiBase = r.base;
   } catch (e) {

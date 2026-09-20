@@ -42,6 +42,7 @@ const PAGES = [
   { id: 'dhcp', name: '开启路由（DHCP）', render: renderDHCP },
   { id: 'probe', name: '连通性', render: renderProbe },
   { id: 'stream', name: '视频流', render: renderStream },
+  { id: 'remote', name: '远程', render: renderRemote },
 ];
 
 let current = 'nic';
@@ -340,6 +341,283 @@ async function renderStream(root) {
     const r = await call('media.rtsp.probe', { url: card.querySelector('#u').value });
     o.textContent = r.ok ? `${r.note}\n\n${JSON.stringify(r.values, null, 2)}` : r.message;
   };
+}
+
+// ── 远程 ──
+//
+// ★ 设备登记、执行命令、传文件、弹消息、开桌面，背后全是同一批工具 ——
+//   改系统的操作由后端走批准渠道弹框，UI 不替人做判断。
+// ★★ 「对方可见」关成静默时，UI 当场再弹一次责任确认（docs/设计.md 安全第 3 条），
+//   这句话必须出现在人点下去之前，不能只藏在后端返回里。
+
+let remoteSel = null;
+
+async function renderRemote(root) {
+  const r = await call('remote.device.list');
+  if (!r.ok) { root.appendChild($(`<div class="card">远程功能不可用：${esc(r.message)}</div>`)); return; }
+  const devices = r.values.devices || [];
+  root.appendChild(notifyCard(r.values.notifyTarget !== false));
+  root.appendChild(deviceTable(devices));
+  root.appendChild(addDeviceCard());
+  const sel = devices.find((d) => d.id === remoteSel);
+  if (sel) root.appendChild(remoteOps(sel));
+  root.appendChild(auditCard());
+}
+
+function notifyCard(on) {
+  const card = $(`<div class="card">
+    <h2>对方可见 <span class="pill ${on ? 'ok' : 'bad'}">${on ? '开（默认）' : '静默'}</span></h2>
+    <p class="hint">开着时，远程连接 / 控制 / 连桌面会先在目标机屏幕上提示一声（带「来自 NetKit·谁」的标识）。
+      审计日志不受这个开关影响，怎么设都照记。</p>
+    <button class="btn ${on ? 'danger' : 'primary'}" id="tog">${on ? '关闭（进入静默）' : '打开'}</button>
+  </div>`);
+  card.querySelector('#tog').onclick = async () => {
+    if (on) {
+      // ★ 关静默 = 要被记住的选择：当场弹一次，写明责任归属，人点了才发
+      const ok = await confirmModal(
+        '关闭「对方可见」，进入静默模式？',
+        ['之后远程连接 / 控制这台设备时，<b>目标机屏幕前的人将不会收到任何提示</b>。',
+         '请确认场景是无人值守（服务器、机柜一体机、数字标牌）。',
+         '<b>由购买方负责在其组织内合规使用并履行告知义务。</b>',
+         '审计日志不受影响，照记；这次选择本身也会进审计。'],
+        '我已了解，确认关闭');
+      if (!ok) return;
+    }
+    const r = await call('remote.config.set', { notifyTarget: !on });
+    if (!r.ok) { alert('改不了：' + r.message); return; }
+    show();
+  };
+  return card;
+}
+
+/** 自己画的确认框：责任那段话必须完整摆出来，不用 confirm()（放不下也不体面）。 */
+function confirmModal(title, htmlLines, okText) {
+  return new Promise((resolve) => {
+    const ov = $(`<div class="modal-ov"><div class="modal">
+      <h2>${esc(title)}</h2>
+      ${htmlLines.map((l) => `<p class="hint">${l}</p>`).join('')}
+      <div style="display:flex;gap:10px;margin-top:14px;justify-content:flex-end">
+        <button class="btn" id="no">取消</button>
+        <button class="btn danger" id="yes">${esc(okText)}</button>
+      </div></div></div>`);
+    document.body.appendChild(ov);
+    const done = (v) => { ov.remove(); resolve(v); };
+    ov.querySelector('#no').onclick = () => done(false);
+    ov.querySelector('#yes').onclick = () => done(true);
+    ov.onclick = (e) => { if (e.target === ov) done(false); };
+  });
+}
+
+const OS_LABEL = { windows: 'Windows', linux: 'Linux', darwin: 'macOS' };
+
+function deviceTable(devices) {
+  const card = $(`<div class="card">
+    <h2>登记的设备 <span class="pill">${devices.length}</span></h2>
+    <p class="hint">凭据只落盘在本机 0600 的文件里，不出现在这里、也不进日志。点「操作」展开命令行 / 传文件 / 弹消息 / 开桌面。</p>
+    <div id="box"></div>
+  </div>`);
+  const box = card.querySelector('#box');
+  if (!devices.length) {
+    box.innerHTML = '<div class="empty">还没有登记设备。在下面填地址和账号加一台，SSH 通了就能诊断、传文件、开桌面。</div>';
+    return card;
+  }
+  const row = (d) => {
+    const host = d.identity && d.identity.hostname ? ` <span class="dim">（${esc(d.identity.hostname)}）</span>` : '';
+    const seen = d.lastSeen ? new Date(d.lastSeen).toLocaleString() : '还没连过';
+    return `<tr>
+      <td><b>${esc(d.name || d.id)}</b>${d.name ? `<br><code class="dim">${esc(d.id)}</code>` : ''}${host}</td>
+      <td>${esc(OS_LABEL[d.os] || '未知')}</td>
+      <td class="dim">${esc(d.auth || '')}${d.hostKeyKnown ? '' : '<br><span class="dim">主机密钥未记录</span>'}</td>
+      <td class="dim">${esc(seen)}</td>
+      <td style="white-space:nowrap">
+        <button class="btn primary" data-act="sel" data-id="${esc(d.id)}">${d.id === remoteSel ? '收起' : '操作'}</button>
+        <button class="btn" data-act="probe" data-id="${esc(d.id)}">探测</button>
+        <button class="btn danger" data-act="rm" data-id="${esc(d.id)}">删除</button>
+      </td></tr>`;
+  };
+  box.innerHTML = `<table><tr><th>设备</th><th>系统</th><th>认证</th><th>最近探测</th><th></th></tr>
+    ${devices.map(row).join('')}</table>`;
+  box.querySelectorAll('button[data-act]').forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.id;
+      if (b.dataset.act === 'sel') { remoteSel = remoteSel === id ? null : id; show(); return; }
+      if (b.dataset.act === 'rm') {
+        if (!confirm(`把 ${id} 从登记簿删掉（连同存的凭据）？`)) return;
+        await call('remote.device.remove', { device: id });
+        if (remoteSel === id) remoteSel = null;
+        show(); return;
+      }
+      b.disabled = true; b.textContent = '连接中…';
+      const r = await call('remote.device.probe', { device: id });
+      alert(r.ok ? r.note : '探测失败：' + r.message);
+      show();
+    };
+  });
+  return card;
+}
+
+function addDeviceCard() {
+  const card = $(`<div class="card">
+    <h2>登记一台设备</h2>
+    <p class="hint">走 SSH。能用私钥就别用口令；不确定账号名就先猜一个，连不上时探测会把线索报回来。</p>
+    <div class="row">
+      <div><label>地址 *</label><input id="host" placeholder="192.168.3.82 或 fe80::1%en0"></div>
+      <div style="max-width:110px"><label>端口</label><input id="port" placeholder="22"></div>
+      <div><label>账号 *</label><input id="user" placeholder="administrator / root / pc"></div>
+      <div><label>备注名</label><input id="name" placeholder="收银台那台"></div>
+    </div>
+    <div class="row">
+      <div><label>口令</label><input id="pw" type="password" placeholder="和私钥二选一"></div>
+      <div><label>私钥路径（本机）</label><input id="key" placeholder="/Users/me/.ssh/id_ed25519"></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn primary" id="add">登记并探测</button></div>
+    <div class="out" id="o" style="display:none;margin-top:10px"></div>
+  </div>`);
+  const g = (s) => card.querySelector(s).value.trim();
+  card.querySelector('#add').onclick = async () => {
+    const o = card.querySelector('#o');
+    const say = (s) => { o.style.display = 'block'; o.textContent = s; };
+    if (!g('#host') || !g('#user')) { say('地址和账号是必填的'); return; }
+    if (!g('#pw') && !g('#key')) { say('口令和私钥至少给一个 —— 没凭据连不上'); return; }
+    const args = { host: g('#host'), user: g('#user'), name: g('#name') || undefined,
+      password: g('#pw') || undefined, keyPath: g('#key') || undefined };
+    if (g('#port')) args.port = Number(g('#port'));
+    const r = await call('remote.device.add', args);
+    if (!r.ok) { say('登记失败：' + r.message); return; }
+    say('已登记，正在连接探测…');
+    const id = r.values.id;
+    const p = await call('remote.device.probe', { device: id });
+    say(p.ok ? p.note : '登记成功，但探测失败：' + p.message);
+    remoteSel = id;
+    setTimeout(show, 1200);
+  };
+  return card;
+}
+
+function remoteOps(d) {
+  const card = $(`<div class="card">
+    <h2>操作 <code>${esc(d.id)}</code> <span class="dim">${esc(OS_LABEL[d.os] || '系统未知，先探测')}</span></h2>
+    <p class="hint">下面每一项改系统的操作都会先弹框确认，且全程记入审计。</p>
+
+    <label>执行命令（远程诊断主力：看资源、抓日志、重启服务）</label>
+    <div style="display:flex;gap:8px">
+      <input id="cmd" placeholder="${d.os === 'windows' ? 'ipconfig /all' : 'systemctl status nginx'}">
+      <button class="btn primary" id="bcmd">执行</button>
+      <button class="btn" id="bsess">看会话</button>
+    </div>
+    <div class="out" id="ocmd" style="display:none;margin-top:8px"></div>
+
+    <label>给屏幕发消息（自动带发送方标识）</label>
+    <div style="display:flex;gap:8px">
+      <input id="msg" placeholder="如：10 分钟后重启收银系统，请保存工作">
+      <button class="btn" id="bmsg">发送</button>
+    </div>
+    <div class="out" id="omsg" style="display:none;margin-top:8px"></div>
+
+    <label>传文件（断点续传 + 整包 SHA256 复核）</label>
+    <div class="row">
+      <div><label>本机路径</label><input id="flocal" placeholder="/Users/me/升级包.bin"></div>
+      <div><label>设备路径</label><input id="fremote" placeholder="${d.os === 'windows' ? 'C:\\\\tmp\\\\升级包.bin' : '/tmp/升级包.bin'}"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn" id="bpush">推到设备 ↑</button>
+      <button class="btn" id="bpull">拉回本机 ↓</button>
+    </div>
+    <div class="out" id="ofile" style="display:none;margin-top:8px"></div>
+
+    <label>远程桌面</label>
+    <div style="display:flex;gap:8px">
+      <button class="btn" id="bdq">查状态</button>
+      <button class="btn primary" id="bdo">打通并连接${d.os === 'windows' ? '（RDP 没开会替它开）' : ''}</button>
+    </div>
+    <div class="out" id="odesk" style="display:none;margin-top:8px"></div>
+  </div>`);
+  const out = (id, s) => { const o = card.querySelector(id); o.style.display = 'block'; o.textContent = s; };
+  const busy = async (btn, fn) => {
+    const b = card.querySelector(btn); const t = b.textContent;
+    b.disabled = true; b.textContent = '进行中…';
+    try { await fn(); } finally { b.disabled = false; b.textContent = t; }
+  };
+
+  card.querySelector('#bcmd').onclick = () => busy('#bcmd', async () => {
+    const cmd = card.querySelector('#cmd').value.trim();
+    if (!cmd) return;
+    out('#ocmd', '执行中…（等待批准）');
+    const r = await call('remote.exec', { device: d.id, command: cmd });
+    if (!r.ok) { out('#ocmd', '执行失败：' + r.message); return; }
+    const v = r.values;
+    out('#ocmd', `退出码 ${v.exitCode} · ${v.seconds.toFixed(1)} 秒\n── 输出 ──\n${v.stdout || '(空)'}${v.stderr ? '\n── 错误 ──\n' + v.stderr : ''}`);
+  });
+
+  card.querySelector('#bsess').onclick = () => busy('#bsess', async () => {
+    const r = await call('remote.sessions', { device: d.id });
+    if (!r.ok) { out('#ocmd', '查会话失败：' + r.message); return; }
+    const ss = r.values.sessions || [];
+    out('#ocmd', ss.length ? ss.map((s) =>
+      `#${s.id}  ${s.state}${s.active ? '（有人）' : ''}${s.current ? ' ← SSH 落在这' : ''}  ${s.name}  ${s.user || ''}`).join('\n')
+      : '这台机器上没有登录会话');
+  });
+
+  card.querySelector('#bmsg').onclick = () => busy('#bmsg', async () => {
+    const text = card.querySelector('#msg').value.trim();
+    if (!text) return;
+    const r = await call('remote.msg.send', { device: d.id, text });
+    const LABEL = { sent: '✓ 已发到对方屏幕', 'sent-unconfirmed': '△ 发了，但不保证对方看得见', 'no-session': '✗ 屏幕前没人', 'send-failed': '✗ 发不出去' };
+    out('#omsg', r.ok ? `${LABEL[r.verdict] || r.verdict}\n${r.note}` : '失败：' + r.message);
+  });
+
+  const transfer = (tool, args) => busy(tool === 'remote.file.push' ? '#bpush' : '#bpull', async () => {
+    out('#ofile', '传输中…（等待批准；大文件要一会儿，断了再点一次会续传）');
+    const r = await call(tool, args);
+    out('#ofile', r.ok ? r.note : '失败：' + r.message);
+  });
+  card.querySelector('#bpush').onclick = () => {
+    const l = card.querySelector('#flocal').value.trim(), rm = card.querySelector('#fremote').value.trim();
+    if (!l || !rm) { out('#ofile', '两个路径都要填'); return; }
+    transfer('remote.file.push', { device: d.id, local: l, remote: rm });
+  };
+  card.querySelector('#bpull').onclick = () => {
+    const l = card.querySelector('#flocal').value.trim(), rm = card.querySelector('#fremote').value.trim();
+    if (!l || !rm) { out('#ofile', '两个路径都要填'); return; }
+    transfer('remote.file.pull', { device: d.id, local: l, remote: rm });
+  };
+
+  card.querySelector('#bdq').onclick = () => busy('#bdq', async () => {
+    const r = await call('remote.desktop.open', { device: d.id });
+    out('#odesk', r.ok ? `${r.note}\n判定：${r.verdict}` : '失败：' + r.message);
+  });
+  card.querySelector('#bdo').onclick = () => busy('#bdo', async () => {
+    out('#odesk', '打通中…（等待批准；Windows 目标 RDP 没开时会改对端注册表和防火墙）');
+    const r = await call('remote.desktop.open', { device: d.id, enable: true });
+    out('#odesk', r.ok ? `${r.note}\n判定：${r.verdict}` : '失败：' + r.message);
+  });
+  return card;
+}
+
+function auditCard() {
+  const card = $(`<div class="card">
+    <h2>审计日志</h2>
+    <p class="hint">谁、何时、对哪台、做了什么、结果如何。静默模式只关屏幕提示，不关这里的留痕。</p>
+    <button class="btn" id="load">取最近 50 条</button>
+    <div id="box" style="margin-top:10px"></div>
+  </div>`);
+  card.querySelector('#load').onclick = async () => {
+    const box = card.querySelector('#box');
+    const r = await call('remote.audit.tail', { n: 50 });
+    if (!r.ok) { box.innerHTML = `<div class="empty">${esc(r.message)}</div>`; return; }
+    const es = (r.values.entries || []).slice().reverse();
+    if (!es.length) { box.innerHTML = '<div class="empty">还没有记录</div>'; return; }
+    box.innerHTML = `<table><tr><th>时间</th><th>谁</th><th>动作</th><th>对哪台</th><th>细节</th><th>结果</th></tr>
+      ${es.map((e) => `<tr>
+        <td class="dim" style="white-space:nowrap">${esc(new Date(e.at).toLocaleString())}</td>
+        <td class="dim">${esc(e.actor || '')}</td>
+        <td><code>${esc(e.action || '')}</code></td>
+        <td>${esc(e.target || '')}</td>
+        <td class="dim">${esc(e.detail || '')}</td>
+        <td class="${String(e.result).startsWith('failed') || e.result === 'send-failed' ? 'bad' : 'dim'}">${esc(e.result || '')}</td>
+      </tr>`).join('')}</table>`;
+  };
+  return card;
 }
 
 // ── 起步 ──

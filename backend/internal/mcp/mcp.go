@@ -251,7 +251,7 @@ func (s *Server) toolsCall(ctx context.Context, params json.RawMessage) (any, *r
 		return nil, &rpcError{Code: codeInvalidParams, Message: "没给工具名"}
 	}
 
-	out, oerr := s.reg.Invoke(ctx, p.Name, p.Arguments)
+	out, oerr := s.reg.Invoke(ots.WithCaller(ctx, "mcp"), p.Name, p.Arguments)
 	if oerr != nil {
 		// ★ 工具执行失败走 isError 的结果，不走 JSON-RPC 错误 ——
 		//   这是 MCP 刻意的设计：让模型能看见失败内容并自己调整，

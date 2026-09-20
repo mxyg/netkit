@@ -24,6 +24,7 @@ import (
 func Register(r *ots.Registry) {
 	r.MustRegister(interfacesTool, tcpProbeTool, pingTool, rtspProbeTool, neighborsTool, discoverTool)
 	RegisterDHCP(r)
+	RegisterRemote(r)
 }
 
 // ── net.interfaces ──

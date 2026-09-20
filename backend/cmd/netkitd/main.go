@@ -21,6 +21,7 @@ import (
 	"net.yuhox.com/netkit/internal/api"
 	"net.yuhox.com/netkit/internal/mcp"
 	"net.yuhox.com/netkit/internal/ots"
+	"net.yuhox.com/netkit/internal/remote"
 	"net.yuhox.com/netkit/internal/state"
 	"net.yuhox.com/netkit/internal/tools"
 )
@@ -58,6 +59,14 @@ func main() {
 		} else {
 			tools.SetJournal(j)
 			tools.RestoreOnStart(slog.Default())
+		}
+	}
+	// 远程功能的数据目录：设备登记（0600，含凭据）、配置、审计。
+	if dir, err := remote.DefaultDir(); err == nil {
+		if m, err := remote.Open(dir); err != nil {
+			fmt.Fprintln(os.Stderr, "打不开远程数据目录，远程功能将不可用：", err)
+		} else {
+			tools.SetRemote(m)
 		}
 	}
 	if *approveURL != "" {

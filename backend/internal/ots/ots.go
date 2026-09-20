@@ -349,6 +349,25 @@ func (r *Registry) Invoke(ctx context.Context, name string, args json.RawMessage
 	return out, nil
 }
 
+// ── 调用方标识 ──
+//
+// 审计要记「谁调的」，但工具的 Invoke 只拿得到 ctx 和参数 ——
+// ★ 参数里的自称不算数（[OTS-7.3] 的同一条精神），调用方身份只能由
+// **传输层**（HTTP API / MCP）在进工具之前塞进 ctx。
+
+type callerKey struct{}
+
+// WithCaller 在 ctx 里记下调用方。由传输层调用，工具层只读。
+func WithCaller(ctx context.Context, who string) context.Context {
+	return context.WithValue(ctx, callerKey{}, who)
+}
+
+// CallerFrom 取调用方标识。没记就是空串。
+func CallerFrom(ctx context.Context) string {
+	v, _ := ctx.Value(callerKey{}).(string)
+	return v
+}
+
 // ValidErrorCode 报告是不是规范定义的错误码。集合封闭。[OTS 第 10.2 节]
 func ValidErrorCode(c ErrorCode) bool { return errorCodes[c] }
 

@@ -207,7 +207,10 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	out, oerr := s.reg.Invoke(r.Context(), name, body)
+	// ★ 审计用的调用方身份在这里注入，不由工具自己去猜 ——
+	//   参数里自称的身份不算数（同 [OTS-7.3]）。
+	ctx := ots.WithCaller(r.Context(), "http:"+r.RemoteAddr)
+	out, oerr := s.reg.Invoke(ctx, name, body)
 
 	// [OTS-11.4] 每一次调用都留痕：谁调的、调了什么、结果如何。
 	lg := s.log.With("tool", name, "caller", r.RemoteAddr, "ms", time.Since(start).Milliseconds())

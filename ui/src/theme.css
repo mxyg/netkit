@@ -214,3 +214,15 @@ code { font-family: ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace; f
 td.dim { color: var(--muted); }
 /* 不带状态的计数片 */
 .pill { background: var(--sunken); color: var(--muted); border-color: var(--line); }
+.dim { color: var(--muted); }
+/* 审计表里的失败结果：告警红，不是品牌金 */
+td.bad { color: var(--red-text); }
+
+/* ── 确认弹框：责任那段话要完整摆出来，native confirm() 放不下 ── */
+
+.modal-ov { position: fixed; inset: 0; background: rgba(6, 12, 22, .55);
+            display: flex; align-items: center; justify-content: center; z-index: 50; }
+.modal { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+         padding: 18px 20px; max-width: 480px; box-shadow: var(--shadow); }
+.modal h2 { margin: 0 0 8px; font-size: 15px; }
+.modal .hint { margin: 6px 0; }
