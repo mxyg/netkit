@@ -40,6 +40,15 @@ type NIC struct {
 	Loop    bool   `json:"loopback"` //
 	Virtual bool   `json:"virtual"`  // 容器 / 虚拟机 / VPN 建的
 
+	// Kind 这块网卡是什么介质：wifi / ethernet / usb-lan / cellular /
+	// bluetooth / thunderbolt / virtual / loopback，见 media.go。
+	//
+	// ★ KindSrc 说明这个结论**从哪来**：os = 问系统问到的，name = 按名字猜的。
+	//   界面靠它决定要不要加「可能是」。现场是照着这一列去插线的，
+	//   把猜测当事实报出去，比不报还糟。
+	Kind    string `json:"kind"`
+	KindSrc string `json:"kindSrc"`
+
 	Addrs []netaddr.Addr `json:"addrs"` // 全部地址，v4 v6 混在一起，按有用程度排序
 
 	// Verdict 是这块网卡处于什么状态的**结构化判定**，不是一句话。
@@ -134,6 +143,9 @@ func Interfaces() ([]NIC, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取本机网卡失败: %w", err)
 	}
+	// ★ 整机问一次。macOS/Windows 上这一步要起子进程，
+	//   放进循环就是每块网卡 fork 一次，24 块网卡能把「看网卡」从毫秒拖到秒。
+	osKinds := kinds()
 	out := make([]NIC, 0, len(ifs))
 	for _, in := range ifs {
 		n := NIC{
@@ -146,6 +158,7 @@ func Interfaces() ([]NIC, error) {
 			Loop:    in.Flags&net.FlagLoopback != 0,
 			Virtual: IsVirtualName(in.Name),
 		}
+		n.Kind, n.KindSrc = kindOf(in.Name, n.Loop, n.Virtual, osKinds[in.Name])
 		if addrs, err := in.Addrs(); err == nil {
 			n.Addrs = collect(addrs, in.Name, in.Index)
 		}

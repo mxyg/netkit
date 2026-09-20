@@ -90,18 +90,39 @@ async function renderNIC(root) {
   const live = (n) => ['dual-stack', 'v4-only', 'v6-only', 'link-local'].includes(n.verdict.verdict);
   const on = all.filter(live), off = all.filter((n) => !live(n));
 
+  /*
+   * ★ 介质类型。后端只给码（wifi / ethernet / …）和**这个结论从哪来**（os / name），
+   *   人话在这里渲染 —— 和判定码一样的规矩，多语种就靠这条。
+   *
+   *   ★★ `kindSrc === 'name'` 时必须加「可能是」。现场是照着这一列去插线的，
+   *   把按名字猜出来的东西说得像确定的，比不说还糟。
+   */
+  const KIND = {
+    wifi: ['无线', '📶'], ethernet: ['有线网口', '🔌'], 'usb-lan': ['USB 网卡', '🔌'],
+    cellular: ['4G/共享网络', '📡'], bluetooth: ['蓝牙', '🔵'],
+    thunderbolt: ['雷雳', '⚡'], virtual: ['虚拟', ''], loopback: ['回环', ''],
+  };
+  const kindCell = (n) => {
+    const [text, icon] = KIND[n.kind] || ['不确定', ''];
+    if (!n.kind) return '<span class="dim">不确定</span>';
+    const guess = n.kindSrc === 'name';
+    return `<span title="${guess ? '按网卡名推测，未经系统确认' : '系统给出的类型'}">`
+      + `${icon} ${guess ? '可能是' : ''}${esc(text)}</span>`;
+  };
+
   const row = (n) => {
     const [text, cls] = LABEL[n.verdict.verdict] || [n.verdict.verdict, ''];
     const addrs = (n.addrs || []).map((a) => `<code>${esc(a.cidr)}</code>`).join('<br>') || '—';
     return `<tr>
       <td><b>${esc(n.name)}</b></td>
+      <td>${kindCell(n)}</td>
       <td><span class="pill ${cls}">${esc(text)}</span></td>
       <td>${addrs}</td>
       <td class="dim"><code>${esc(n.mac || '—')}</code></td>
       <td class="dim">${n.mtu || '—'}</td>
     </tr>`;
   };
-  const head = '<tr><th>网卡</th><th>状态</th><th>地址</th><th>MAC</th><th>MTU</th></tr>';
+  const head = '<tr><th>网卡</th><th>类型</th><th>状态</th><th>地址</th><th>MAC</th><th>MTU</th></tr>';
 
   root.appendChild($(`<div class="card">
     <h2>在用的网卡</h2>
