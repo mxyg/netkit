@@ -1,0 +1,216 @@
+/*
+ * 昱弘网通的配色与基础件 —— 与昱弘播控（stage）**同一套**。
+ *
+ * ★★★ 这份不是新配的色，是从 `stage/apps/console/src/styles.css` 搬过来的。
+ *   公司规矩（全局 CLAUDE.md §4）：品牌资产只从 08-品牌资产 下发，
+ *   **不许各仓库自己画一份**。颜色也是品牌资产。
+ *
+ *   2026-09-20 头一版这里自己编了一套灰底 + 橙色（#0f1115 / #e0a33a）——
+ *   那正是这条规矩要禁的：看着"差不多"，摆在一起就是两个产品。
+ *
+ * # 色从哪儿来
+ *
+ * 公司品牌色板（08-品牌资产/色板.py）：
+ *   绀 #1F3557  结构、承重、正文墨色。公司名里的「弘」，广大、宏阔
+ *   曦 #E8A33D  唯一的强调色。「昱」，日光初升 —— **只给"此刻正在发生的事"**
+ *
+ * 品牌色板里写死的两条，这儿必须守住：
+ *   ① **品牌金成为主色之后，告警绝不能再用金**，否则界面上「品牌」和「故障」同色。
+ *      告警一律红 #C0392B，警示用橙 #E8730C —— 橙跟曦金拉开，不许混用。
+ *   ② **不用中性黑、不用中性灰**。深色面用绀调的深色，中性色是蓝调的 slate。
+ *      这样整屏是一个色系，不会「黑底上飘着几块暖色」。
+ *
+ * # 为什么默认跟随系统
+ *
+ * 播控默认暗色，因为会场灯一暗，屏幕不能是唯一光源。
+ * 网通不一样：**它多半在白天的机房、办公室、工地板房里用**，
+ * 所以缺省跟系统走，两套都要。
+ *
+ * # 怎么改
+ *
+ * 只改这里的变量，别处一律 var()。
+ */
+
+:root {
+  /* ── 品牌两主色 ── */
+  --brand-gan: #1f3557;
+  --brand-xi: #e8a33d;
+
+  /* ── 暗色 ── */
+  --bg: #0c1421;
+  --panel: #101b2e;
+  --panel-2: #14243c;
+  --line: #23344f;
+  --line-soft: #1a2a42;
+  /* 深底上的曦金要提亮一档，否则闷在绀里看不清 */
+  --gold: #f2b75c;
+  --gold-dim: #b57312;
+  --green: #1e9e6a;
+  --green-dim: #146b48;
+  --blue: #7194ca;
+  --red: #c0392b;
+  --red-dim: #8a2a20;
+  --warn: #e8730c;
+  --text: #e8edf4;
+  --muted: #8e9bad;
+  --muted-2: #64748b;
+  --shadow: 0 8px 28px rgba(6, 12, 22, 0.6);
+  --lift: 0 1px 0 rgba(255, 255, 255, 0.03);
+
+  /* 状态的底与字：金色按钮的底不能是纯金（晃眼），要金调的深底 + 金色的字 */
+  --gold-bg: #2a2416;
+  --green-bg: #12301f;
+  --green-text: #6fd6a0;
+  --red-bg: #2e1512;
+  --red-line: #5a2b24;
+  --red-text: #e79484;
+
+  /** 比 bg 更深的那一层：输出框、下沉的槽 */
+  --deep: #060c15;
+  /** 比 panel 略沉的那一层：内嵌的小块、次级卡片 */
+  --sunken: #0e1826;
+
+  --ui-scale: 1;
+  color-scheme: dark;
+}
+
+/*
+ * 亮色。**不是把暗色反过来**：浅底上曦金会晃眼，所以强调色压回品牌原色，
+ * 正文用绀而不是黑 —— 整屏还是一个色系。
+ */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    --bg: #e7ebf2;
+    --panel: #ffffff;
+    --panel-2: #f4f7fb;
+    --line: #dbe2ec;
+    --line-soft: #eaeff5;
+    --gold: #b57312;
+    --gold-dim: #de8e18;
+    --green: #1e9e6a;
+    --green-dim: #34a97a;
+    --blue: #1f3557;
+    --red: #c0392b;
+    --red-dim: #d4685c;
+    --warn: #e8730c;
+    --text: #1f3557;
+    --muted: #546175;
+    --muted-2: #8e9bad;
+    --shadow: 0 6px 20px rgba(31, 53, 87, 0.12);
+    --lift: 0 1px 2px rgba(31, 53, 87, 0.06), 0 2px 8px rgba(31, 53, 87, 0.05);
+    --gold-bg: #fdf3e0;
+    --green-bg: #e6f6ef;
+    --green-text: #147a52;
+    --red-bg: #fdecea;
+    --red-line: #e8b4ae;
+    --red-text: #a5291c;
+    --deep: #d7dde8;
+    --sunken: #eef2f8;
+    color-scheme: light;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+
+input, select, textarea {
+  font: inherit;
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: 5px;
+  width: 100%;
+}
+input:focus, select:focus { outline: none; border-color: var(--gold-dim); }
+
+/* ── 顶栏 ── */
+
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+header .mark { width: 26px; height: 26px; flex: none; }
+header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+header .en { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
+header .state { margin-left: auto; color: var(--muted); font-size: 12.5px; }
+
+/* ── 导航 ── */
+
+nav { display: flex; gap: 6px; padding: 10px 16px; background: var(--panel-2);
+      border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+
+/* ── 按钮：照 stage 的 .btn 一套 ── */
+
+.btn {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  border-radius: 5px;
+  padding: 6px 12px;
+  color: var(--text);
+  white-space: nowrap;
+  transition: border-color .12s, background .12s;
+}
+.btn:hover { border-color: var(--gold-dim); background: var(--sunken); }
+.btn:active { transform: translateY(1px); }
+/* ★ 曦金只给"此刻正在发生的事"：当前页、正在服务中 */
+.btn.on { border-color: var(--gold); background: var(--gold-bg); color: var(--gold); }
+.btn.primary { border-color: var(--gold); background: var(--gold-bg); color: var(--gold); font-weight: 600; }
+.btn.danger { border-color: var(--red-line); background: var(--red-bg); color: var(--red-text); }
+.btn:disabled { opacity: .45; cursor: default; }
+
+/* ── 卡片 ── */
+
+main { padding: 16px 18px; max-width: 1080px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; margin-bottom: 12px; box-shadow: var(--lift); }
+.card h2 { margin: 0 0 4px; font-size: 14.5px; font-weight: 600; }
+.hint { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
+label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.row > div { flex: 1; min-width: 150px; }
+
+/* ── 表格 ── */
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px;
+     padding: 7px 10px; border-bottom: 1px solid var(--line); }
+td { padding: 8px 10px; border-bottom: 1px solid var(--line-soft); }
+/* ★ 新接入的设备：用绿（"正常、刚发生"），不用金 —— 金要留给"正在进行中"那件事 */
+tr.fresh td { background: var(--green-bg); }
+
+/* ── 状态片 ── */
+
+.pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 12px;
+        border: 1px solid transparent; }
+.pill.ok { background: var(--green-bg); color: var(--green-text); border-color: var(--green-dim); }
+.pill.warn { background: var(--gold-bg); color: var(--gold); border-color: var(--gold-dim); }
+.pill.bad { background: var(--red-bg); color: var(--red-text); border-color: var(--red-line); }
+
+/* ── 输出块 ── */
+
+.out { background: var(--deep); border: 1px solid var(--line); border-radius: 6px;
+       padding: 11px; white-space: pre-wrap;
+       font-family: ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace;
+       font-size: 12.5px; color: var(--muted); max-height: 300px; overflow: auto; }
+.empty { color: var(--muted); padding: 14px 0; }
+code { font-family: ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace; font-size: 13px; }
+
+/* 次要列（MAC、MTU）：在场的人先看「能不能用」，这些是核对时才看的 */
+td.dim { color: var(--muted); }
+/* 不带状态的计数片 */
+.pill { background: var(--sunken); color: var(--muted); border-color: var(--line); }

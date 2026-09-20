@@ -29,7 +29,8 @@
     },
     "files": [
       "src/**/*",
-      "assets/icon.png"
+      "assets/icon.png",
+      "assets/icon.svg"
     ],
     "extraResources": [
       {

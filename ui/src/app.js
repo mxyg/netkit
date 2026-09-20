@@ -52,7 +52,7 @@ function renderNav() {
   for (const p of PAGES) {
     const b = document.createElement('button');
     b.textContent = p.name;
-    b.className = p.id === current ? 'on' : '';
+    b.className = p.id === current ? 'btn on' : 'btn';
     b.onclick = () => { current = p.id; renderNav(); show(); };
     nav.appendChild(b);
   }
@@ -78,16 +78,53 @@ async function renderNIC(root) {
     'no-address': ['没有 IP 地址', 'bad'], 'no-carrier': ['没插线', 'warn'],
     down: ['已禁用', 'warn'], virtual: ['虚拟网卡', ''], loopback: ['回环', ''],
   };
-  for (const n of r.values.interfaces || []) {
+  const all = r.values.interfaces || [];
+
+  /*
+   * ★ 这一页原先是「一块网卡一张大卡片」。在 Mac 上一开就是二十几张，
+   *   其中二十张是系统自带的虚拟网卡，清一色「没有 IP 地址」——
+   *   真正在用的那一块被埋在最上面一行，要滚半天才看得完。
+   *   现场要的是**一眼看出哪块能用**，所以：一张表、在用的排前面、
+   *   没在用的默认折起来。
+   */
+  const live = (n) => ['dual-stack', 'v4-only', 'v6-only', 'link-local'].includes(n.verdict.verdict);
+  const on = all.filter(live), off = all.filter((n) => !live(n));
+
+  const row = (n) => {
     const [text, cls] = LABEL[n.verdict.verdict] || [n.verdict.verdict, ''];
-    const addrs = (n.addrs || []).map((a) =>
-      `<tr><td><code>${esc(a.cidr)}</code></td><td>${a.family}</td><td>${esc(a.scope)}</td></tr>`).join('');
-    root.appendChild($(`<div class="card">
-      <h2>${esc(n.name)} <span class="pill ${cls}">${esc(text)}</span></h2>
-      <p class="hint">${esc(n.mac || '')}${n.mtu ? ' · MTU ' + n.mtu : ''}</p>
-      ${addrs ? `<table><tr><th>地址</th><th>族</th><th>用途</th></tr>${addrs}</table>` : '<div class="empty">没有地址</div>'}
-    </div>`));
-  }
+    const addrs = (n.addrs || []).map((a) => `<code>${esc(a.cidr)}</code>`).join('<br>') || '—';
+    return `<tr>
+      <td><b>${esc(n.name)}</b></td>
+      <td><span class="pill ${cls}">${esc(text)}</span></td>
+      <td>${addrs}</td>
+      <td class="dim"><code>${esc(n.mac || '—')}</code></td>
+      <td class="dim">${n.mtu || '—'}</td>
+    </tr>`;
+  };
+  const head = '<tr><th>网卡</th><th>状态</th><th>地址</th><th>MAC</th><th>MTU</th></tr>';
+
+  root.appendChild($(`<div class="card">
+    <h2>在用的网卡</h2>
+    <p class="hint">下面这些拿到了地址，可以用来 ping、探端口、发 DHCP。</p>
+    ${on.length ? `<table>${head}${on.map(row).join('')}</table>`
+               : '<div class="empty">一块都没有拿到地址。检查网线、交换机，或者用「开启路由」自己发地址。</div>'}
+  </div>`));
+
+  if (!off.length) return;
+  const rest = $(`<div class="card">
+    <h2>没在用的网卡 <span class="pill">${off.length}</span></h2>
+    <p class="hint">虚拟网卡、没插线的、被禁用的。排查时一般不用管。</p>
+    <button class="btn" id="more">展开</button>
+    <div id="offbox" style="display:none;margin-top:10px"></div>
+  </div>`);
+  root.appendChild(rest);
+  const box = rest.querySelector('#offbox');
+  rest.querySelector('#more').onclick = (e) => {
+    const openNow = box.style.display === 'none';
+    box.style.display = openNow ? 'block' : 'none';
+    e.target.textContent = openNow ? '收起' : '展开';
+    if (openNow && !box.innerHTML) box.innerHTML = `<table>${head}${off.map(row).join('')}</table>`;
+  };
 }
 
 // ── 开启路由（DHCP）──
@@ -124,8 +161,8 @@ async function renderDHCP(root) {
     <input id="router" placeholder="留空 = 不下发">
     <p class="hint" id="routerNote"></p>
     <div style="margin-top:14px;display:flex;gap:10px">
-      <button class="ghost" id="btnProbe">先看看有没有别人在发地址</button>
-      <button class="go" id="btnStart">开始发地址</button>
+      <button class="btn" id="btnProbe">先看看有没有别人在发地址</button>
+      <button class="btn primary" id="btnStart">开始发地址</button>
     </div>
     <div class="out" id="out" style="margin-top:12px;display:none"></div>
   </div>`);
@@ -177,7 +214,7 @@ async function runningCard(state) {
     <div class="card">
       <h2>正在发地址 <span class="pill ok">服务中</span></h2>
       <p class="hint">网卡 ${esc(v.iface)} · 池子共 ${v.poolSize} 个地址 · 已发出 <b id="cnt">${v.count}</b> 个</p>
-      <button class="ghost danger" id="btnStop">停止服务</button>
+      <button class="btn danger" id="btnStop">停止服务</button>
     </div>
     <div class="card">
       <h2>已接入的设备</h2>
@@ -203,7 +240,7 @@ function drawLeases(box, leases) {
       <td><code>${esc(l.mac)}</code></td>
       <td>${esc(l.host || '—')}</td>
       <td><input value="${esc(l.ip)}" data-mac="${esc(l.mac)}" data-from="${esc(l.ip)}" style="width:140px"></td>
-      <td><button class="ghost" data-act="${esc(l.mac)}">改地址</button></td>
+      <td><button class="btn" data-act="${esc(l.mac)}">改地址</button></td>
     </tr>`).join('');
   box.innerHTML = `<table><tr><th>IP</th><th>MAC</th><th>设备名</th><th>改成</th><th></th></tr>${rows}</table>`;
   box.querySelectorAll('button[data-act]').forEach((b) => {
@@ -243,8 +280,8 @@ async function renderProbe(root) {
       <div><label>端口（探端口时填）</label><input id="p" placeholder="554"></div>
     </div>
     <div style="margin-top:12px;display:flex;gap:10px">
-      <button class="go" id="bp">ping</button>
-      <button class="ghost" id="bt">探端口</button>
+      <button class="btn primary" id="bp">ping</button>
+      <button class="btn" id="bt">探端口</button>
     </div>
     <div class="out" id="o" style="margin-top:12px;display:none"></div>
   </div>`);
@@ -272,7 +309,7 @@ async function renderStream(root) {
     <p class="hint">输入取流地址，直接告诉你编码、**真实分辨率**、帧率。不需要播放器，也不解码。</p>
     <label>RTSP 地址</label>
     <input id="u" placeholder="rtsp://admin:密码@192.168.1.64:554/cam/realmonitor?channel=1&subtype=0">
-    <div style="margin-top:12px"><button class="go" id="b">探测</button></div>
+    <div style="margin-top:12px"><button class="btn primary" id="b">探测</button></div>
     <div class="out" id="o" style="margin-top:12px;display:none"></div>
   </div>`);
   root.appendChild(card);
