@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -74,6 +75,10 @@ type codecReading struct {
 	Data     []byte
 	Fixes    []string
 	Extra    map[string]any
+	// hasStd / hasURL 只在 base64 一档里有意义：这段里到底出没出现过 +/ 和 -_。
+	// 指死字母表时靠它分清「指错了」和「无从区分」—— 后者不该报错。
+	hasStd bool
+	hasURL bool
 }
 
 var codecTool = ots.Tool{
@@ -87,6 +92,11 @@ var codecTool = ots.Tool{
 		"★ 会替人放宽几处并全部记在 normalized 里：补 `=` 填充、认 URL 安全字母表、去掉折行空白、去 0x 前缀 —— " +
 		"从 URL 里抄来的 base64，那个空格原本可能是 `+`，不记下来就是悄悄改了数据。" +
 		"URL 里有 `+` 时按「查询串」和「路径」两种读法分开给（同一段字符串两个答案，密码抄错的经典根因）。" +
+		"★ 写全了 `=` 的串按它自己声明的填充式验一遍：填充个数和长度对不上就拦下 —— 这种串换别处照样解得开，" +
+		"解回来的却是个错值，而现场症状是「密码不对」，没人怀疑到自己抄的那一行动上。" +
+		"行中间的空格只在「剔掉它解得出人话」时才当 base64 读（从 PDF 里粘出来的那种），" +
+		"凑出来是二进制的就判回文本 —— 折行的算另一回事，证书本来就是折行的二进制。" +
+		"正向编 \\u 转义时把反斜杠本身也编掉，保证编得出去就解得回来。" +
 		"解出来不是合法 UTF-8 但字节范围落在 GBK 里时点明「像老设备固件的中文」，不并到二进制里。" +
 		"看到签名令牌（eyJ… 三段）会把头部和载荷分开解出来，★ 只解码不验签。纯字符串运算：不发任何包，不碰文件系统。",
 	Schema: json.RawMessage(`{
@@ -116,9 +126,15 @@ func doCodecConvert(_ context.Context, raw json.RawMessage) (any, error) {
 	if strings.TrimSpace(a.Text) == "" {
 		return nil, ots.Errf(ots.ErrInvalidArgument, "text 是空的 —— 没有要解的东西")
 	}
-	if len(a.Text) > maxCodecInput {
+	if n := len([]rune(a.Text)); n > maxCodecInput {
 		return nil, ots.Errf(ots.ErrInvalidArgument,
-			"输入 %d 字符，超过 %d 的上限 —— 这是给一段字符串用的，要整份文件那是文件服务的事", len(a.Text), maxCodecInput)
+			"输入 %d 字符，超过 %d 的上限 —— 这是给一段字符串用的，要整份文件那是文件服务的事", n, maxCodecInput)
+	}
+	// ★ encoding 是不是一个认识的写法，在这里就判掉：认不出是**调用方说错了**，
+	//   不是「这段用那种写法解不开」。混成一档，AI 会以为换一种编码再试就有结果。
+	if a.Encoding != "" && !codecKnownEncoding(a.Encoding) {
+		return nil, ots.Errf(ots.ErrInvalidArgument,
+			"encoding 只认 base64 / base64url / hex / url / unicode，给的是 %q", a.Encoding)
 	}
 	switch a.Op {
 	case "", "auto":
@@ -134,8 +150,18 @@ func doCodecConvert(_ context.Context, raw json.RawMessage) (any, error) {
 	return nil, ots.Errf(ots.ErrInvalidArgument, "op 只认 auto / decode / encode，给的是 %q", a.Op)
 }
 
+var codecEncodings = []string{"base64", "base64url", "hex", "url", "unicode"}
+
+func codecKnownEncoding(enc string) bool {
+	return slices.Contains(codecEncodings, enc)
+}
+
 // codecAuto 不指编码时：能解就解，解不出就把正向写法给全 ——
 // 贴进来一段明文的人，十有八九是要编出去（贴进 URL、贴进配置文件）。
+//
+// ★★ 编的是**清理过的那一份**，并且把清理记在 normalized 里。
+// 显示「你的原文是 hello world!」、给出的 base64 却是带着引号和尾空格编的，
+// 人拿去贴的就是他嘴上说不要的那个值 —— 这一档错掉时最难发现，因为两个结果看着都挺像对的。
 func codecAuto(text, pinned string) (any, error) {
 	v, err := codecDecode(text, pinned)
 	if err != nil {
@@ -145,9 +171,11 @@ func codecAuto(text, pinned string) (any, error) {
 	if !ok || res.Code != codecPlainText {
 		return v, nil
 	}
-	values := codecEncodeAll(text).Values
-	values["plainText"] = res.Values["text"]
+	body, _ := res.Values["text"].(string)
+	values := codecEncodeAll(body).Values
+	values["plainText"] = body
 	values["why"] = res.Values["why"]
+	values["normalized"] = res.Values["normalized"]
 	return ots.Verdict{
 		Code:   codecPlainText,
 		Values: values,
@@ -266,8 +294,13 @@ func codecCandidates(s string) ([]codecReading, []string) {
 	}
 	hr, hprob := codecReadHex(s)
 	br, bprob := codecReadBase64(s)
-	if bprob != "" && strings.Contains(bprob, "又有") {
+	// ★ 认得出「为什么没按 base64 读」的两种情况要留给调用方：字母表混在一起（说明这是两段值粘起来了）、
+	// 以及靠中间空格才凑得成 base64 却解出二进制（说明这就是一段文本）。
+	// 不记下来，plain-text 那一档只会说「它没在编码」，而现场真正要听的是「我试过 base64，是这样排除的」
+	if strings.Contains(bprob, "又有") {
 		notes = append(notes, bprob+"，所以没按 base64 读")
+	} else if strings.Contains(bprob, "解出来是二进制") {
+		notes = append(notes, bprob+"，所以按文本原样读")
 	}
 	switch {
 	case hprob == "" && bprob == "":
@@ -289,9 +322,14 @@ func codecReadPinned(s, enc string) (codecReading, string) {
 	case "base64", "base64url":
 		r, problem = codecReadBase64(s)
 		if problem == "" && r.Encoding != enc {
-			// ★ 两种字母表只在串里真出现 +/ 或 -_ 时才分得出。指错了要说破为什么无所谓 / 有什么要紧
-			return codecReading{}, fmt.Sprintf(
-				"这段按 %s 读才对（串里出现的字符决定字母表），指成 %s 会把 %s 当成别的字", r.Encoding, enc, enc)
+			// ★ 字母表只由「串里出现了 +/ 还是 -_」决定。两种字符都没出现时两派解出的字节一模一样，
+			//   指哪一种都不影响结果 —— 这时拒绝一个本来解得开的输入，等于把人往「这串坏了」上带
+			if r.hasStd || r.hasURL {
+				return codecReading{}, fmt.Sprintf(
+					"这段按 %s 读才对（串里出现的字符决定字母表），指成 %s 会把 %s 当成别的字", r.Encoding, enc, enc)
+			}
+			r.Encoding = enc
+			r.Extra = map[string]any{"alphabetUnclaimed": true}
 		}
 	case "hex":
 		r, problem = codecReadHex(s)
@@ -316,29 +354,36 @@ func codecReadPinned(s, enc string) (codecReading, string) {
 //
 // ★ 4n+1 这种长度单独说破：base64 每 4 个字符出 3 个字节，4n+1 在数学上不可能存在 ——
 // 报「非法字符」是浪费人时间，真相是「它不是 base64」。
+//
+// ★★ 末尾写了 `=` 就是这段自己声明「我是填充式」，那就按它声明的验一遍：
+// 填充个数和去掉填充后的长度对不上，唯一讲得通的解释是**抄漏或多抄了一个字符**。
+// 换到别处（浏览器、命令行 `base64 -d`）这种串照样解得开，解回来却是一个错值，
+// 而现场症状是「密码不对」，没人会怀疑到自己抄的那一行动上 —— 所以这里拦下说破。
 func codecReadBase64(s string) (*codecReading, string) {
 	hasStd := strings.ContainsAny(s, "+/")
 	hasURL := strings.ContainsAny(s, "-_")
 	if hasStd && hasURL {
 		return nil, "既有 +/ 又有 -_：标准字母表和 URL 安全字母表不会同时出现在一个值里，多半是两段值粘成了一行"
 	}
+	padSeen := len(s) - len(strings.TrimRight(s, "="))
 	core := strings.TrimRight(s, "=")
 	if core == "" {
 		return nil, "去掉末尾的填充符之后什么都不剩 —— 只有 `=`，没有内容"
 	}
 	var fixes []string
+	spaceOnly := false // 中间是空格而不只是折行 —— 这种「放宽」最容易把一段普通文本凑成 base64
 	if strings.ContainsAny(core, " \t\r\n") {
 		if strings.ContainsAny(core, "\r\n") {
 			fixes = append(fixes, "line-wrapped") // openssl / `base64` 命令行每 76 列折一行
 		} else {
 			fixes = append(fixes, "inner-whitespace")
+			spaceOnly = true
 		}
 		core = strings.Join(strings.Fields(core), "")
 	}
 	if len(core)%4 == 1 {
 		return nil, fmt.Sprintf("去掉填充后 %d 个字符 —— base64 每 4 个字符出 3 个字节，4n+1 这种长度不可能出现，所以它不是 base64", len(core))
 	}
-	urlSafe := strings.ContainsAny(core, "-_")
 	for i := 0; i < len(core); i++ {
 		if core[i] == '-' || core[i] == '_' {
 			continue
@@ -349,14 +394,19 @@ func codecReadBase64(s string) (*codecReading, string) {
 	}
 	enc := base64.RawStdEncoding
 	name := "base64"
-	if urlSafe {
+	if hasURL {
 		enc = base64.RawURLEncoding
 		name = "base64url"
 		fixes = append(fixes, "url-safe-alphabet")
 	}
-	if len(core)%4 != 0 && !strings.HasSuffix(s, "=") {
-		// ★ 只看去掉填充之后的长度会把「本来带填充」的串也报成「我替你补了填充」——
-		// normalized 是对外承诺做过什么让步，报错了就等于凭空认下一桩没做过的事
+	if want := (4 - len(core)%4) % 4; padSeen > 0 {
+		if padSeen != want {
+			return nil, fmt.Sprintf("末尾有 %d 个 `=`，可去掉填充后剩 %d 个字符，按 base64 该配 %d 个 —— "+
+				"这种串换别处照样解得开，但解回来的是个错值。八成是抄的时候漏了或多带了一个字符", padSeen, len(core), want)
+		}
+	} else if len(core)%4 != 0 {
+		// ★ 只对「压根没写填充」的输入认这笔账：本来带 `=` 却报「我替你补了填充」，
+		//   等于凭空认下一桩没做过的事 —— normalized 是对外承诺做过什么让步
 		fixes = append(fixes, "padding-added")
 	}
 	data, err := enc.DecodeString(core)
@@ -366,7 +416,17 @@ func codecReadBase64(s string) (*codecReading, string) {
 	if len(data) == 0 {
 		return nil, "解出来是零字节"
 	}
-	return &codecReading{Encoding: name, Data: data, Fixes: dedupeStrings(fixes)}, ""
+	if spaceOnly {
+		// ★ 行中间的空格只有一种讲法认：剔掉它之后解出来是人话（从 PDF / 表格里粘出来那种）。
+		// 解出来是二进制、而原文自己就读得通 —— 那讲得通的就是「这是一段文本」，
+		// 拿空格凑出来的 base64 再报一句「解出来是二进制」，是把人往「数据坏了」上推。
+		// 折行的不走这条：证书和密钥本来就是折行的 base64 二进制，解出来当然不是文本。
+		if _, readable := codecBytesInfo(data); !readable {
+			return nil, "剔掉中间的空格后能凑成 base64，可解出来是二进制 —— 而那几个空格分开的是几个单词，" +
+				"所以它是一段文本，不是被空格弄散的 base64"
+		}
+	}
+	return &codecReading{Encoding: name, Data: data, Fixes: dedupeStrings(fixes), hasStd: hasStd, hasURL: hasURL}, ""
 }
 
 // codecReadHex 认 `48656c6c6f`、`48 6c …`、`0x486…`。
@@ -389,17 +449,11 @@ func codecReadHex(s string) (*codecReading, string) {
 	if core == "" {
 		return nil, "去掉 0x 和分隔符之后什么都不剩"
 	}
-	if len(core)%2 != 0 {
-		return nil, fmt.Sprintf("十六进制字符是 %d 个，奇数 —— 一个字节占两位，凑不成整字节", len(core))
-	}
-	for i := 0; i < len(core); i++ {
-		if strings.IndexByte(hexDigits, core[i]) < 0 {
-			return nil, fmt.Sprintf("第 %d 个字符 %q 不是十六进制", i+1, string(core[i]))
-		}
-	}
-	data, err := hex.DecodeString(strings.ToLower(core))
+	// ★ 成不成整字节、坏在第几位，都交给 hexBytes 说 —— 它给的已经是「第 N~M 位不是十六进制」
+	//   这种带位置的话。这里再自己扫一遍字符，同一件事就有两套说法，迟早对不上
+	data, err := hexBytes(strings.ToLower(core))
 	if err != nil {
-		return nil, fmt.Sprintf("按十六进制解不开：%s", err)
+		return nil, "按十六进制读：" + err.Error()
 	}
 	return &codecReading{Encoding: "hex", Data: data, Fixes: dedupeStrings(fixes)}, ""
 }
@@ -448,12 +502,41 @@ func firstBadPercent(s string) int {
 	return -1
 }
 
+// hasLooseBackslash 串里有没有一个 `\` 后面跟的不是合形的 \xNN / \uXXXX。
+//
+// 有，说明这些反斜杠是路径分隔符（`\newfolder` 里的 \n 是字母 n）；
+// 一个都没有，说明整串就是转义写法，该照常解。
+func hasLooseBackslash(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' {
+			continue
+		}
+		switch {
+		case i+3 < len(s) && s[i+1] == 'x':
+			if _, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+				i += 3
+				continue
+			}
+		case i+5 < len(s) && s[i+1] == 'u':
+			if _, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
+				i += 5
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 // codecReadUnicode 认 `\xNN` 和 `\uNNNN`（含 UTF-16 代理对）。Windows 路径不算转义。
 func codecReadUnicode(s string) (*codecReading, string) {
 	if !strings.Contains(s, `\x`) && !strings.Contains(s, `\u`) {
 		return nil, "没有 \\x 或 \\u 转义"
 	}
-	if codecWindowsPath.MatchString(s) {
+	if codecWindowsPath.MatchString(s) && hasLooseBackslash(s) {
+		// ★ 盘符打头 + 还有一个「不是转义」的反斜杠，那就是路径。
+		//   只有这一条才拦：全串每个 `\` 后面都跟着合形的 \x / \u 时，它已经是转义写法了，
+		//   这时再拦就把我们自己编出去的 `C:\u005c...` 挡在读不回来的地方
 		return nil, `看着像 Windows 路径（开头是盘符），不当转义串解 —— 那种 \newfolder 里的 \n 是真字符`
 	}
 	var out []byte
@@ -464,8 +547,8 @@ func codecReadUnicode(s string) (*codecReading, string) {
 			continue
 		}
 		switch {
-		case i+3 < len(s) && s[i+1] == 'x' &&
-			strings.IndexByte(hexDigits, s[i+2]) >= 0 && strings.IndexByte(hexDigits, s[i+3]) >= 0:
+		case i+3 < len(s) && s[i+1] == 'x':
+			// 是不是两位十六进制，交给 ParseUint 判 —— 先自己扫一遍再解，判不上的分支就是死分支
 			v, err := strconv.ParseUint(s[i+2:i+4], 16, 8)
 			if err != nil {
 				return nil, fmt.Sprintf("第 %d 个字符处的 \\x 后面不是两位十六进制", i+1)
@@ -648,13 +731,36 @@ func codecHexDump(data []byte) string {
 	return s
 }
 
-// stillHasEncoding 解完一次还剩百分号或 \\x —— 双重编码。★ 只认「还能再解」，不去猜要解几遍。
+// stillHasEncoding 认「解一次还剩一层」—— 双重编码。
+//
+// ★★ 不能「看见 %XX 就判还套着一层」：一段正常文本里出现 `%0D`、`%41` 太常见了
+//
+//	（日志里印出来的转义、URL 模板、`50%0D` 这种写法），一律判成还有第二层，
+//	人就照着再解一次，把一段好端端的文本解出控制字符出来。
+//	真被编了两遍的东西有个特征：**除了转义就不剩几个字**。
+//	按这个分，宁可漏判（剩下的转义符号人自己看得见）也不误判。
 func stillHasEncoding(s string) bool {
-	if strings.Contains(s, "%") && firstBadPercent(s) == -1 && strings.Count(s, "%") >= 1 {
-		return true
+	if firstBadPercent(s) >= 0 {
+		return false // 有不成形的百分号，说明它压根不是一层编码
 	}
-	return strings.Contains(s, `\x`) || strings.Contains(s, `\u`)
+	runs := codecEscapeRun.FindAllString(s, -1)
+	if len(runs) == 0 {
+		return false
+	}
+	rest := codecEscapeRun.ReplaceAllString(s, "")
+	if len(runs) == 1 {
+		// 整段就一个转义、外面不剩别的字 —— 那是被编了一遍的空格 / 斜杠（`%2520` 解出来就是 `%20`）；
+		// 若旁边还有别的内容（`50%0D`），那更可能是文本里恰好带着转义
+		return strings.TrimSpace(rest) == ""
+	}
+	// 剩下来的还凑得出一个词（两个连着的字母），那就是文本里恰好带着转义
+	return !codecProseRun.MatchString(rest)
 }
+
+var (
+	codecEscapeRun = regexp.MustCompile(`%[0-9A-Fa-f]{2}|\\x[0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}`)
+	codecProseRun  = regexp.MustCompile(`[A-Za-z]{2}`)
+)
 
 // ── 正向编码 ──
 
@@ -676,12 +782,6 @@ func codecEncodeAll(text string) ots.Verdict {
 }
 
 func codecEncodePinned(text, enc string) (any, error) {
-	switch enc {
-	case "base64", "base64url", "hex", "url", "unicode":
-	default:
-		return nil, ots.Errf(ots.ErrInvalidArgument,
-			"encoding 只认 base64 / base64url / hex / url / unicode，给的是 %q", enc)
-	}
 	all := codecEncodeAll(text).Values
 	return ots.Verdict{
 		Code:   codecEncoded,
@@ -692,12 +792,17 @@ func codecEncodePinned(text, enc string) (any, error) {
 
 // codecEscapeUnicode 把非 ASCII 编成 \uXXXX。★ 中文按 UTF-16 走：
 // 生僻字和 emoji 在 UTF-16 里是代理对，只写一个 \uXXXX 的设备会解出半个字。
+//
+// ★ 反斜杠自己也要编：不编的话 `C:\new` 编出去还是 `C:\new`，再解回来就撞在
+// 「认不出的转义开头」上 —— 编得出去解不回来，等于这一档在 Windows 路径上是坏的。
 func codecEscapeUnicode(text string) string {
 	var sb strings.Builder
 	for _, r := range text {
 		switch {
 		case r < 0x20 || r == 0x7f:
 			fmt.Fprintf(&sb, `\u%04x`, r)
+		case r == '\\':
+			sb.WriteString(`\u005c`)
 		case r < 0x7f:
 			sb.WriteRune(r)
 		case r <= 0xFFFF:

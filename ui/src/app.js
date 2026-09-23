@@ -2944,9 +2944,13 @@ function macRandomCard() {
 //   人就换工具、或者去查设备坏没坏 —— 而那两种都不是结论。所以每一档都带下一步。
 const CC_CODE = {
   'decoded-text': ['解出来了，是可读文本', 'ok', (v) =>
-    v.shape === 'jwt'
+    (v.shape === 'jwt'
       ? '这是一枚签名令牌，上面已经把头解出来 —— ★ 这里只解码，不验签，所以「解得开」不等于「这枚令牌有效」。载荷里常带账号、内部 IP，别整段贴进工单。'
-      : '下面那一栏就是解出来的原文，可以直接复制。'],
+      : '下面那一栏就是解出来的原文，可以直接复制。') +
+    (v.alphabetUnclaimed
+      ? ' 这一段里 + 和 / 、- 和 _ 都没出现过，两派 base64 字母表解出来一模一样 —— 指哪一种都不影响结果；' +
+        '哪天串里真出现了这一类字符，指错了会被当场拦下来，不会悄悄解成一个错值。'
+      : '')],
   'decoded-binary': ['解出来是二进制', 'warn', (v) =>
     v.looksLikeGbk
       ? '这一串既不是合法 UTF-8、也不像随机数据，而是老设备固件里那种 GBK 中文。这里不替你猜字符表 —— 猜出来的中文比乱码更容易被当成事实。要看成人话，得拿转码工具整份转一次。'
@@ -3060,10 +3064,11 @@ function codecCard() {
         <pre style="${mono};margin:4px 0 0;white-space:pre-wrap">${esc(v.text)}</pre></div>` : ''}
       ${v.hexDump ? `<div style="margin-top:10px"><label class="dim">按字节看</label>
         <pre style="${mono};margin:4px 0 0;white-space:pre-wrap">${esc(v.hexDump)}</pre></div>` : ''}
-      ${v.readings ? `<table style="margin-top:12px"><tr><th>读法</th><th>解出来</th></tr>
+      ${v.readings ? `<table style="margin-top:12px"><tr><th>读法</th><th>解出来</th><th>这一种放宽过什么</th></tr>
         ${v.readings.map((x) => `<tr><td class="dim" style="white-space:nowrap">${esc(CC_ENC[x.encoding] || x.encoding)}
           ${x.encoding === v.mostLikely ? '（多半是这种）' : ''}</td>
-          <td><code style="${mono}">${esc(x.readable ? x.text : x.hexDump)}</code></td></tr>`).join('')}</table>` : ''}
+          <td><code style="${mono}">${esc(x.readable ? x.text : x.hexDump)}</code></td>
+          <td class="dim">${esc((x.normalized || []).map((f) => CC_FIX[f] || f).join('；')) || '—'}</td></tr>`).join('')}</table>` : ''}
       ${rows ? `<table style="margin-top:14px"><tr><th></th><th></th></tr>${rows}</table>` : ''}
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;

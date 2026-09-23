@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -168,7 +170,7 @@ func Test十六进制的0x与分隔写法都认(t *testing.T) {
 
 func Test奇数个十六进制字符不当hex读(t *testing.T) {
 	why := codecRunErrText(t, map[string]any{"text": "abc", "op": "decode", "encoding": "hex"})
-	if !strings.Contains(why, "奇数") {
+	if !strings.Contains(why, "不是偶数") {
 		t.Errorf("没说清为什么凑不成整字节：%q", why)
 	}
 }
@@ -395,9 +397,103 @@ func Test转义写法按UTF16出代理对(t *testing.T) {
 // ── 边界与安全 ──
 
 func Test不认的编码当场拒(t *testing.T) {
-	msg := codecRunErr(t, map[string]any{"text": "ab", "op": "encode", "encoding": "jwt"})
-	if !strings.Contains(msg, "base64url") {
-		t.Errorf("报错要把可选值列出来：%q", msg)
+	// ★ 指错了写法是**调用方说错了**，不是「这段用那种写法解不开」——
+	// 两条路都得当场报错，混成 not-decodable 会让 AI 以为换一种编码再试就有结果
+	for _, op := range []string{"encode", "decode"} {
+		msg := codecRunErr(t, map[string]any{"text": "ab", "op": op, "encoding": "jwt"})
+		if !strings.Contains(msg, "base64url") {
+			t.Errorf("op=%s 的报错要把可选值列出来：%q", op, msg)
+		}
+	}
+}
+
+func Test自动档给的五种写法必须编的是清理过的那一份(t *testing.T) {
+	// ★ 界面上显示「你的原文是 hello world!」、给出的 base64 却是带引号和尾空格编的 ——
+	// 两个结果看着都像对的，人拿去贴的就是他嘴上说不要的那个值
+	v := codecRun(t, map[string]any{"text": `"hello world!" `})
+	want := base64.StdEncoding.EncodeToString([]byte("hello world!"))
+	if got := codecStr(v, "base64"); got != want {
+		t.Errorf("base64 编的是没清理的那一份：%q，应为 %q", got, want)
+	}
+	if n, _ := v.Values["normalized"].([]string); len(n) == 0 {
+		t.Error("替人去过引号和空格，却不写进 normalized —— 承诺漏了一条")
+	}
+}
+
+func Test字母表无从区分时指哪一种都算(t *testing.T) {
+	// 这段里既没有 +/ 也没有 -_，两派解出的字节一模一样，拒绝解等于把人往「串坏了」上带
+	v := codecRun(t, map[string]any{"text": "aGVsbG8", "op": "decode", "encoding": "base64url"})
+	if v.Code != codecDecodedText || codecText(t, v) != "hello" {
+		t.Fatalf("判定 %s / 文本 %q —— 无从区分时要把结果照常解出来", v.Code, v.Values["text"])
+	}
+	if v.Values["alphabetUnclaimed"] != true {
+		t.Error("要标出「这一指其实无从验证」，界面好说明为什么两种写法结果相同")
+	}
+}
+
+func Test填充个数对不上要说破是抄漏了(t *testing.T) {
+	// 两个方向分开钉：少一个 = 漏抄，多一个 = 多带 —— 只断言「认出来了」，
+	// 把方向说反（该配 2 个说成 0 个）也算通过，而那恰好是最害人的错法
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"QQ=", "该配 2 个"},   // 正确的写法是 QQ==，抄掉了一个字符
+		{"AAAA=", "该配 0 个"}, // 4 的倍数不需要填充，多出来的 = 是抄串了尾巴
+	} {
+		v := codecRun(t, map[string]any{"text": tc.in, "op": "decode", "encoding": "base64"})
+		if v.Code != codecNotDecodable {
+			t.Errorf("%s 判定 %s —— 填充个数不对就该拦下", tc.in, v.Code)
+			continue
+		}
+		if why := codecStr(v, "why"); !strings.Contains(why, tc.want) {
+			t.Errorf("%s 没说清%s：%q", tc.in, tc.want, why)
+		}
+	}
+}
+
+func Test文本里恰好带转义不算第二层编码(t *testing.T) {
+	// 解出来是 "rate = 50%0D and %41" —— 看见 %XX 就判「还套一层」，人再解一次
+	// 就把一段好端端的文本解出控制字符出来
+	in := base64.StdEncoding.EncodeToString([]byte("rate = 50%0D and %41"))
+	v := codecRun(t, map[string]any{"text": in})
+	if v.Code != codecDecodedText {
+		t.Errorf("判定 %s —— 转义旁边还有词在，那是文本里带着转义，不是双重编码", v.Code)
+	}
+}
+
+func Test空格凑出来的base64解出二进制时按文本读(t *testing.T) {
+	// "  hello world  " 剔掉空格能凑成 base64，解出来却是二进制；
+	// 这时报「解出来是二进制」等于把一段文本判成坏数据
+	v := codecRun(t, map[string]any{"text": "  hello world  "})
+	if v.Code != codecPlainText {
+		t.Fatalf("判定 %s —— 该按文本原样读", v.Code)
+	}
+	if why := codecStr(v, "why"); !strings.Contains(why, "base64") || !strings.Contains(why, "二进制") {
+		t.Errorf("要写清「试过 base64、因为解出来是二进制所以不这么读」，不能只说没认出编码：%q", why)
+	}
+}
+
+func Test反斜杠编得出去也要解得回来(t *testing.T) {
+	// 不把 `\` 自己编掉，`前\后` 编出去还是 `前\后`，再解回来就撞在「认不出的转义开头」上
+	enc := codecRun(t, map[string]any{"text": `前\后`, "op": "encode", "encoding": "unicode"})
+	got := codecStr(enc, "result")
+	if !strings.Contains(got, `\u005c`) {
+		t.Errorf(`反斜杠没被编掉：%q`, got)
+	}
+	back := codecRun(t, map[string]any{"text": got, "op": "decode"})
+	if codecText(t, back) != `前\后` {
+		t.Errorf("转一圈回来变了：%q", back.Values["text"])
+	}
+}
+
+func Test输入上限按字符算而不是字节(t *testing.T) {
+	// 中文一个字三个字节：按字节数拦，报错里写的「字符」就是假的，而且拦得比说的早
+	// codecRun 一遇到 error 就 fail：3000 个中文字符 = 9000 字节，按字节拦就是误伤
+	codecRun(t, map[string]any{"text": strings.Repeat("中", 3000)})
+	msg := codecRunErr(t, map[string]any{"text": strings.Repeat("中", maxCodecInput+1)})
+	if !strings.Contains(msg, "8193 字符") {
+		t.Errorf("个数要按字符算（8193 个中文字符是 24579 字节，报那个数等于说谎）：%q", msg)
 	}
 }
 
@@ -442,6 +538,62 @@ func Test编解码能转回来(t *testing.T) {
 			t.Errorf("%q 转一圈回来成了 %q（判定 %s）", s, back.Values["text"], back.Code)
 		}
 	}
+	// \u 那一档单独转一遍：反斜杠、盘符路径、控制字符是它的三个坑
+	for _, s := range []string{`C:\new`, `前\后`, "a\tb", "密😀码"} {
+		enc := codecStr(codecRun(t, map[string]any{"text": s, "op": "encode", "encoding": "unicode"}), "result")
+		back := codecRun(t, map[string]any{"text": enc, "op": "decode", "encoding": "unicode"})
+		if got := codecText(t, back); got != s {
+			t.Errorf("%q 编成 %q，解回来成了 %q —— 编得出去解不回来，这一档在 Windows 路径上就是坏的", s, enc, got)
+		}
+	}
+}
+
+func Test自动档给出去的写法要能原样解回清理过的原文(t *testing.T) {
+	// 贴进来的是带引号的一段（从配置文件里抄的常态）：显示的是清理过的原文，
+	// 那五种写法就必须都是这一段编出来的，否则人贴走的是另一个值
+	const cleaned = "hello world!"
+	v := codecRun(t, map[string]any{"text": `"` + cleaned + `" `})
+	for key, want := range map[string]string{
+		"base64": base64.StdEncoding.EncodeToString([]byte(cleaned)),
+		"hex":    hex.EncodeToString([]byte(cleaned)),
+	} {
+		got := codecStr(v, key)
+		if got != want {
+			t.Errorf("%s 编的不是显示的那一份：%q，应为 %q", key, got, want)
+		}
+		back := codecRun(t, map[string]any{"text": got, "op": "decode", "encoding": key})
+		if codecText(t, back) != cleaned {
+			t.Errorf("%s 解回来不是原文：%q", key, back.Values["text"])
+		}
+	}
+}
+
+func Test指死字母表时按串里的字符分该不该拦(t *testing.T) {
+	// 串里出现了 + 就是标准字母表：这时指 base64url 要拦（- 会被当成别的字），
+	// 而 _ 反过来 —— 这一拦一放才有意义，全放等于没在指
+	for _, tc := range []struct {
+		in, enc string
+		ok      bool
+	}{
+		{"aGVsbG8+", "base64", true},
+		{"aGVsbG8+", "base64url", false},
+		{"aGVsbG8_", "base64url", true},
+		{"aGVsbG8_", "base64", false},
+	} {
+		v := codecRun(t, map[string]any{"text": tc.in, "op": "decode", "encoding": tc.enc})
+		if tc.ok && v.Code != codecDecodedText {
+			t.Errorf("%s 指成 %s 本该解得开：%s / %v", tc.in, tc.enc, v.Code, v.Values["why"])
+		}
+		if !tc.ok {
+			if v.Code != codecNotDecodable {
+				t.Errorf("%s 指成 %s 是笔误，不拦下来人就拿着错值去对设备了（判定 %s）", tc.in, tc.enc, v.Code)
+				continue
+			}
+			if why := codecStr(v, "why"); !strings.Contains(why, "字母表") {
+				t.Errorf("要说破分歧在哪：%q", why)
+			}
+		}
+	}
 }
 
 func TestCodec工具声明(t *testing.T) {
@@ -461,9 +613,14 @@ func TestCodec工具声明(t *testing.T) {
 }
 
 func Test每个判定都有人话(t *testing.T) {
-	// 后端给的码，界面侧必须有对应措辞；这里先钉住「码没打错字」
+	// 一个码要在三处齐：后端的常量、Summary（AI 只看得到这个）、界面 CC_CODE（客户只看得到这个）。
+	// 只查前两处等于没查 —— 码没打错字这件事，恒真。
 	wanted := []string{codecDecodedText, codecDecodedBytes, codecStillEncoded,
 		codecAmbiguous, codecPlainText, codecNotDecodable, codecEncoded}
+	src, err := os.ReadFile("../../../ui/src/app.js")
+	if err != nil {
+		t.Fatalf("读不到界面源码，这一项就漏了：%v", err)
+	}
 	seen := map[string]bool{}
 	for _, c := range wanted {
 		if seen[c] {
@@ -472,6 +629,9 @@ func Test每个判定都有人话(t *testing.T) {
 		seen[c] = true
 		if !strings.Contains(codecTool.Summary, c) {
 			t.Errorf("Summary 里没提到 %s，AI 看不见这一档", c)
+		}
+		if !strings.Contains(string(src), c) {
+			t.Errorf("界面里没有 %s —— 客户会看见一个裸码", c)
 		}
 	}
 }
