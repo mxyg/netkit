@@ -411,9 +411,19 @@ func (w *icmpWatcher) Close() error { return w.conn.Close() }
 
 // run 用真的套接字连发。
 func (w *icmpWatcher) run(ctx context.Context, interval, dur time.Duration) ([]pingSample, string) {
-	return sweep(ctx, interval, dur, func(seq int) (time.Duration, string, error) {
+	return sweep(ctx, interval, dur, w.probe())
+}
+
+// runN 连发固定 n 发。★ 给「要按发数算丢包率」的调用方（体检到网关那一小轮）。
+func (w *icmpWatcher) runN(ctx context.Context, interval time.Duration, n int) ([]pingSample, string) {
+	return sweepN(ctx, interval, n, w.probe())
+}
+
+// probe 把「发一发」包成一个动作。
+func (w *icmpWatcher) probe() watchProbe {
+	return func(seq int) (time.Duration, string, error) {
 		return pingOnce(w.conn, w.addr, w.dst, w.id, seq, w.timeout)
-	})
+	}
 }
 
 // watchProbe 发一发的动作。★ 抽出来是为了能测：
@@ -422,20 +432,37 @@ func (w *icmpWatcher) run(ctx context.Context, interval, dur time.Duration) ([]p
 type watchProbe func(seq int) (time.Duration, string, error)
 
 // sweep 按间隔连发到时间为止，返回每一发的结果，以及「包是不是根本没出去」的原因。
+func sweep(ctx context.Context, interval, dur time.Duration, probe watchProbe) ([]pingSample, string) {
+	return sweepFor(ctx, interval, probe, func(seq int, elapsed time.Duration) bool {
+		return elapsed < dur
+	})
+}
+
+// sweepN 连发固定 n 发就收。★ 和 sweep 的差别只在什么时候停下：按发数，不按时长。
+//
+//	「问了 6 次、2 次没回」这种丢包率必须按发数算 —— 按时长跑的话，链路一慢就只问得到 1 次，
+//	那个「丢包 100%」是工具的窗口太小，不是网络真丢了。
+func sweepN(ctx context.Context, interval time.Duration, n int, probe watchProbe) ([]pingSample, string) {
+	return sweepFor(ctx, interval, probe, func(seq int, elapsed time.Duration) bool {
+		return seq <= n
+	})
+}
+
+// sweepFor 按绝对时刻连发，什么时候收摊由 more 说了算。
 //
 // ★ 发不出去（比如本机没有路由）和发了没回是两件事：前者从第一发就该停下 ——
 //
 //	继续发只会得到一条「全丢」的曲线，而那条曲线会让人去查对端的防火墙。
-func sweep(ctx context.Context, interval, dur time.Duration, probe watchProbe) ([]pingSample, string) {
+func sweepFor(ctx context.Context, interval time.Duration, probe watchProbe, more func(seq int, elapsed time.Duration) bool) ([]pingSample, string) {
 	var out []pingSample
 	start := time.Now()
-	deadline := start.Add(dur)
 	seq := 1
 	for {
-		if ctx.Err() != nil || !time.Now().Before(deadline) {
+		elapsed := time.Since(start)
+		if ctx.Err() != nil || !more(seq, elapsed) {
 			break
 		}
-		at := time.Since(start)
+		at := elapsed
 		rtt, kind, err := probe(seq)
 		s := pingSample{Seq: seq, AtMS: at.Milliseconds(), Kind: kind}
 		if rtt > 0 {

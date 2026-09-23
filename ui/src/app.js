@@ -394,6 +394,7 @@ function startPolling(root) {
 // ── 连通性 ──
 
 async function renderProbe(root) {
+  root.appendChild(checkupCard());
   root.appendChild(dualStackCard());
   root.appendChild(traceCard());
   root.appendChild(mtrCard());
@@ -560,6 +561,224 @@ function dualStackCard() {
         ${attemptRow('AAAA 记录（v6）', v.domain.aaaa)}
         ${eyeballRow(v.eyeballs)}
       </table>`;
+  };
+  return card;
+}
+
+/*
+ * ── 一键体检 ──
+ *
+ * ★★ 这一栏卖的不是「八个结果」，是**顺序**：八行清单谁都会列，「第一个坏掉的是哪一步」才省时间。
+ *   网关在丢包时，DNS 和出口测到的那些「慢」全是链路带出来的 —— 从中间开始查必然查错方向。
+ *   所以这里照着后端给的顺序平铺，不许按颜色或耗时重排。
+ * ★ 后端只出判定码，码 → 人话全部在这里（多语种靠的就是这条分工）。
+ */
+
+// 顶层判定 → [标题, 颜色, 该怎么做]
+const CK_TOP = {
+  'all-good': ['八项都过', 'ok',
+    '有地址、有默认路由、到网关不丢、解析得出、出得了外网、时钟也对得上。'
+    + '★ 这只说明「这台机器到公网这一段」没问题 —— 两台设备之间通不通，得拿那两台的地址另问。'],
+  'degraded': ['没有硬故障，但有值得看一眼的', 'warn',
+    '下面标出来的几项都不会让网断，却常常就是「慢」和「偶尔卡一下」的来源 —— 从标了「先看这一步」的那项开始。'],
+  'broken-at-iface': ['坏在本机网卡', 'bad',
+    '没有一块「启用、有链路、且有可用地址」的网卡 —— 后面每一项都是在它之上测的，先把这一步解决掉。'],
+  'broken-at-route': ['坏在默认路由', 'bad',
+    '有地址却没有默认路由，这台机器只会发到本网段：局域网里 ping 得通，外面什么都到不了。'
+    + '查 DHCP 有没有发网关，或者静态地址里那个网关填错了。'],
+  'broken-at-gateway': ['坏在到网关这一段', 'bad',
+    '★ 网关在丢包时，DNS 和出口的「慢」都是链路带出来的，不是那两层自己的毛病 —— 先修它，再回头看后面那些数。'
+    + '查线、查 AP、查网关本身；最好另拿一台机器同时发一份对照，才知道是不是只有这台的事。'],
+  'broken-at-dns': ['坏在域名解析', 'bad',
+    '配了 DNS 服务器却问不出名字（或者根本没配）。出口那几项是拿 IP 直连测的，所以它们正常不代表解析正常 ——'
+    + '「网页打不开，但 IP ping 得通」就是这一层。'],
+  'broken-at-egress': ['局域网好，出不了外网', 'bad',
+    '到网关不丢、名字也问得出，但 TCP 连不上公网 —— 往上查：网关的 NAT、ACL、认证门户，'
+    + '或者这条链路本来就只放行内网。'],
+  'broken-at-clock': ['本机时钟偏得太多', 'bad',
+    '偏差已经大到会出事：TLS 证书校验直接失败、日志时间戳互相对不上、带时间有效性的令牌全部被拒。'
+    + '先校时，再回头看别的。'],
+};
+
+const CK_STEP = {
+  iface: '本机网卡', route: '默认路由', gateway: '到网关', dns: '域名解析',
+  egress: '出外网', mtu: '出口 MTU', clock: '本机时钟', proxy: '系统代理',
+};
+
+// 每一步自己的坏法。★ tone 空的是「没问」——它不算结论，别渲染成红。
+const CK_CODE = {
+  iface: {
+    'ok': ['在用', 'ok'], 'no-nic': ['没有一块网卡', 'bad'],
+    'all-disabled': ['网卡全被禁用了', 'bad'],
+    'no-link': ['启用了但没链路（没插线 / 没连上 AP）', 'bad'],
+    'no-address': ['没有可用地址', 'bad'],
+    'virtual-only': ['只有隧道口有地址', 'warn'],
+  },
+  route: {
+    'ok': ['两族都有', 'ok'], 'v4-only': ['只有 IPv4', 'ok'],
+    'v6-only': ['只有 IPv6', 'warn'], 'none': ['没有默认路由', 'bad'],
+  },
+  gateway: {
+    'ok': ['不丢也不抖', 'ok'], 'stable': ['不丢也不抖', 'ok'],
+    'jitter': ['偶尔抖一下', 'warn'],
+    'loss': ['在丢包', 'bad'], 'no-route': ['包根本发不出去', 'bad'],
+    'unreachable': ['明确回了不可达', 'bad'],
+    'no-reply': ['不回 ping', 'warn'],
+    'no-gateway': ['没有下一跳（点对点链路）', ''],
+    'tunnel': ['走隧道口，没问', ''], 'not-asked': ['没问', ''],
+  },
+  dns: {
+    'ok': ['问得出名字', 'ok'], 'no-server': ['系统没配 DNS', 'bad'],
+    'error': ['解析失败', 'bad'], 'no-record': ['一条记录都问不出', 'bad'],
+    'no-v4-record': ['v4 问空了', 'warn'],
+  },
+  egress: {
+    'ok': ['出得去', 'ok'], 'v6-egress-broken': ['IPv6 出得去一半', 'warn'],
+    'v4-egress-broken': ['IPv4 出得去一半', 'warn'],
+    'broken': ['出不了外网', 'bad'], 'not-asked': ['没问', ''],
+  },
+  mtu: {
+    'ok': ['正常', 'ok'], 'small': ['偏小', 'warn'],
+    'tunnel': ['走隧道口，那样是对的', 'ok'], 'unknown': ['没读到', ''],
+  },
+  clock: {
+    'ok': ['对得上', 'ok'], 'skew': ['有点偏', 'warn'],
+    'big-skew': ['偏得太多', 'bad'], 'not-asked': ['没问到', ''],
+  },
+  proxy: {
+    'none': ['没设代理', 'ok'], 'set': ['走了代理', 'warn'],
+    'unsupported': ['这台读不到', ''],
+  },
+};
+
+const ckFam = (f, fn) => ['ipv4', 'ipv6'].filter((k) => f && f[k])
+  .map((k) => `<div><b class="dim">${k === 'ipv4' ? 'IPv4' : 'IPv6'}</b> ${fn(f[k])}</div>`).join('');
+
+const ckLoss = (n) => (n || n === 0 ? `丢 ${Math.round(n)}%` : '');
+
+// 事实那一列：只把后端给的数摊开，不在这里下判断。
+function ckFacts(step, f) {
+  if (!f) return '<span class="dim">—</span>';
+  switch (step) {
+    case 'iface': {
+      const names = f.withAddress || [];
+      return `${f.nics || 0} 块网卡 · 启用 ${f.up || 0} · 有链路 ${f.running || 0} · `
+        + (names.length ? `有地址：<code>${esc(names.join('、'))}</code>`
+                        : '<span class="dim">没有一块网卡有可用地址</span>');
+    }
+    case 'route':
+      return ckFam(f, (x) => (x.hasRoute
+        ? `→ <code>${esc(x.gateway || '无下一跳')}</code> 经 ${esc(x.iface || '?')}`
+          + (x.count > 1 ? ` <span class="dim">（共 ${x.count} 条）</span>` : '')
+        : '<span class="dim">没有默认路由</span>'));
+    case 'gateway':
+      return ckFam(f, (x) => pillOf(CK_CODE.gateway, x.code)
+        + (x.sent
+          ? ` 到 <code>${esc(x.gateway)}</code> 发了 ${x.sent} 发 · ${ckLoss(x.lossPercent)}`
+            + ` · 中位 ${ms(x.rttMedianMs)} · 抖动 ${ms(x.jitterAvgMs)}`
+            + (x.unreachable ? ` · 明确不可达 ${x.unreachable} 发` : '')
+          : (x.gateway ? ` 目标 <code>${esc(x.gateway)}</code>` : '')));
+    case 'dns': {
+      const srv = (f.servers || []).map((s) => `${esc(s.addr)}${s.iface ? '（' + esc(s.iface) + '）' : ''}`).join('、');
+      const at = (list) => {
+        const cells = (list || []).map((a) => `<code>${esc(a.addr)}</code> ${pillOf(DS_CONN, a.code)}`
+          + ` <span class="dim">${ms(a.rttMs)}</span>`).join('　');
+        return cells || '<span class="dim">没有</span>';
+      };
+      return `<div>${srv ? '问 ' + srv : '<span class="dim">系统里没配 DNS 服务器</span>'}
+        · <code>${esc(f.domain || '')}</code>${f.lookupMs ? ' 解析 ' + ms(f.lookupMs) : ''}${f.error ? ' · ' + esc(f.error) : ''}</div>
+        <div>A：${at(f.v4)}</div><div>AAAA：${at(f.v6)}</div>`;
+    }
+    case 'egress':
+      return ckFam(f, (x) => pillOf(DS_CONN, x.egress)
+        + ` <code>${esc(x.target || '')}</code>${x.rttMs ? ' ' + ms(x.rttMs) : ''}`
+        + (x.present ? '' : ' <span class="dim">这一族不在场</span>'));
+    case 'mtu': {
+      const others = (f.nics || []).filter((n) => n.iface !== f.egressIface).slice(0, 5)
+        .map((n) => `${n.iface} ${n.mtu}${n.virtual ? '（隧道）' : ''}`).join('、');
+      return `出口 <code>${esc(f.egressIface || '未识别')}</code> MTU <b>${f.egressMtu || '—'}</b>`
+        + (f.egressKind ? ` <span class="dim">${esc((KIND[f.egressKind] || [f.egressKind])[0])}</span>` : '')
+        + (others ? ` <span class="dim">其它：${esc(others)}</span>` : '');
+    }
+    case 'clock': {
+      const off = f.offsetMs;
+      const has = off || off === 0;
+      return `问 <code>${esc(f.server || '')}</code> · 回了 ${f.answers || 0}/${f.samples || 0} 包`
+        + (has ? ` · <b>${off >= 0 ? '本机慢' : '本机快'} ${esc(humanMs(Math.abs(off)))}</b>` : '')
+        + (f.rttMs ? ` · 往返 ${ms(f.rttMs)}` : '')
+        + (f.serverTime ? `<div class="dim">它说 ${esc(fmtStamp(f.serverTime))} · 本机 ${esc(fmtStamp(f.localTime))}</div>` : '');
+    }
+    case 'proxy': {
+      const e = f.entries || [];
+      if (e.length) return e.map((x) => `<code>${esc(x)}</code>`).join('　');
+      return f.scutilError ? `<span class="dim">读取代理设置失败：${esc(f.scutilError)}</span>`
+                           : '<span class="dim">没读到任何代理条目</span>';
+    }
+  }
+  return '<span class="dim">—</span>';
+}
+
+// 一行体检项。★ 「先修 / 先看这一步」只贴在顶层点名的那一步上 ——
+// 八行里后面那些坏的是被它带出来的，贴成一样的颜色就等于没给出顺序。
+function ckRow(it, i, first) {
+  const map = CK_CODE[it.step] || {};
+  const [text, tone] = map[it.code] || [it.code || '—', ''];
+  const flag = it.step === first && first
+    ? `<span class="pill ${it.severity === 'bad' ? 'bad' : 'warn'}">${it.severity === 'bad' ? '先修这一步' : '先看这一步'}</span>`
+    : '';
+  return `<tr><td class="dim">${i + 1}</td>
+    <td>${esc(CK_STEP[it.step] || it.step)} ${flag}</td>
+    <td><span class="pill ${tone}">${esc(text)}</span></td>
+    <td>${ckFacts(it.step, it.facts)}</td></tr>`;
+}
+
+function checkupCard() {
+  const card = $(`<div class="card">
+    <h2>一键体检 <span id="cku-top"></span></h2>
+    <p class="hint">什么都不用填，按老手的排查顺序把这台机器过一遍：网卡 → 默认路由 → 到网关丢不丢 →
+      解析 → 出外网 → MTU → 时钟 → 系统代理。<b>八项并行，两三秒出结果</b>，只发少量探测包、不改动任何东西。
+      ★ 顶层只说<b>第一个坏掉的是哪一步</b>，因为后面那些数是带着这个毛病测出来的 —— 从中间开始查，一定会查错方向。</p>
+    <details style="margin-top:8px"><summary class="dim">高级：换体检用的域名 / NTP 源 / 到网关发几发</summary>
+      <div class="row" style="margin-top:10px">
+        <div><label>域名（公网不通时换内网里一定解析得到的名字）</label><input id="cku-d" placeholder="默认 www.cloudflare.com"></div>
+        <div><label>NTP 源（内网有自己的时钟源就填它）</label><input id="cku-n" placeholder="默认 pool.ntp.org"></div>
+        <div style="flex:0 0 150px"><label>到网关发几发</label><input id="cku-p" placeholder="默认 6（3 到 20）"></div>
+      </div>
+    </details>
+    <div style="margin-top:12px"><button class="btn primary" id="cku-go">开始体检</button></div>
+    <div id="cku-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#cku-out');
+  const top = card.querySelector('#cku-top');
+  card.querySelector('#cku-go').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">体检中…（八项并行，约 3 秒）</div>';
+    const args = {};
+    const d = card.querySelector('#cku-d').value.trim();
+    const n = card.querySelector('#cku-n').value.trim();
+    const p = Number(card.querySelector('#cku-p').value);
+    if (d) args.domain = d;
+    if (n) args.ntpServer = n;
+    if (p) args.lanProbes = p;
+    const r = await call('net.checkup', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">体检失败：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const items = v.items || [];
+    const [title, cls, advice] = CK_TOP[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      <table style="margin-top:14px">
+        <tr><th></th><th>按排查顺序</th><th>判定</th><th>看到的事实</th></tr>
+        ${items.map((it, i) => ckRow(it, i, v.first)).join('')}
+      </table>
+      <p class="hint" style="margin-top:10px">★ 只有 v4/v6 分开给的两项（到网关、出外网）才算得清「有一族出得去一半」——
+        那种机器不会断网，但每次连接都慢半拍。</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };
   return card;
 }

@@ -502,3 +502,30 @@ func Test持续ping工具声明(t *testing.T) {
 		t.Error("Schema 不许放过没写的参数：写错字段名应该当场报错，而不是静默按默认值跑 10 秒")
 	}
 }
+
+// 按发数发：每发都比间隔还慢时，也必须问满那 n 发。
+// ★ 体检里到网关那一小轮用的就是这条 —— 它要的是「6 发里丢了 2 发」这个数。
+//
+//	如果按时长跑，链路一慢就只问得到 1 发，那个「丢包 100%」是工具的窗口太小，不是网络丢的。
+func Test按发数发时慢链路也问得满(t *testing.T) {
+	var probes int
+	samples, noRoute := sweepN(context.Background(), 20*time.Millisecond, 6,
+		func(seq int) (time.Duration, string, error) {
+			probes++
+			time.Sleep(30 * time.Millisecond) // 每一发都比间隔还慢
+			return 0, verdictNoReply, nil
+		})
+	if noRoute != "" {
+		t.Errorf("说成本机没路：%s", noRoute)
+	}
+	if probes != 6 || len(samples) != 6 {
+		t.Errorf("发了 %d 收到 %d 条，应该问满 6 发", probes, len(samples))
+	}
+	if st := statsOf(samples); st.Sent != 6 || st.LossPercent != 100 {
+		t.Errorf("汇总成 %+v，应该是 6 发全发、全没回执", st)
+	}
+	// ★ 发得满不等于时刻等距：慢链路会把后面的时刻挤到一起，这一点留给调用方说清楚。
+	if samples[5].AtMS <= int64(5*20/2) {
+		t.Errorf("第 6 发的时刻 %dms，快到不像话（每发就要 30ms）", samples[5].AtMS)
+	}
+}
