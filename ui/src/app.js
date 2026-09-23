@@ -44,6 +44,7 @@ const PAGES = [
   { id: 'scan', name: '扫描与发现', render: renderScan },
   { id: 'stream', name: '视频流', render: renderStream },
   { id: 'remote', name: '远程', render: renderRemote },
+  { id: 'tools', name: '小工具', render: renderTools },
 ];
 
 let current = 'nic';
@@ -2646,6 +2647,112 @@ function auditCard() {
         <td class="${String(e.result).startsWith('failed') || e.result === 'send-failed' ? 'bad' : 'dim'}">${esc(e.result || '')}</td>
       </tr>`).join('')}</table>`;
   };
+  return card;
+}
+
+// ── 小工具 ──
+
+/*
+ * ★ 这一页放「不常用、但每次现场都要现查」的东西，所以不挤占前面几页：
+ *   排障时人要的是连通性，不是掩码。
+ */
+async function renderTools(root) {
+  root.appendChild(subnetCalcCard());
+}
+
+// ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
+//   重叠要改配置，主机地址只是登记时别抄错，跨族是这个问题本身问不成立。
+// ★ 有两句要按结果里的字段改口（写成函数）：/31 没有「网络地址不能分给设备」这回事，
+//   而显式填了 /32 的人不是「忘填掩码」，说成他没填是在怪错人。
+const SC_CODE = {
+  'single-address': ['只是一个地址', '', (v) => v.prefixAssum
+    ? '掩码没填上，所以按「一个地址」算 —— 没替你猜一个 /24。要算一段，把掩码补上再算一次。'
+    : `填的就是 /${v.prefix}：一个地址自成一个段。要算一段，把斜杠后面的数字改小（如 /24）。`],
+  'v4-network': ['填的是网段地址', 'ok', (v) => v.pointToPoint
+    ? '这是 /31 互联口：这一段的两个地址都能配给设备，没有「减掉网络地址和广播地址」这一步。'
+    : '这个可以直接登记。★ 网络地址本身不能分给设备用（它是「这一段」的名字）。'],
+  'v4-host-address': ['填的是主机地址', 'warn', '段算得出来（见下），但登记时别把这个地址抄成网段地址。'],
+  'v4-broadcast-address': ['填的是广播地址', 'bad', '它不能配在任何设备上 —— 大概率末段该写 0。'],
+  'v6-prefix': ['IPv6 段', '', 'v6 没有广播地址、也没有「总数减二」，按下面「地址总数」那一栏读。'],
+  'networks-overlap': ['两段重叠', 'bad',
+    '这是「有时候连得上有时候连不上」的根因：两条路由都能到一个地址，走哪条看内核当时怎么选。得改掩码或改地址池。'],
+  'families-differ': ['两族各自编址', '',
+    '这个问法本身不成立 —— v4 段和 v6 段谈不上撞。要说「这台机器两族是不是都通」，去连通性页做双栈体检。'],
+};
+
+function subnetCalcCard() {
+  const card = $(`<div class="card">
+    <h2>子网计算 <span id="sc-top"></span></h2>
+    <p class="hint">填什么都认：192.168.1.0/24、192.168.1.0/255.255.255.0（从设备页抄下来的写法）、
+      只写地址（按一个地址算，★ 不替你猜 /24）。
+      掩码 1 不连续（比如 255.0.255.0）会直接报错 —— 那种掩码不成段，硬算出来的答案是假的。
+      纯算术，不发任何包，所以它答不了「这段里有没有人」，那要用网段扫描。</p>
+    <div class="row">
+      <div style="flex:1 1 260px"><label>要算的段或地址</label>
+        <input id="sc-cidr" placeholder="192.168.1.100/255.255.255.0"></div>
+      <div style="flex:1 1 260px"><label>对照段（可留空，填了就问撞不撞）</label>
+        <input id="sc-peer" placeholder="192.168.1.128/25"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="sc-go">算</button></div>
+    </div>
+    <div id="sc-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#sc-out');
+  const top = card.querySelector('#sc-top');
+  const run = async () => {
+    const args = { cidr: card.querySelector('#sc-cidr').value.trim() };
+    const peer = card.querySelector('#sc-peer').value.trim();
+    if (peer) args.peer = peer;
+    if (!args.cidr) { out.innerHTML = '<div class="empty">先填要算的段或地址。</div>'; return; }
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">计算中…</div>';
+    const r = await call('net.subnet.calc', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">算不了：${esc(r.message || r.error)}</div>`; return; }
+    const v = r.values;
+    const [title, cls, advice] = SC_CODE[r.verdict] || [r.verdict || '没给判定', '', ''];
+    const say = typeof advice === 'function' ? advice(v) : advice;
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    // ★ 只列后端真给了的字段：v6 没有掩码/通配码/广播，硬排上去会出现「广播：undefined」
+    const items = [
+      ['规整网段', v.canonical], ['这个段是', v.network],
+      ['掩码', v.mask], ['通配码', v.wildcard],
+      ['地址总数', v.size], ['可用主机数', v.usable],
+      ['首个可用', v.firstUsable], ['末个可用', v.lastUsable], ['广播地址', v.broadcast],
+      ['反向解析区', v.reverseZone],
+    ].filter((x) => x[1] !== undefined && x[1] !== '');
+    const n6 = v.v6Notes || {};
+    if (n6.kind) items.push(['地址性质', ({
+      ula: '站内自建（ULA）—— 不该出现在公网', 'link-local': '链路本地 —— 出不了这条链路',
+      global: '公网可路由', multicast: '组播地址 —— 不是用来配的', loopback: '本机回环',
+    }[n6.kind] || n6.kind)]);
+    if (n6.sla64Count) items.push(['可切出的 /64', n6.sla64Count + ' 个（v6 通常一条链路一个 /64）']);
+    if (v.pointToPoint) items.push(['点对点段', '两个地址都能用（/31 互联口，没有网络/广播地址）']);
+    if (v.peer) items.push(['对照段', v.peer]);
+    const rel = [];
+    if (v.overlaps === true) {
+      rel.push(['怎么撞的', ({
+        'identical': '两段完全相同', 'peer-inside': '填的这段把对照段整个包住',
+        'peer-contains': '对照段把填的这段整个包住',
+      }[v.contains] || v.contains)]);
+      if (v.overlapSize) rel.push(['重叠地址数', v.overlapSize]);
+    }
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(say)}</div>
+      <table style="margin-top:14px"><tr><th></th><th></th></tr>
+        ${items.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+          <td><code>${esc(x)}</code></td></tr>`).join('')}
+        ${rel.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+          <td><b>${esc(x)}</b></td></tr>`).join('')}</table>
+      ${v.prefixAssum ? '<p class="hint">★ 输入的掩码是空的，这一栏按「一个地址」算 —— 没有替你猜一个 /24。</p>' : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#sc-go').onclick = run;
+  card.querySelector('#sc-cidr').onkeydown = (e) => { if (e.key === 'Enter') run(); };
+  card.querySelector('#sc-peer').onkeydown = (e) => { if (e.key === 'Enter') run(); };
   return card;
 }
 
