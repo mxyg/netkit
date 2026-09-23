@@ -2666,6 +2666,7 @@ async function renderTools(root) {
   root.appendChild(macRandomCard());
   root.appendChild(codecCard());
   root.appendChild(wolCard());
+  root.appendChild(fileshareCard());
 }
 
 // ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
@@ -3435,6 +3436,272 @@ function routesCard() {
   card.querySelector('#rt-go').onclick = run;
   card.querySelector('#rt-dest').onkeydown = (e) => { if (e.key === 'Enter') run(); };
   run();  // 只读本机，不要人点头：进页面就把表摆出来
+  return card;
+}
+
+// ── 文件共享：把本机一个目录开成只读的下载地址 ──
+//
+// ★★ 这张卡跟别的卡有一点不一样：**开着的每一秒都在把一个目录摊给整个网段**
+//   （无鉴权，谁都能读）。所以默认版面必须一眼看见「开着没有、开的哪个目录、
+//   绑在哪几个地址」，停掉那颗钮得一直在手边。
+//   ★ 后端只接 GET/HEAD：界面上压根没有上传入口，不是「藏起来不给点」。
+
+const FS_CODE = {
+  'share-serving': ['正在共享', 'ok'],
+  'share-stopped': ['已经停掉了', ''],
+  'share-idle': ['没在共享', ''],
+};
+
+// ★ 这几种「没成」的处置完全不同，界面不许并成一句「失败」：
+//   partial 是设备那头掉了或网断了（重发一次就行），not-found 是文件名填错
+//   （去改设备那一页的地址），denied 是有人在试上传或想翻出共享目录。
+const FS_TAKE = {
+  ok: ['整份取走了', ''],
+  head: ['只问了大小', ''],
+  range: ['按段取的（断点续传在跑）', ''],
+  partial: ['传到一半断了', 'bad'],
+  list: ['翻了目录', 'warn'],
+  denied: ['被拒（想上传 / 想翻出去）', 'bad'],
+  'not-found': ['没有这个文件', 'warn'],
+};
+
+// 后端给的是「这块口凭什么选上」的原话，界面翻成人话，并且把风险点一句带上：
+// 指定网卡这条路是绕开默认路由的，机器上那块口连着谁，只有现场的人知道。
+const FS_WHY = {
+  '你指定的网卡': '说的就是你指的那块口 ★ 这一条没照着默认路由挑，确认一下这块口连着谁',
+  'IPv4 默认路由走这块': '按 IPv4 默认路由挑的（这台机器往上走的那块口）',
+  '本机只有一块带可用 IPv4 的网卡': '自动挑的：本机只有这一块带可用的 IPv4 地址',
+};
+
+function fsSize(n) {
+  if (typeof n !== 'number') return '—';
+  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KB';
+  return n + ' 字节';
+}
+
+function fsClock(s) {
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return '—';
+  const p = (x) => String(x).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function fsSpan(since) {
+  const d = new Date(since);
+  if (isNaN(d.getTime())) return '';
+  let m = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (m < 1) m = 1;
+  if (m < 60) return `${m} 分钟`;
+  return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+}
+
+// 台账：现场查「设备说下载失败」就看这一栏 —— 有没有人来取过、
+// 取到第几个字节断的，看了就不用猜。
+function fsLedger(recent) {
+  const list = recent || [];
+  if (!list.length) {
+    return '<div class="empty">还没有设备来取过文件。它说不行的时候回来看这一栏：'
+      + '空着说明根本没来（地址或网不对），有半截的说明传断了。</div>';
+  }
+  const rows = list.map((t) => {
+    const [word, cls] = FS_TAKE[t.status] || [t.status || '—', ''];
+    return `<tr>
+      <td class="dim">${esc(fsClock(t.at))}</td>
+      <td><code>${esc(t.peer || '—')}</code></td>
+      <td><code>${esc(t.path || '—')}</code></td>
+      <td class="dim">${esc(fsSize(t.bytes))}</td>
+      <td class="${cls}">${esc(word)}</td>
+    </tr>`;
+  }).join('');
+  return `<div style="max-height:280px;overflow:auto"><table>
+    <tr><th>什么时候</th><th>谁取的</th><th>取了什么</th><th>多少</th><th>结果</th></tr>
+    ${rows}</table></div>
+    <p class="hint">只留最近 50 笔。「被拒」那一行是分开的：想上传的一律不收，
+      文件名写错只算没找到，不混成「有人在攻击」。</p>`;
+}
+
+function fsWarn(lines) {
+  if (!lines || !lines.length) return '';
+  return `<div style="margin-top:10px;padding:10px 12px;border-radius:6px;font-size:13.5px;
+      background:var(--gold-bg);border:1px solid var(--gold-dim);color:var(--gold)">★ ${
+    lines.map((x) => esc(x)).join('<br>★ ')}</div>`;
+}
+
+let fsTimer = null;
+
+function fileshareCard() {
+  const card = $(`<div class="card">
+    <h2>文件共享（只读） <span id="fs-top"></span></h2>
+    <p class="hint">把本机一个目录开成 http 下载地址 —— 设备的升级页面要填一个
+      「固件下载地址」，交换机要把配置文件拉回去，都是这一张。
+      ★ <strong>只读</strong>：只发不收，同网段谁都改不了、删不了本机任何东西。
+      ★ 只绑你挑的那块网卡上的地址，<strong>不绑 0.0.0.0</strong> ——
+      多网卡机器上那等于把目录从办公网甚至公网口也开出去。
+      ★ 无鉴权：开着的时候同一网段任何设备不必登录就能把这个目录整个读走，
+      所以每次开都要你点头，用完请点停掉（停是当场断，正在传的那一发也立刻断）。</p>
+    <div class="row">
+      <div style="flex:1 1 300px"><label>要共享的目录（只放要发出去的那些文件）</label>
+        <input id="fs-root" placeholder="/Users/you/firmware 或 D:\\固件"></div>
+      <div style="flex:0 0 150px"><label>开在哪块网卡（留空自动）</label>
+        <input id="fs-iface" placeholder="en0 / eth0 / WLAN"></div>
+      <div style="flex:0 0 100px"><label>端口</label>
+        <input id="fs-port" placeholder="8080"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn danger" id="fs-go">开共享</button></div>
+    </div>
+    <div class="row">
+      <div style="flex:1 1 260px"><label>或者只绑这几个地址（填了就按这个来，覆盖上面那块网卡）</label>
+        <input id="fs-addrs" placeholder="192.168.1.20 fd00::1（不许写 0.0.0.0）"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <label style="display:flex;gap:6px;align-items:center;font-size:13px;font-weight:normal">
+          <input type="checkbox" id="fs-list" checked style="flex:0 0 auto">
+          允许翻目录列表</label></div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:0 0 auto;min-width:0">
+        <button class="btn" id="fs-refresh">刷新台账</button>
+        <button class="btn danger" id="fs-stop" style="display:none">立刻停掉</button></div>
+    </div>
+    <div id="fs-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#fs-out');
+  const top = card.querySelector('#fs-top');
+  const btnStop = card.querySelector('#fs-stop');
+
+  const paint = (verdict, v) => {
+    const [title, cls] = FS_CODE[verdict] || [verdict || '没给判定', ''];
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+    btnStop.style.display = verdict === 'share-serving' ? '' : 'none';
+    const st = v.status || v;                 // status 卡把台账包在 status 里
+    const serving = verdict === 'share-serving';
+    // serve 和 status 两个形状都要能画：字段落在哪一层不一样，别看错成 undefined
+    const root = v.root || st.root || '';
+    const port = v.port || st.port || 0;
+    const listing = typeof v.listing === 'boolean' ? v.listing : st.listing;
+    const urls = (v.urls && v.urls.length ? v.urls : st.urls) || [];
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--sunken)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--line)';
+
+    let say;
+    if (verdict === 'share-idle') {
+      say = '现在没开着。开一次就是一次对外暴露，需要时再开、用完就停 —— '
+        + '这个共享不鉴权，同网段谁都能读。';
+    } else if (verdict === 'share-stopped') {
+      // ★ 停掉之后不再摆下载地址：那几条已经读不到东西了，还做成可复制的样子，
+      //   人就照旧往设备里粘，然后回来查「为什么下载失败」。
+      say = `端口已经放掉，${esc(root)} 不再对外可读。`
+        + `这中间一共被取走 ${v.requests || 0} 次、${esc(fsSize(v.bytes || 0))}。`
+        + '已经下到设备里的文件不受影响。';
+    } else if (serving && v.iface) {
+      say = `目录 <code>${esc(root)}</code> 正从网卡 <b>${esc(v.iface)}</b>`
+        + `（${esc(FS_WHY[v.ifaceWhy] || v.ifaceWhy || '怎么定的没说')}）发出去，端口 ${port || '—'}。`
+        + `只读，不收上传。★ 同一网段的设备不必登录就能读到这个目录里的东西。`;
+    } else if (serving) {
+      say = `目录 <code>${esc(root)}</code> 正绑在这些地址上：${
+        (v.addrs || st.addrInfo || []).map((x) => `<code>${esc(x)}</code>`).join('、')
+        }，端口 ${port || '—'}。只读，不收上传。`;
+    } else {
+      say = '后端给了一个这里还没认得的判定，原文在下面展开看。';
+    }
+
+    const facts = [];
+    if (serving || verdict === 'share-stopped') {
+      if (typeof v.entries === 'number') {
+        facts.push(['目录里有多少', `${v.entries} 个文件${v.dirs ? `、${v.dirs} 个子目录` : ''}，共 ${esc(fsSize(v.bytes || 0))}`]);
+      }
+      if (typeof st.requests === 'number') {
+        facts.push(['已被取走', `${st.requests} 次、${esc(fsSize(st.bytes || 0))}`
+          // ★ 两个数分开摆：想上传的是有人在试，文件名没对上的是现场抄错了字。
+          //   并成一个「失败 N 次」的话，前者会被后者淹掉。
+          + (st.denied ? `；<b class="bad">${st.denied} 次被拒</b>（想上传 / 想翻出目录）` : '')
+          + (st.notFound ? `；${st.notFound} 次文件名没对上` : '')]);
+      }
+      if (st.since) facts.push(['开了多久', fsSpan(st.since)]);
+      if (serving) {
+        // ★ 这一栏在状态刷新后也要留着：关没关列表决定了别人能不能把文件名挨个抄走
+        facts.push(['能不能翻目录', listing
+          ? '能（同网段谁都能把这个目录的文件名挨个列走）' : '不能（要写对完整文件名才取到走）']);
+      }
+    }
+    const factRows = facts.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+      <td>${x}</td></tr>`).join('');
+
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${say}</div>
+      ${urls.length && serving ? `<div style="margin-top:12px"><label class="dim">下载地址（贴进设备的升级页面）</label>
+        ${urls.map((u) => `<div style="margin-top:4px"><code style="user-select:all;cursor:cell">${esc(u)}</code></div>`).join('')}
+        <p class="hint">点一下整条就选中，直接抄。跨网段的设备要用它自己能到的那个地址，
+          不是随便挑一条。</p></div>` : ''}
+      ${factRows ? `<table style="margin-top:12px"><tr><th></th><th></th></tr>${factRows}</table>` : ''}
+      ${fsWarn(v.warnings)}
+      ${serving ? `<div style="margin-top:12px"><label class="dim">谁在取、取走了什么（每 3 秒自己刷新）</label>
+        <div id="fs-ledger">${fsLedger(st.recent)}</div></div>` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+
+  const refresh = async (quiet) => {
+    const r = await call('net.fileshare.status');
+    if (!r.ok) {
+      if (!quiet) out.innerHTML = `<div class="empty">看不了状态：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    paint(r.verdict, r.values || {});
+    if (r.verdict === 'share-serving') {
+      if (fsTimer) clearInterval(fsTimer);
+      fsTimer = setInterval(() => refresh(true), 3000);
+    } else if (fsTimer) {
+      clearInterval(fsTimer);
+      fsTimer = null;
+    }
+  };
+
+  card.querySelector('#fs-go').onclick = async () => {
+    const root = card.querySelector('#fs-root').value.trim();
+    if (!root) {
+      out.innerHTML = '<div class="empty">先写要共享哪个目录。只放要发出去的那些文件 —— '
+        + '别把整个用户目录端出来（里面有 id_rsa、.env 这类东西）。</div>';
+      return;
+    }
+    const args = { root };
+    const iface = card.querySelector('#fs-iface').value.trim();
+    const port = card.querySelector('#fs-port').value.trim();
+    const addrs = card.querySelector('#fs-addrs').value.split(/[\s,、]+/).filter(Boolean);
+    if (iface) { args.iface = iface; }
+    if (port) { args.port = Number(port); }
+    if (addrs.length) { args.addrs = addrs; }
+    if (!card.querySelector('#fs-list').checked) { args.listing = false; }
+    top.innerHTML = '';
+    // ★ 等批准：开这个共享改的是这台机器对外的可见面，必须有人看一眼再开
+    out.innerHTML = '<div class="empty">等你点批准…（取消的话一个端口都不开）</div>';
+    const r = await call('net.fileshare.serve', args);
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">没有开起来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    paint(r.verdict, r.values || {});
+    if (fsTimer) clearInterval(fsTimer);
+    fsTimer = setInterval(() => refresh(true), 3000);
+  };
+  card.querySelector('#fs-refresh').onclick = () => refresh(true);
+  card.querySelector('#fs-stop').onclick = async () => {
+    btnStop.disabled = true;
+    out.innerHTML = '<div class="empty">等你点批准…（取消就还开着）</div>';
+    const r = await call('net.fileshare.stop');
+    btnStop.disabled = false;
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">停不下来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    if (fsTimer) { clearInterval(fsTimer); fsTimer = null; }
+    paint(r.verdict, r.values || {});
+  };
+  card.querySelector('#fs-root').onkeydown = (e) => { if (e.key === 'Enter') card.querySelector('#fs-go').click(); };
+  refresh(true);   // 只读一次状态，不动系统：进页面就要看得见「现在开着没有」
   return card;
 }
 

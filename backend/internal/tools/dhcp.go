@@ -561,6 +561,8 @@ func RestoreOnStart(log *slog.Logger) {
 			"如需继续请在界面上重新开启", "改动", e.What, "时间", e.At.Format(time.RFC3339))
 		_ = journal.MarkReverted(e.ID, "进程重启：服务已随上次进程退出而停止")
 	}
+	// 文件共享同理：端口随进程释放，没有要还原的东西，但账要了结（见 fileshare.go）
+	restoreFileShare(log)
 }
 
 // ── 小工具 ──
