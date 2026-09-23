@@ -2660,6 +2660,7 @@ async function renderTools(root) {
   root.appendChild(subnetCalcCard());
   root.appendChild(macCard());
   root.appendChild(macRandomCard());
+  root.appendChild(codecCard());
 }
 
 // ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
@@ -2936,6 +2937,141 @@ function macRandomCard() {
   card.querySelector('#mr-go').onclick = run;
   card.querySelector('#mr-count').onkeydown = (e) => { if (e.key === 'Enter') run(); };
   card.querySelector('#mr-prefix').onkeydown = (e) => { if (e.key === 'Enter') run(); };
+  return card;
+}
+
+// ★ 编解码这一页的措辞难点在「解出来不是文本」：多数工具在这儿报「失败」，
+//   人就换工具、或者去查设备坏没坏 —— 而那两种都不是结论。所以每一档都带下一步。
+const CC_CODE = {
+  'decoded-text': ['解出来了，是可读文本', 'ok', (v) =>
+    v.shape === 'jwt'
+      ? '这是一枚签名令牌，上面已经把头解出来 —— ★ 这里只解码，不验签，所以「解得开」不等于「这枚令牌有效」。载荷里常带账号、内部 IP，别整段贴进工单。'
+      : '下面那一栏就是解出来的原文，可以直接复制。'],
+  'decoded-binary': ['解出来是二进制', 'warn', (v) =>
+    v.looksLikeGbk
+      ? '这一串既不是合法 UTF-8、也不像随机数据，而是老设备固件里那种 GBK 中文。这里不替你猜字符表 —— 猜出来的中文比乱码更容易被当成事实。要看成人话，得拿转码工具整份转一次。'
+      : '★ 解码没有失败：是这些字节本来就不该当文本读。要么它是加密 / 压缩过的数据（那本来就解不出人话），要么它压根不是这一种编码 —— 换一种读法再判一次。'],
+  'still-encoded': ['还套着一层编码', 'warn', '解出来一次，里面还剩编码 —— 多半是被编了两遍（常见于把一个链接整个塞进另一个链接的参数里）。再判一次就解到底了。'],
+  'ambiguous-encoding': ['几种读法都成立', 'warn', (v) =>
+    `几种读法各自解出了不同东西，都列在下面了。多半是 ${CC_ENC[v.mostLikely] || v.mostLikely} —— ${v.why || ''}。★ 没替你挑一个，因为挑错了你会拿着那个结果去对设备。`],
+  'plain-text': ['这段没在编码', '', (v) => v.why || '它原样就是它自己。'],
+  'not-decodable': ['这一种解不开', 'bad', (v) => v.why || '解不开。'],
+  encoded: ['编好了', 'ok', '挑一种贴走。★ base64 不是加密，别拿它藏密码 —— 它一眼就能解回来。'],
+};
+
+const CC_ENC = {
+  base64: 'Base64（标准字母表）', base64url: 'Base64（URL 安全，带 - 和 _）',
+  hex: '十六进制', url: 'URL 百分号转义', unicode: '\\u 转义', jwt: '签名令牌',
+};
+
+// ★ 工具替人放宽了什么，必须逐条摆出来：不记下来就等于悄悄改了数据。
+const CC_FIX = {
+  'outer-whitespace': '去掉了首尾空白',
+  'quotes-trimmed': '去掉了成对引号',
+  'padding-added': '补上了缺失的填充符 =',
+  'url-safe-alphabet': '按 URL 安全字母表读的（认了 - 和 _）',
+  'line-wrapped': '去掉了折行带的换行（命令行输出那种每 76 列一段）',
+  'inner-whitespace': '去掉了中间的空格 —— ★ 要是这段是从网址里抄的，那个空格原本可能是个加号',
+  'hex-0x-prefix': '去掉了开头的 0x',
+  'separators-removed': '去掉了字节之间的分隔符',
+  'plus-in-url': '串里有加号，按「查询串」和「路径」两种读法分开给了',
+};
+
+function codecCard() {
+  const card = $(`<div class="card">
+    <h2>编解码 <span id="cc-top"></span></h2>
+    <p class="hint">整段贴进来：Base64 / Base64URL / 十六进制 / 网址百分号转义 / \\u 转义，认得出是哪种并解开；
+      反过来要编进去也行。
+      ★ 解出来不是文本时不会报「失败」—— 二进制就是二进制，那是两种不同的下一步。
+      几种读法都说得通的串（比如 32 个十六进制字符），两种结果都摆出来让你指一个，不替你猜。
+      纯字符串运算：不发任何包，也不碰文件。</p>
+    <div class="row">
+      <div style="flex:1 1 100%"><label>要判的字符串</label>
+        <textarea id="cc-text" rows="3" placeholder="贴 Base64、网址里抄的一段、或者一串十六进制"
+          style="width:100%"></textarea></div>
+    </div>
+    <div class="row">
+      <div style="flex:1 1 160px"><label>怎么处理</label>
+        <select id="cc-op">
+          <option value="auto">自动（判是什么并解开）</option>
+          <option value="decode">只要解开</option>
+          <option value="encode">只要编进去</option>
+        </select></div>
+      <div style="flex:1 1 190px"><label>按哪种读法（可留自动）</label>
+        <select id="cc-enc">
+          <option value="">自动判断</option>
+          <option value="base64">Base64</option>
+          <option value="base64url">Base64URL</option>
+          <option value="hex">十六进制</option>
+          <option value="url">URL 转义</option>
+          <option value="unicode">\\u 转义</option>
+        </select></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="cc-go">判一下</button></div>
+    </div>
+    <div id="cc-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#cc-out');
+  const top = card.querySelector('#cc-top');
+  const mono = 'user-select:all;cursor:pointer;word-break:break-all';
+  const run = async () => {
+    const text = card.querySelector('#cc-text').value;
+    if (!text.trim()) { top.innerHTML = ''; out.innerHTML = '<div class="empty">先贴一段字符串。</div>'; return; }
+    const args = { text, op: card.querySelector('#cc-op').value };
+    const enc = card.querySelector('#cc-enc').value;
+    if (enc) args.encoding = enc;
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">判一下…</div>';
+    const r = await call('net.codec.convert', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">判不了：${esc(r.message || r.error)}</div>`; return; }
+    const v = r.values;
+    const [title, cls, advice] = CC_CODE[r.verdict] || [r.verdict || '没给判定', '', ''];
+    const say = typeof advice === 'function' ? advice(v) : advice;
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const fixes = (v.normalized || []).map((f) => CC_FIX[f] || f);
+    // ★ 只列后端真给了的：解出来是二进制就没有 text 那一栏，硬排会出「undefined」
+    // ★ 同一个字段在不同判定下说的是两件事：解不开那一档里的 encoding 是「你指的读法」，
+    //   不是「我们认出来的」；明文那一档的 byteLen 是贴进来的长度，不是解出来的
+    const rejected = r.verdict === 'not-decodable';
+    const passthrough = r.verdict === 'plain-text' || r.verdict === 'encoded';
+    const items = [
+      [rejected ? '你指的读法' : '认出的写法', v.encoding ? (CC_ENC[v.encoding] || v.encoding) : undefined],
+      [passthrough ? '这段多少字节' : '解出多少字节',
+        v.byteLen !== undefined && r.verdict !== 'encoded' ? String(v.byteLen) : undefined],
+      ['是不是合法 UTF-8', v.utf8 === undefined ? undefined : (v.utf8 ? '是' : '不是')],
+      ['头（签名令牌）', v.header],
+      ['按查询串读', v.plusAmbiguous ? v.asQuery : undefined],
+      ['按路径读', v.plusAmbiguous ? v.asPath : undefined],
+      ['原文', v.plainText],
+      ['Base64', v.base64], ['Base64URL', v.base64url],
+      ['十六进制', v.hex],
+      ['URL 转义', v.url], ['\\u 转义', v.unicode],
+      ['编了多少字节', r.verdict === 'encoded' ? String(v.byteLen) : undefined],
+    ].filter((x) => x[1] !== undefined && x[1] !== '');
+    const rows = items.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+      <td><code style="${mono}">${esc(x)}</code></td></tr>`).join('');
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(say)}</div>
+      ${fixes.length ? `<p class="hint" style="margin-top:8px">替你放宽过：${esc(fixes.join('；'))}</p>` : ''}
+      ${v.text ? `<div style="margin-top:10px"><label class="dim">解出来</label>
+        <pre style="${mono};margin:4px 0 0;white-space:pre-wrap">${esc(v.text)}</pre></div>` : ''}
+      ${v.hexDump ? `<div style="margin-top:10px"><label class="dim">按字节看</label>
+        <pre style="${mono};margin:4px 0 0;white-space:pre-wrap">${esc(v.hexDump)}</pre></div>` : ''}
+      ${v.readings ? `<table style="margin-top:12px"><tr><th>读法</th><th>解出来</th></tr>
+        ${v.readings.map((x) => `<tr><td class="dim" style="white-space:nowrap">${esc(CC_ENC[x.encoding] || x.encoding)}
+          ${x.encoding === v.mostLikely ? '（多半是这种）' : ''}</td>
+          <td><code style="${mono}">${esc(x.readable ? x.text : x.hexDump)}</code></td></tr>`).join('')}</table>` : ''}
+      ${rows ? `<table style="margin-top:14px"><tr><th></th><th></th></tr>${rows}</table>` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#cc-go').onclick = run;
+  card.querySelector('#cc-text').onkeydown = (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) run();
+  };
   return card;
 }
 
