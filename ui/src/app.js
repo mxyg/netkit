@@ -394,6 +394,7 @@ function startPolling(root) {
 
 async function renderProbe(root) {
   root.appendChild(dualStackCard());
+  root.appendChild(traceCard());
   root.appendChild(dnsCard());
   root.appendChild(certCard());
   root.appendChild(httpCard());
@@ -864,7 +865,143 @@ function httpCard() {
   return card;
 }
 
-async function renderStream(root) {  const card = $(`<div class="card">
+/*
+ * ── 路径追踪 ──
+ *
+ * ★★ 和双栈体检是互补的两件事：体检答「这一族出不出得了外网」，追踪答「出得去的话路有多长、
+ *   断在哪一跳」。现场拿到「上不去」之后问的下一句几乎都是这个。
+ * ★ 逐跳的 * 一定要画出来：中间丢两跳是常态，只有把「没回」和「回了但很慢」分开摆，
+ *   人才看得懂「断在哪」和「这次没看出来」的区别。
+ * ★ 后端只出判定码，码 → 人话在这里（多语种靠这条分工）。
+ */
+
+const TRACE_CODE = {
+  'path-ok': ['这条路走得通', 'ok',
+    '每一族的追踪都到了终点。慢不慢看下面逐跳的往返 —— 某一跳突然变大，就是那里。到了终点还上不了服务，那是端口或服务的事，换「网页 / 接口探测」。'],
+  'path-partial': ['一族到、另一族断在半路', 'bad',
+    '★ 双栈机器上最贵的一种漏报：应用往往优先走 IPv6，就先卡在那条上。下面两族并排，断的那族写着停在哪台设备。'],
+  'path-broken': ['两族都没走到终点', 'bad',
+    '断在哪一跳、停在哪台设备上，见下面逐跳。先处理写着「本机没路」或「断在中间」的那一族。'],
+  'path-incomplete': ['结论不全，别急着查网络', 'warn',
+    '有一族没给出结论：可能是这台机器缺追踪命令，也可能只是跳数或时间用完 —— 那两种都该调参数或换机器，而不是去查一条没坏的路。看下面各族自己那一行。'],
+  'reached': ['走到了终点', 'ok', ''],
+  'stalled': ['断在中间某跳', 'bad',
+    '最后一台有回应的设备之后，再没人回过话。停在哪台下面写着。'],
+  'no-response': ['第一跳就没回应', 'warn',
+    '★ 这**不说明路断了**：路由器不回应 ICMP 超时时，整条路都是这个形状，目标可能好好的。改用 ping / 探端口确认到不到得了终点。'],
+  'max-hops': ['跳数用完了', 'warn',
+    '一路都有回应、只是没走到终点。该做的是把上面的「最多几跳」调大再看，不是查网络。'],
+  'no-route': ['本机这一族没有出路', 'bad',
+    '探测包在这台机器上就发不出去 —— v6 被关的招牌表现。查这一族的网卡地址和默认路由，用上方「双栈体检」。'],
+  'needs-privilege': ['命令要管理员权限', 'warn',
+    '追踪要发原始探测包。以管理员身份再跑一次；Linux 上可换 tracepath，普通用户就能跑。'],
+  'trace-timeout': ['整条追踪超时', 'warn',
+    '已经走到的跳在下面，并标了「不完整」。哪一族在耗时间，看它有没有跳出第一跳；要更久的话把上面的超时调大。'],
+  'no-command': ['这台机器没有可用的追踪命令', 'warn',
+    '★ 这是工具没有，不是路上没设备 —— 装 traceroute 或换台机器再追，别去查网络。'],
+  'name-unresolved': ['域名解析不到地址', 'bad', '还没走到追路径这一步 —— 先用上方的 DNS 查询把解析查通。'],
+};
+
+const TRACE_SHORT = {
+  'reached': '到了终点', 'stalled': '断在中间', 'no-response': '没回应',
+  'max-hops': '跳数用完', 'no-route': '本机没路', 'needs-privilege': '要权限',
+  'trace-timeout': '超时', 'no-command': '没命令',
+};
+
+// 逐跳画成一排小方块：丢的跳留灰块，别让它从图上消失 ——
+// 只画回了的那些，人就看不出「其实第 3、4 跳根本没吭声」。
+function traceRail(hops) {
+  const chips = hops.map((h) => {
+    const rtt = (h.rttMs || []).length
+      ? `${Math.min(...h.rttMs).toFixed(1)}ms` : '不回';
+    const bg = h.isGoal ? 'var(--green-bg)' : h.addr ? 'var(--panel-2)' : 'var(--gold-bg)';
+    const line = h.isGoal ? 'var(--green-dim)' : h.addr ? 'var(--gold-dim)' : 'var(--red-line)';
+    return `<div title="${esc(h.addr || '这一跳没回应')}${h.mark ? ' · ' + esc(h.mark) : ''}"
+      style="background:${bg};border:1px solid ${line};border-radius:5px;padding:5px 8px;min-width:96px;font-size:12.5px">
+      <span class="dim">#${h.hop}</span>
+      <code>${esc(h.addr || '—')}</code>
+      <span class="${h.addr ? 'dim' : 'pill warn'}">${esc(rtt)}</span>
+      ${h.lost ? `<span class="dim" title="这一跳发了几个、丢了几个">丢${h.lost}</span>` : ''}
+      ${h.mark ? `<span class="pill bad">${esc(h.mark)}</span>` : ''}
+      ${h.isGoal ? '<span class="pill ok">终点</span>' : ''}</div>`;
+  }).join('');
+  return `<div style="display:flex;flex-wrap:wrap;gap:6px">${chips}</div>`;
+}
+
+function traceFamilyBlock(f) {
+  const [text, cls] = TRACE_CODE[f.code] || [f.code, ''];
+  const hops = f.hops || [];
+  // ★ 没跳的时候怎么说，要按**为什么**没跳分开：
+  //   本机没路 / 缺命令 / 要权限时一句「一个跳都没回来」会被读成「这条路是空的」，
+  //   而真实情况是压根没开始走 —— 那种情况交给下面那行原因说。
+  //   只有真的发出去了、一个都没回（no-response），才需要把「全黑」这件事讲出来。
+  const rail = hops.length ? traceRail(hops)
+    : f.code === 'no-response'
+      ? '<p class="hint"><span class="pill warn">一个都没回</span> <span class="dim">探测发出去了，从第一跳起没人吭声。</span></p>'
+      : '';
+  const stop = f.lastAddr
+    ? `<span class="dim">停在</span> <code>${esc(f.lastAddr)}</code> <span class="dim">第 ${f.hopsSeen} 跳</span>` : '';
+  const extra = f.detail || f.tried
+    ? `<div class="dim" style="margin-top:6px;font-size:12.5px">${esc([f.detail, f.tried].filter(Boolean).join(' ｜ '))}</div>` : '';
+  return `<div style="margin-top:14px">
+    <p style="margin:0 0 8px">
+      <b>${esc((f.family || '').toUpperCase())}</b>
+      <span class="pill ${cls}">${esc(TRACE_SHORT[f.code] || text)}</span>
+      ${f.partial ? '<span class="pill warn">不完整</span>' : ''}
+      ${stop}
+      <span class="dim"> · ${esc(f.command || '')}</span></p>
+    ${rail}
+    ${extra}</div>`;
+}
+
+function traceCard() {
+  const card = $(`<div class="card">
+    <h2>路径追踪 <span id="tv"></span></h2>
+    <p class="hint">走到目标要经过哪几台设备、<b>断在哪一跳</b>。★ 默认 IPv4、IPv6 各追一遍并排给结果 ——
+      现场最常见的正是「一族到、另一族断在半路」。中途个别跳不全是常态，卡片不会据此说路断了；
+      整条都不回（路由器限速 ICMP）会单独标成「没回应」，而不是「断在第一跳」。用的哪条命令如实写出来。</p>
+    <div class="row">
+      <div><label>目标（域名或 IP）</label><input id="th" placeholder="192.168.1.1 或 camera.example.com"></div>
+      <div style="flex:0 0 110px"><label>地址族</label>
+        <select id="tf"><option value="auto">两族都追</option><option value="v4">只追 v4</option><option value="v6">只追 v6</option></select></div>
+      <div style="flex:0 0 90px"><label>最多几跳</label><input id="tm" placeholder="30"></div>
+      <div style="flex:0 0 90px"><label>每跳几个探测</label><input id="tq" placeholder="1"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label><button class="btn primary" id="tgo">追踪</button></div>
+    </div>
+    <div id="tout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#tout');
+  const top = card.querySelector('#tv');
+  card.querySelector('#tgo').onclick = async () => {
+    top.innerHTML = '';
+    const host = card.querySelector('#th').value.trim();
+    if (!host) { out.innerHTML = '<div class="empty">先填目标地址。</div>'; return; }
+    out.innerHTML = '<div class="empty">追踪中…（最长 1 分钟，两族各分一半时间）</div>';
+    const args = { host, family: card.querySelector('#tf').value };
+    const n = Number(card.querySelector('#tm').value);
+    const q = Number(card.querySelector('#tq').value);
+    if (n > 0) args.maxHops = n;
+    if (q > 0) args.perHop = q;
+    const r = await call('net.trace', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">追不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = TRACE_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      ${(v.traces || []).map(traceFamilyBlock).join('')}
+      <p class="hint" style="margin-top:12px"><span class="dim">引擎：${esc(v.engine || '')}</span></p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+async function renderStream(root) {
+  const card = $(`<div class="card">
     <h2>视频流探测</h2>
     <p class="hint">输入取流地址，直接告诉你编码、**真实分辨率**、帧率。不需要播放器，也不解码。</p>
     <label>RTSP 地址</label>
