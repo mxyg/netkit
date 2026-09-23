@@ -23,6 +23,7 @@ import (
 // Register 把本包的工具装进注册表。
 func Register(r *ots.Registry) {
 	r.MustRegister(interfacesTool, tcpProbeTool, pingTool, rtspProbeTool, neighborsTool, discoverTool)
+	RegisterAddress(r)
 	RegisterDHCP(r)
 	RegisterRemote(r)
 }
@@ -63,6 +64,8 @@ type nicOut struct {
 	Running bool        `json:"running"`
 	Virtual bool        `json:"virtual,omitempty"`
 	Loop    bool        `json:"loopback,omitempty"`
+	Kind    string      `json:"kind,omitempty"`
+	KindSrc string      `json:"kindSrc,omitempty"`
 	Addrs   []addrOut   `json:"addrs"`
 	Verdict ots.Verdict `json:"verdict"`
 }
@@ -92,6 +95,7 @@ func toNICOut(n netif.NIC) nicOut {
 	return nicOut{
 		Name: n.Name, Index: n.Index, MAC: n.MAC, MTU: n.MTU,
 		Up: n.Up, Running: n.Running, Virtual: n.Virtual, Loop: n.Loop,
+		Kind: n.Kind, KindSrc: n.KindSrc,
 		Addrs: addrs,
 		Verdict: ots.Verdict{
 			Code:   string(v.Code),

@@ -69,6 +69,25 @@ async function show() {
 
 // ── 本机网络 ──
 
+/*
+ * ★ 介质类型。后端只给码（wifi / ethernet / …）和**这个结论从哪来**（os / name），
+ *   人话在这里渲染 —— 和判定码一样的规矩，多语种就靠这条。
+ *
+ * ★★ `kindSrc === 'name'` 时必须加「可能是」。现场是照着这一列去插线的，
+ *   把按名字猜出来的东西说得像确定的，比不说还糟。
+ */
+const KIND = {
+  wifi: ['无线', '📶'], ethernet: ['有线网口', '🔌'], 'usb-lan': ['USB 网卡', '🔌'],
+  cellular: ['4G/共享网络', '📡'], bluetooth: ['蓝牙', '🔵'],
+  thunderbolt: ['雷雳', '⚡'], virtual: ['虚拟', ''], loopback: ['回环', ''],
+};
+// kindWord 给下拉框、标题这类只要一个词的地方用；带「可能是」的诚实前缀。
+function kindWord(n) {
+  if (!n.kind) return '网卡';
+  const [text] = KIND[n.kind] || ['网卡'];
+  return (n.kindSrc === 'name' ? '可能是' : '') + text;
+}
+
 async function renderNIC(root) {
   const r = await call('net.interfaces');
   if (!r.ok) { root.appendChild($(`<div class="card">读取失败：${esc(r.message)}</div>`)); return; }
@@ -91,18 +110,6 @@ async function renderNIC(root) {
   const live = (n) => ['dual-stack', 'v4-only', 'v6-only', 'link-local'].includes(n.verdict.verdict);
   const on = all.filter(live), off = all.filter((n) => !live(n));
 
-  /*
-   * ★ 介质类型。后端只给码（wifi / ethernet / …）和**这个结论从哪来**（os / name），
-   *   人话在这里渲染 —— 和判定码一样的规矩，多语种就靠这条。
-   *
-   *   ★★ `kindSrc === 'name'` 时必须加「可能是」。现场是照着这一列去插线的，
-   *   把按名字猜出来的东西说得像确定的，比不说还糟。
-   */
-  const KIND = {
-    wifi: ['无线', '📶'], ethernet: ['有线网口', '🔌'], 'usb-lan': ['USB 网卡', '🔌'],
-    cellular: ['4G/共享网络', '📡'], bluetooth: ['蓝牙', '🔵'],
-    thunderbolt: ['雷雳', '⚡'], virtual: ['虚拟', ''], loopback: ['回环', ''],
-  };
   const kindCell = (n) => {
     const [text, icon] = KIND[n.kind] || ['不确定', ''];
     if (!n.kind) return '<span class="dim">不确定</span>';
@@ -157,34 +164,87 @@ let evSeq = 0;
 let freshMacs = new Set();
 let pollTimer = null;
 
+/*
+ * ★★ 老板的问题（2026-09-23）：「usb 或者网口连接的网卡怎么没在想开 dhcp 列表里？」
+ *
+ *   原来这一页只列**已经拿到私网 IPv4** 的网卡（dual-stack / v4-only）。
+ *   而现场的真实情况恰恰相反：一块 USB 网卡或有线口插到傻瓜交换机上，
+ *   没有路由器发地址，macOS 给自己塞一个 169.254（link-local）——
+ *   按老筛选它就被藏起来了。可这正是**最需要在它上面开 DHCP** 的那块网卡。
+ *
+ *   所以这里改成：物理网卡全列出来，按能不能直接服务分三档——
+ *     · 能直接开（有私网 IPv4）：正常预填地址池
+ *     · 缺固定 IP（link-local / no-address）：选中后先让它在本页设一个静态地址
+ *     · 开不了（没插线 / 已禁用 / 只有 IPv6）：选项置灰，把原因写出来，不让人瞎猜
+ */
+const DHCP_DISABLED_REASON = {
+  'no-carrier': '没插线', down: '已禁用', 'v6-only': '只有 IPv6',
+};
+function dhcpClass(n) {
+  const v = n.verdict.verdict;
+  if (v === 'dual-stack' || v === 'v4-only') return 'servable';
+  if (v === 'link-local' || v === 'no-address') return 'needsAddr';
+  return 'disabled';
+}
+
 async function renderDHCP(root) {
   clearInterval(pollTimer);
   const nics = await call('net.interfaces');
-  const usable = (nics.values.interfaces || []).filter(
-    (n) => !n.loopback && (n.verdict.verdict === 'dual-stack' || n.verdict.verdict === 'v4-only'));
+  // 物理网卡：滤掉回环和虚拟网卡（虚拟网卡开 DHCP 没意义，还会把列表撑爆）
+  const phys = (nics.values.interfaces || []).filter(
+    (n) => n.verdict.verdict !== 'loopback' && n.verdict.verdict !== 'virtual');
 
   const state = await call('net.dhcp.leases');
   const serving = state.ok && state.verdict === 'serving';
 
   if (serving) { root.appendChild(await runningCard(state)); startPolling(root); return; }
 
-  const opts = usable.map((n) => `<option value="${esc(n.name)}">${esc(n.name)}（${esc((n.addrs[0] || {}).cidr || '')}）</option>`).join('');
+  // 能用的排前面，开不了的沉底，符合现场「一眼找到该插哪块」的需要
+  const order = { servable: 0, needsAddr: 1, disabled: 2 };
+  const listed = phys.slice().sort((a, b) => order[dhcpClass(a)] - order[dhcpClass(b)]);
+  const byName = {};
+  listed.forEach((n) => { byName[n.name] = n; });
+
+  const opts = listed.map((n) => {
+    const cls = dhcpClass(n);
+    const word = kindWord(n);
+    let tail;
+    if (cls === 'servable') tail = (n.addrs[0] || {}).cidr || '';
+    else if (cls === 'needsAddr') tail = '没有固定 IP，选中后先设一个';
+    else tail = DHCP_DISABLED_REASON[n.verdict.verdict] || n.verdict.verdict;
+    return `<option value="${esc(n.name)}" data-cls="${cls}"${cls === 'disabled' ? ' disabled' : ''}>`
+      + `${esc(n.name)}（${esc(word)}）${tail ? ' — ' + esc(tail) : ''}</option>`;
+  }).join('');
+
   const card = $(`<div class="card">
     <h2>把这台电脑变成 DHCP 服务器</h2>
-    <p class="hint">设备都插在交换机上、没人自动分 IP 时用它。参数已按本机网段算好，可以直接改。</p>
+    <p class="hint">设备都插在交换机上、没人自动分 IP 时用它。选好网卡后参数会自动算好，可以直接改。</p>
     <label>在哪块网卡上服务</label>
     <select id="iface">${opts || '<option>没有可用网卡</option>'}</select>
-    <div class="row">
-      <div><label>地址池起</label><input id="start"></div>
-      <div><label>地址池止</label><input id="end"></div>
-      <div><label>租期（小时）</label><input id="lease" value="12"></div>
+
+    <div id="addrPanel" style="display:none;margin-top:12px;padding:12px;border-radius:10px;background:var(--panel-2);border:1px solid var(--line)">
+      <p class="hint" id="addrWhy"></p>
+      <div class="row">
+        <div><label>给它设的 IP</label><input id="addrIp" value="192.168.50.1"></div>
+        <div><label>掩码位数</label><input id="addrPrefix" value="24"></div>
+      </div>
+      <button class="btn primary" id="btnSetAddr" style="margin-top:8px">设静态地址</button>
+      <p class="hint">设完这块网卡就能发地址了。改系统网络设置需要管理员权限，弹出来就输入开机密码。</p>
     </div>
-    <label>下发网关（可留空）</label>
-    <input id="router" placeholder="留空 = 不下发">
-    <p class="hint" id="routerNote"></p>
-    <div style="margin-top:14px;display:flex;gap:10px">
-      <button class="btn" id="btnProbe">先看看有没有别人在发地址</button>
-      <button class="btn primary" id="btnStart">开始发地址</button>
+
+    <div id="poolPanel">
+      <div class="row">
+        <div><label>地址池起</label><input id="start"></div>
+        <div><label>地址池止</label><input id="end"></div>
+        <div><label>租期（小时）</label><input id="lease" value="12"></div>
+      </div>
+      <label>下发网关（可留空）</label>
+      <input id="router" placeholder="留空 = 不下发">
+      <p class="hint" id="routerNote"></p>
+      <div style="margin-top:14px;display:flex;gap:10px">
+        <button class="btn" id="btnProbe">先看看有没有别人在发地址</button>
+        <button class="btn primary" id="btnStart">开始发地址</button>
+      </div>
     </div>
     <div class="out" id="out" style="margin-top:12px;display:none"></div>
   </div>`);
@@ -192,9 +252,12 @@ async function renderDHCP(root) {
 
   const out = card.querySelector('#out');
   const say = (s) => { out.style.display = 'block'; out.textContent = s; };
+  const sel = card.querySelector('#iface');
+  const addrPanel = card.querySelector('#addrPanel');
+  const poolPanel = card.querySelector('#poolPanel');
 
   async function fillDefaults() {
-    const name = card.querySelector('#iface').value;
+    const name = sel.value;
     if (!name) return;
     const d = await call('net.dhcp.defaults', { iface: name });
     if (!d.ok) { say('算不出默认参数：' + d.message); return; }
@@ -204,12 +267,48 @@ async function renderDHCP(root) {
     card.querySelector('#lease').value = v.leaseHours || 12;
     card.querySelector('#routerNote').textContent = v.routerNote || '';
   }
-  card.querySelector('#iface').onchange = fillDefaults;
-  await fillDefaults();
+
+  // 选中一块网卡：缺 IP 的走「先设静态地址」，其余正常预填地址池
+  function onSelect() {
+    out.style.display = 'none';
+    const n = byName[sel.value];
+    if (!n) return;
+    if (dhcpClass(n) === 'needsAddr') {
+      addrPanel.style.display = 'block';
+      poolPanel.style.display = 'none';
+      card.querySelector('#addrWhy').textContent =
+        `网卡 ${n.name} 还没有可用的固定 IP，DHCP 服务器得先有一个自己的地址才能发。给它设一个：`;
+    } else {
+      addrPanel.style.display = 'none';
+      poolPanel.style.display = 'block';
+      fillDefaults();
+    }
+  }
+  sel.onchange = onSelect;
+
+  card.querySelector('#btnSetAddr').onclick = async () => {
+    const btn = card.querySelector('#btnSetAddr');
+    btn.disabled = true; say('正在设静态地址…（可能弹出管理员密码框）');
+    const r = await call('net.address.set', {
+      iface: sel.value,
+      ip: card.querySelector('#addrIp').value,
+      prefix: Number(card.querySelector('#addrPrefix').value) || 24,
+    });
+    btn.disabled = false;
+    if (!r.ok) { say('没设成：' + r.message); return; }
+    // ★ 后端会回去核一眼地址有没有真用上。没插线时配置写进去了但地址不激活，
+    //   这时候不能重渲染成「设好了」——把后端的诚实提示原样说出来，让人去查网线。
+    if (r.verdict === 'address-set-inactive') { say('⚠ ' + r.note); return; }
+    say('设好了，正在重新读取网卡…');
+    show();  // 重渲染：这块网卡现在能直接发地址了
+  };
+
+  if (!listed.length) { say('这台机器上没有能发地址的物理网卡。'); }
+  else { onSelect(); }
 
   card.querySelector('#btnProbe').onclick = async () => {
     say('正在广播探测…（约 3 秒）');
-    const p = await call('net.dhcp.probe', { iface: card.querySelector('#iface').value, waitMs: 3000 });
+    const p = await call('net.dhcp.probe', { iface: sel.value, waitMs: 3000 });
     if (!p.ok) { say('探测失败：' + p.message); return; }
     say(p.note + '\n\n' + JSON.stringify(p.values.servers || [], null, 2));
   };
@@ -217,7 +316,7 @@ async function renderDHCP(root) {
   card.querySelector('#btnStart').onclick = async () => {
     say('正在启动…启动前会自动探一遍，确认没有别的 DHCP 在发地址。');
     const r = await call('net.dhcp.serve', {
-      iface: card.querySelector('#iface').value,
+      iface: sel.value,
       start: card.querySelector('#start').value,
       end: card.querySelector('#end').value,
       leaseHours: Number(card.querySelector('#lease').value) || 12,
