@@ -199,7 +199,41 @@ func listenICMP(a netaddr.Addr) (*icmp.PacketConn, error) {
 	return nil, ots.Errf(ots.ErrInternal, "开 ICMP 套接字失败：%s", err)
 }
 
-func pingOnce(conn *icmp.PacketConn, a netaddr.Addr, dst net.Addr, id, seq int, timeout time.Duration) (time.Duration, string, error) {
+// icmpConn 是 ping 一族工具用到的那几件套：读、写、设读deadline、关。
+//
+// ★ 抽成接口的原因是 net.ping.watch 要能换实现（真套接字 / 编出来的样本序列），
+//
+//	不然测「丢在哪一发、抖在哪一发」就得真等上十几秒。
+//	*icmp.PacketConn 天然满足它，两边都不用包一层。
+type icmpConn interface {
+	ReadFrom(b []byte) (int, net.Addr, error)
+	WriteTo(b []byte, dst net.Addr) (int, error)
+	SetReadDeadline(t time.Time) error
+	Close() error
+}
+
+// echoDst 拼出发包要用的目的地址。
+//
+// ★ 链路本地地址必须带 zone 才知道从哪块网卡发 —— netaddr 里已经存了接口名和索引，
+//
+//	这里按本平台取用（见 netaddr.Addr.DialString 里那段说明）。
+func echoDst(a netaddr.Addr) (net.Addr, error) {
+	dst := &net.UDPAddr{IP: net.IP(a.IP.AsSlice())}
+	if !a.NeedsZone() {
+		return dst, nil
+	}
+	if a.Zone == "" && a.ZoneID == 0 {
+		return nil, ots.Errf(ots.ErrInvalidArgument,
+			"链路本地地址 %s 必须说清楚走哪块网卡（zone），否则不知道从哪个口发出去", a.IP)
+	}
+	dst.Zone = a.Zone
+	if dst.Zone == "" {
+		dst.Zone = itoa(a.ZoneID)
+	}
+	return dst, nil
+}
+
+func pingOnce(conn icmpConn, a netaddr.Addr, dst net.Addr, id, seq int, timeout time.Duration) (time.Duration, string, error) {
 	typ := icmp.Type(ipv4.ICMPTypeEcho)
 	if a.Is6() {
 		typ = ipv6.ICMPTypeEchoRequest

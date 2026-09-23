@@ -415,6 +415,7 @@ async function renderProbe(root) {
     <div class="out" id="o" style="margin-top:12px;display:none"></div>
   </div>`);
   root.appendChild(card);
+  root.appendChild(pingWatchCard());
   root.appendChild(udpCard());
   root.appendChild(scanCard());
   root.appendChild(mtuCard());
@@ -1564,6 +1565,207 @@ function mtuCard() {
   };
   return card;
 }
+
+/*
+ * ── 连续 ping ──
+ *
+ * ★★ 现场的原话是「有时候卡一下」。四发的 ping 问不出这个毛病 —— 四发全通，
+ *   因为那一下没赶上。所以这一栏按时间连发，把每一发都留在结果里。
+ *
+ * ★ 图只负责看出形状，**点名的那一发才是产出**：时刻 + 值。
+ *   人拿时刻去对现场发生了什么（是不是刚好起流、刚好有人插拔网线），
+ *   只给一张图和一句「抖动偏大」等于没答。
+ * ★ 丢包那几发在图上必须断线、并在底下留格子 —— 连过去就是把「没回执」画成了「一直很好」。
+ */
+
+// 「没回执」有三种，界面不许合成一种说：
+// 超时是对方不吭声，不可达是有人明说够不着，error 是包在本机就没出去 —— 三个查的方向不同。
+const WATCH_KIND = {
+  'no-reply': ['没回执（超时）', 'warn'],
+  'unreachable': ['明确不可达', 'bad'],
+  'error': ['包没出去（本机）', 'bad'],
+};
+
+const WATCH_CODE = {
+  'stable': ['稳', 'ok',
+    '这一段每一发都有回执、快慢也平 —— 「卡」不是这一台在这段时间的问题，去别的环节找'
+    + '（应用自己的超时、DNS、对端的服务）。'],
+  'jitter': ['抖', 'warn',
+    '没丢包，但快慢差得明显。★ 先看下面点名的那一发是第几秒 —— 无线链路、挤满的 AP、'
+    + '对端在干重活都会这样。如果整条线都在晃而挑不出单发，那是链路质量本身在晃，不是谁卡了一下。'],
+  'loss': ['丢包', 'bad',
+    '有发数没拿到回执。★ 丢和抖是两种病，处理方向不同：丢要查链路（信号、网线、端口协商、环路），'
+    + '抖多半是排队。底下写清了丢在第几发、是超时还是明确不可达。'],
+  'no-reply': ['一个都没回', 'warn',
+    '这一栏分不出「主机不在」和「ICMP 被挡」，所以给不出稳定性结论。先去上面的 ping 确认这台存在。'],
+  'unreachable': ['明确不可达', 'bad',
+    '每一发都拿到了「到不了」的回执 —— 包出得去、也有人回话，中间的路是通的，'
+    + '问题在终点或路由（对端关机、地址没人要、中间设备没路由）。这跟「被防火墙挡了」是两个结论。'],
+  'no-route': ['本机没路', 'bad',
+    '包根本没出去，跟对端没关系。查自己这边：网卡起没起、地址配没配、是不是同一个网段。'],
+};
+
+// 一图一例。★ 纵轴按本图最大值缩放，两条线各画一张，不做双轴 ——
+// 把 0.05ms 的对照和 90ms 的目标塞进同一根轴上，对照那条就变成一条贴底的直线，
+// 看着像「它稳得像根线」，其实只是被刻度压扁了。
+function watchChart(samples, spanMS, tone, spikes) {
+  const W = 620, H = 168, P = 16;
+  const ok = samples.filter((s) => s.kind === 'reachable');
+  if (!ok.length) return '';
+  const hi = Math.max(...ok.map((s) => s.rttMs || 0)) * 1.18 || 1;
+  const span = Math.max(1, spanMS || ok[ok.length - 1].atMs || 1);
+  const X = (at) => P + (at / span) * (W - 2 * P);
+  const Y = (r) => H - P - (r / hi) * (H - 2 * P);
+  const stroke = tone === 'base' ? 'var(--gold-dim)' : 'var(--green-dim)';
+  let prev = null;
+  const segs = [], dots = [], holes = [];
+  for (const s of samples) {
+    if (s.kind !== 'reachable') {
+      holes.push(`<line x1="${X(s.atMs)}" y1="${P}" x2="${X(s.atMs)}" y2="${H - P}"
+          stroke="var(--red-line)" stroke-dasharray="3 4" opacity=".5"/>
+        <rect x="${(X(s.atMs) - 3.5).toFixed(1)}" y="${H - P - 3.5}" width="7" height="7"
+          fill="var(--red-bg)" stroke="var(--red-line)"/>`);
+      prev = null;
+      continue;
+    }
+    const cx = X(s.atMs), cy = Y(s.rttMs || 0);
+    if (prev) segs.push(`<line x1="${prev[0].toFixed(1)}" y1="${prev[1].toFixed(1)}"
+        x2="${cx.toFixed(1)}" y2="${cy.toFixed(1)}" stroke="${stroke}" stroke-width="1.7"/>`);
+    dots.push(`<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.7" fill="${stroke}"/>`);
+    prev = [cx, cy];
+  }
+  const rings = (spikes || []).map((seq) => {
+    const s = samples.find((x) => x.seq === seq);
+    if (!s || s.kind !== 'reachable') return '';
+    return `<circle cx="${X(s.atMs).toFixed(1)}" cy="${Y(s.rttMs || 0).toFixed(1)}" r="6"
+      fill="none" stroke="var(--gold-dim)" stroke-width="1.6"/>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block" role="img"
+      aria-label="每一发的往返时间">
+      <line x1="${P}" y1="${H - P}" x2="${W - P}" y2="${H - P}" stroke="var(--line)"/>
+      ${holes.join('')}${segs.join('')}${dots.join('')}${rings}
+      <text x="${P}" y="${P - 4}" fill="var(--muted)" font-size="10">
+        ${esc(hi.toFixed(1))}ms</text>
+      <text x="${W - P}" y="${P - 4}" text-anchor="end" fill="var(--muted)" font-size="10">
+        ${(span / 1000).toFixed(1)}s</text>
+    </svg>`;
+}
+
+// prefix 传 'baseline' 时读的是 baselineSent / baselineRttMedianMs 这一批 ——
+// ★ 后端把前缀后的首字母大写了（mergeStats 里的 upper1），这里必须按同一个口径拼，
+//   拼错不会报错，只会让对照组的八个格子全显示「没测到」。
+function watchSummaryRows(v, prefix) {
+  const p = prefix || '';
+  const key = (k) => (p ? p + k[0].toUpperCase() + k.slice(1) : k);
+  const num = (n, unit) => (n == null ? '<span class="dim">没测到</span>' : `<b>${esc(n)}</b>${unit}`);
+  return `<div class="row" style="gap:18px;flex-wrap:wrap;margin-top:10px">
+    <div><label>发了</label><div>${num(v[key('sent')], '')}</div></div>
+    <div><label>回了</label><div>${num(v[key('recv')], '')}</div></div>
+    <div><label>明确不可达</label><div>${num(v[key('unreachable')], '')}</div></div>
+    <div><label>丢包率</label><div>${num(v[key('lossPercent')], '%')}</div></div>
+    <div><label>中位</label><div>${num(v[key('rttMedianMs')], 'ms')}</div></div>
+    <div><label>95 分位</label><div>${num(v[key('rttP95Ms')], 'ms')}</div></div>
+    <div><label>最慢</label><div>${num(v[key('rttMaxMs')], 'ms')}</div></div>
+    <div><label>相邻两发抖动</label><div>${num(v[key('jitterAvgMs')], 'ms')}</div></div>
+  </div>`;
+}
+
+function pingWatchCard() {
+  const card = $(`<div class="card">
+    <h2>连续 ping（看抖不抖）<span id="pwv"></span></h2>
+    <p class="hint">专查<b>「有时候卡一下」</b>：四发的 ping 问不出这个毛病，因为那一下没赶上。
+      这里按时间连发，把每一发都留下 —— 曲线之外还会点出<b>第几发、第几秒、抖成什么样</b>，
+      拿那个时刻去对现场发生了什么。可选填一个对照地址（一般是网关），
+      用来分「只有这台慢」和「这一整段都在抖」。</p>
+    <div class="row">
+      <div><label>目标地址</label><input id="pwa" placeholder="192.168.1.64"></div>
+      <div style="flex:0 0 130px"><label>间隔 ms</label><input id="pwi" placeholder="500"></div>
+      <div style="flex:0 0 130px"><label>看多久 ms</label><input id="pwd" placeholder="10000（最多 60000）"></div>
+      <div style="flex:0 0 130px"><label>单发等待 ms</label><input id="pwt" placeholder="1000"></div>
+      <div><label>对照地址（可留空）</label><input id="pwb" placeholder="192.168.1.1 网关"></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn primary" id="pwgo">开始连发</button></div>
+    <div id="pwout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#pwout');
+  const top = card.querySelector('#pwv');
+  card.querySelector('#pwgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = { addr: card.querySelector('#pwa').value };
+    for (const [id, key] of [['#pwi', 'intervalMs'], ['#pwd', 'durationMs'], ['#pwt', 'timeoutMs']]) {
+      const n = Number(card.querySelector(id).value);
+      if (n > 0) args[key] = n;
+    }
+    const b = card.querySelector('#pwb').value.trim();
+    if (b) args.baseline = b;
+    const secs = Math.round((args.durationMs || 10000) / 1000);
+    out.innerHTML = `<div class="empty">连发中…（约 ${secs} 秒，两腿一起跑时要再久一点）</div>`;
+    const r = await call('net.ping.watch', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">测不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = WATCH_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+
+    const spikes = (v.spikes || []).length
+      ? `<div style="margin-top:12px"><label>抖在哪一发</label><div style="font-size:13.5px">
+          ${(v.spikes || []).map((s) => {
+    const one = (v.samples || []).find((x) => x.seq === s) || {};
+    return `<span style="background:var(--gold-bg);border:1px solid var(--gold-dim);
+              border-radius:5px;padding:3px 8px;margin-right:8px;display:inline-block">
+              第 ${esc(s)} 发 · ${esc(((one.atMs || 0) / 1000).toFixed(1))}s · ${esc(Math.round(one.rttMs || 0))}ms
+            </span>`;
+  }).join('')}</div></div>` : '';
+
+    const lost = (v.lostAt || []).length
+      ? `<div style="margin-top:12px"><label>丢在哪几发</label>
+          <table><tr><th>第几发</th><th>第几秒</th><th>是哪种没回执</th></tr>
+          ${(v.lostAt || []).map((m) => `<tr><td><code>${esc(m.seq)}</code></td>
+            <td>${esc(((m.atMs || 0) / 1000).toFixed(1))}s</td>
+            <td>${pillOf(WATCH_KIND, m.kind)}</td></tr>`).join('')}
+          </table>
+          <p class="dim" style="margin:6px 0 0">★ 「明确不可达」和「超时」是两种东西：前者有人回话说够不着，
+            后者连句话都没有 —— 前者查路由和终点，后者多半是挡包。</p></div>` : '';
+
+    const baseBlock = v.compare ? `
+      <div style="margin-top:16px">
+        <label>对照组 ${esc(v.baseline)} <span class="dim">（同一轮里跑的，用来分「谁在抖」）</span></label>
+        ${watchChart(v.baselineSamples || [], v.baselineSpanMs || v.spanMs, 'base', [])}
+        ${watchSummaryRows(v, 'baseline')}
+      </div>` : '';
+    const cmp = v.compare ? `
+      <div style="margin-top:12px;background:${bg};border:1px solid ${line};border-radius:6px;
+        padding:10px 12px;font-size:13.5px">${esc(CMP_TEXT[v.compare] || v.compare)}${
+  v.compare === 'both' && v.compareWorse && v.compareWorse !== 'similar'
+    ? esc(v.compareWorse === 'target' ? '（更难看的是目标这台）' : '（更难看的是对照组那台）') : ''}</div>` : '';
+
+    out.innerHTML = `
+      <div class="row" style="gap:18px;margin-bottom:10px;flex-wrap:wrap">
+        <div><label>目标</label><div><b><code>${esc(v.target)}</code></b> ${esc(v.family)}</div></div>
+        <div><label>间隔 / 时长</label><div>${esc(v.intervalMs)}ms · ${esc((v.durationMs / 1000).toFixed(0))}s</div></div>
+        <div><label>实到</label><div>${esc(((v.spanMs || 0) / 1000).toFixed(1))}s
+          ${v.actualIntervalMs && v.actualIntervalMs > v.intervalMs * 1.5
+    ? `<span class="pill warn">实际每发 ${esc(v.actualIntervalMs)}ms</span>` : ''}</div></div>
+      </div>
+      ${watchChart(v.samples || [], v.spanMs, 'target', v.spikes)}
+      ${watchSummaryRows(v, '')}
+      ${spikes}${lost}${baseBlock}${cmp}
+      <div style="margin-top:14px;background:${bg};border:1px solid ${line};border-radius:6px;
+        padding:10px 12px;font-size:13.5px">${esc(advice)}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果（逐发留痕）</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+const CMP_TEXT = {
+  'neither': '两条线都干净 —— 目标这一路没毛病。',
+  'target-only': '同一轮里对照组是干净的 —— 毛病只在这台，去查它自己（网卡、驱动、它那条链路）。',
+  'baseline-only': '同一轮里反倒是对照组不干净，目标这台没问题。',
+  'both': '同一轮里对照组也不干净 —— 先查这一段链路（网段、AP、出口），别只盯这一台。',
+};
 
 /*
  * ── 扫描与发现 ──
