@@ -395,6 +395,7 @@ function startPolling(root) {
 async function renderProbe(root) {
   root.appendChild(dualStackCard());
   root.appendChild(dnsCard());
+  root.appendChild(certCard());
   const card = $(`<div class="card">
     <h2>ping / 探端口</h2>
     <p class="hint">ping 会区分「对方明确回了不可达」和「完全没回应」——前者说明路是通的、问题在对端。</p>
@@ -615,7 +616,116 @@ function dnsCard() {
   return card;
 }
 
-// ── 视频流 ──
+/*
+ * ── 证书检查 ──
+ *
+ * ★★ 现场有四件事全都长成「打不开 / 不安全」一句话，处理办法却互相冲突：
+ *   证书过期、名字和地址不一致、自签没进信任列表、设备只支持 TLS1.0。
+ *   浏览器只给一句红字，工程师得自己拆开。这一页替人拆。
+ * ★ 后端只出判定码，码 → 人话在这里（多语种靠的就是这条分工）。
+ */
+
+const CERT_CODE = {
+  'cert-ok': ['证书正常', 'ok', '证书没过期、名字对得上、本机也认这条链 —— 网页打不开的话，原因不在证书上，往服务和网络上查。'],
+  'cert-expired': ['证书已过期', 'bad', '必须重新签发一张。过期之后所有客户端都会拒绝，重装应用、清缓存都没用。'],
+  'cert-not-yet-valid': ['证书还没到生效时间', 'bad',
+    '这条几乎从来不是证书的错，是这台设备的时钟不对（掉电后重置回几年前那种）。先校时，再回来看证书。'],
+  'cert-name-mismatch': ['证书上的名字和访问的地址对不上', 'bad',
+    '要么改用证书上写着的名字访问，要么按现在这个地址重签一张。浏览器报 ERR_CERT_COMMON_NAME_INVALID 就是这一条。'],
+  'cert-self-signed': ['自签证书', 'warn',
+    '证书本身没过期，只是本机不认它这个根 —— 内网设备的出厂默认。要么把它的根证书装进本机信任列表，要么换一张正规签发的。'],
+  'cert-unknown-authority': ['本机验不过这条链', 'warn',
+    '签发者不在信任列表里：常见于设备上只放了叶子证书、缺中间证书，或者本机没装企业/设备的根证书。'],
+  'cert-expiring-soon': ['快要到期了', 'warn', '现在换是顺手的事，等到现场发现打不开就是加班的事。'],
+  'cert-weak-protocol': ['证书可用，但对方只支持老版本 TLS', 'bad',
+    'TLS 1.0/1.1 已被新版浏览器和平台直接拒绝连接。要升级设备侧的 TLS 栈，换证书解决不了。'],
+  'not-tls': ['这个端口回的不是 TLS', 'bad', '端口给错了 —— 它后面多半是明文 HTTP 或 RTSP，换对端口再来一次。'],
+  'handshake-failed': ['连上了，但 TLS 没谈成', 'bad',
+    '常见于双方的协议版本/加密套件没有交集，或者对端根本不是 TLS 服务。细节看 reason。'],
+  'no-certificate': ['握手成功却没出示证书', 'warn', '用的是匿名加密套件（没有身份可验证），或者它不是按 HTTPS 出证的。'],
+  'name-unresolved': ['域名解析不到地址', 'bad', '还没走到证书这一步 —— 先用上方的 DNS 查询把解析查通。'],
+  'closed': ['端口关着', 'bad', '这个端口上没有 TLS 服务（对方明确拒绝，说明主机是在的）。'],
+  'filtered': ['没有任何回应', 'bad', '分不清端口是关着还是被防火墙静默丢了。'],
+  'unreachable': ['地址到不了', 'bad', '连路由都不通 —— 先确认地址填对了、和它之间有没有路。'],
+};
+
+// 逐个地址那行要短 —— 整句标题排成四行就没法看了。
+const CERT_SHORT = {
+  'closed': '端口关着', 'filtered': '没回应', 'unreachable': '到不了',
+  'not-tls': '不是 TLS', 'handshake-failed': '没谈成',
+};
+
+function certCard() {
+  const card = $(`<div class="card">
+    <h2>证书检查 <span id="cv"></span></h2>
+    <p class="hint">连一下对方的 TLS，把「打不开 / 连接不安全」拆成具体是哪一个：<b>过期</b> / <b>名字不匹配</b> /
+      <b>自签未受信</b> / <b>设备只支持老 TLS</b>。★ 只握手、不读业务数据。用 IP 访问但想按域名核对证书时，把域名填在第三个框里。</p>
+    <div class="row">
+      <div><label>地址（域名或 IP，可带端口）</label><input id="cu" placeholder="192.168.1.64 或 cam.example.com:8443"></div>
+      <div style="flex:0 0 100px"><label>端口</label><input id="cp" placeholder="443"></div>
+      <div><label>按哪个名字核对</label><input id="cn" placeholder="证书上写的域名"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label><button class="btn primary" id="cgo">检查</button></div>
+    </div>
+    <div id="cout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#cout');
+  const top = card.querySelector('#cv');
+  card.querySelector('#cgo').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">握手中…</div>';
+    const addr = card.querySelector('#cu').value.trim();
+    if (!addr) { out.innerHTML = '<div class="empty">先填要检查的地址。</div>'; return; }
+    const args = { addr };
+    const p = Number(card.querySelector('#cp').value);
+    const name = card.querySelector('#cn').value.trim();
+    if (p) args.port = p;
+    if (name) args.serverName = name;
+    const r = await call('net.tls.check', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">检查不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = CERT_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    // 三项核对各自的脸色：名字不对是**必须改**的（换证书或换地址），
+    // 不受信和自签只是本机没导入 —— 报成红色会把一件顺手的事说成故障。
+    const flag = (b, yes, no, okCls = 'ok', badCls = 'bad') =>
+      `<span class="pill ${b ? okCls : badCls}">${esc(b ? yes : no)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const names = [].concat(v.san || [], v.sanIP || []);
+    const days = v.daysLeft === undefined ? ''
+      : v.daysLeft < 0 ? `<span class="pill bad">已过期 ${-v.daysLeft} 天</span>`
+        : `还剩 <b>${v.daysLeft}</b> 天`;
+    const tries = (v.attempts || []).map((a) => `<div><code>${esc(a.address)}</code>
+        <span class="pill ${CERT_CODE[a.code] ? CERT_CODE[a.code][1] : ''}">${esc(CERT_SHORT[a.code] || a.code)}</span>
+        <span class="dim">${esc(a.detail || '')}</span></div>`).join('');
+    // 没拿到证书的那些判定（端口关、不是 TLS、解析不到）就别摆一张空证书表
+    const proto = v.protocol ? tCell('协议 / 套件', `<code>${esc(v.protocol)}</code> ·
+        <code>${esc(v.cipherSuite || '—')}</code>${v.weakProtocol ? '<span class="pill bad">版本太老</span>' : ''}`) : '';
+    const cert = v.subject ? `
+        ${tCell('主体 / 签发者', `${esc(v.subject)} <span class="dim">←</span> ${esc(v.issuer || '—')}`)}
+        ${tCell('有效期', `${esc(v.notBefore || '?')} <span class="dim">到</span> ${esc(v.notAfter || '?')} · ${days}`)}
+        ${tCell('包括的名字', names.length ? names.map((n) => `<code>${esc(n)}</code>`).join(' ')
+          : '<span class="dim">证书里没写备用名字（只有主题那一个）</span>')}
+        ${tCell('三项核对', `${flag(v.hostnameMatch, '名字对得上', '名字不对')}
+          ${flag(v.trusted, '本机认这条链', '本机不认', 'ok', 'warn')}
+          ${flag(!v.selfSigned, '正规签发', '自签', 'ok', 'warn')}`)}
+        ${v.chain && v.chain.length ? tCell('证书链',
+          v.chain.map((c) => `<code>${esc(c)}</code>`).join(' <span class="dim">←</span> ')) : ''}` : '';
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}${v.reason ? `<div class="dim" style="margin-top:6px">${esc(v.reason)}</div>` : ''}</div>
+      <table style="margin-top:14px">
+        ${tCell('连到哪', `<code>${esc(v.target || '—')}</code>
+          <span class="dim">${esc(v.family || '')}${v.hostname ? ' · 域名 ' + esc(v.hostname) : ''}</span>`)}
+        ${proto}
+        ${cert}
+        ${tries ? tCell('逐个地址', tries) : ''}
+      </table>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
 
 async function renderStream(root) {
   const card = $(`<div class="card">

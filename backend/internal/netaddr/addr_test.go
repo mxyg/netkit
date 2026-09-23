@@ -207,3 +207,14 @@ func TestAddr可比较能当mapkey(t *testing.T) {
 		t.Errorf("map 里应该有 2 个，实际 %d", len(m))
 	}
 }
+
+// 零值 Addr 表示「不是 IP」——调用方靠这个把域名和 IP 分流，不能靠猜。
+func Test零值只意味着没装地址(t *testing.T) {
+	var zero Addr
+	if zero.IsValid() {
+		t.Error("零值不该被当成一个地址")
+	}
+	if !mustParse(t, "0.0.0.0").IsValid() {
+		t.Error("全零地址是合法地址，不是「没有地址」")
+	}
+}

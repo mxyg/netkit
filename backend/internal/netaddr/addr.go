@@ -75,6 +75,13 @@ type Addr struct {
 }
 
 // Is6 是不是 IPv6（v4-in-v6 映射地址算 v4，那本质上就是个 v4 地址）。
+// IsValid 说清楚这个 Addr 到底装没装地址。
+//
+// ★ 调用方常用它分「拿到的是 IP 还是域名」—— 零值 Addr 就是「不是 IP」。
+//
+//	少了这个方法，每处调用都得知道里面裹着个 netip.Addr，封装就白做了。
+func (a Addr) IsValid() bool { return a.IP.IsValid() }
+
 func (a Addr) Is6() bool { return a.IP.Is6() && !a.IP.Is4In6() }
 
 // Is4 是不是 IPv4。
