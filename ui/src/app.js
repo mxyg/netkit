@@ -2661,6 +2661,7 @@ async function renderTools(root) {
   root.appendChild(macCard());
   root.appendChild(macRandomCard());
   root.appendChild(codecCard());
+  root.appendChild(wolCard());
 }
 
 // ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
@@ -3077,6 +3078,149 @@ function codecCard() {
   card.querySelector('#cc-text').onkeydown = (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) run();
   };
+  return card;
+}
+
+// ── net.wol：唤醒一台机器 ──
+//
+// ★★ 这一页的难点不是「怎么发」，是**别把「发出去了」说成「醒了」**。
+//   唤醒失败的现场表象永远是同一个：没有人报错。所以每一栏都要说清
+//   「这一栏能证明什么」：从哪块网卡发的、发到哪、对方此刻在不在邻居表里。
+
+// 发出去了，但「醒没醒」要另一步验
+const WL_SENT = {
+  'sent-broadcast': ['已发到本机网段', 'ok'],
+  'sent-unicast': ['已发到指定地址', 'ok'],
+};
+const WL_CODE = {
+  'likely-awake': ['它此刻在邻居表里，没发', 'warn'],
+};
+// 这块网卡是怎么定下来的——现场发错地方，八成在这一步
+const WL_FROM = {
+  'given': '你指定的',
+  'neighbor-table': '这个 MAC 在邻居表里是从这块网卡学到的',
+  'default-route': '没有它的记录，按 IPv4 默认路由选了这块',
+  'only-usable-v4': '没默认路由，本机只有这一块带可用 IPv4 的网卡',
+};
+const WL_DST = {
+  'directed-broadcast': '本机网段的定向广播地址',
+  'forwarded-unicast': '你指定的地址（跨网段）',
+};
+
+function wolCard() {
+  const card = $(`<div class="card">
+    <h2>Wake-on-LAN 唤醒 <span id="wl-top"></span></h2>
+    <p class="hint">往目标网卡的 MAC 发一枚魔术帧，把睡着的机器叫起来。
+      ★ 这会改变那台机器的状态，所以一次只唤醒一台、要你点头才发，并且留一笔痕迹。
+      默认只往指定网卡自己网段的广播地址发（不用全 255 那一发，它从默认路由的网卡出去，
+      可能吵醒一整层楼）。网卡留空就自己推：先看这个 MAC 是哪块网卡学到的，再看默认路由。
+      ★ 发出去不等于醒了：看结果里「从哪发到哪」和「它在不在邻居表里」两栏，
+      最后一步是过一两分钟回来看它回没回来。</p>
+    <div class="row">
+      <div style="flex:1 1 220px"><label>要唤醒的 MAC（只能一台）</label>
+        <input id="wl-mac" placeholder="aa:bb:cc:dd:ee:ff"></div>
+      <div style="flex:1 1 140px"><label>从哪块网卡（留空自动选）</label>
+        <input id="wl-iface" placeholder="en0 / eth0"></div>
+      <div style="flex:1 1 180px"><label>跨网段时发到哪（目标网段广播地址）</label>
+        <input id="wl-host" placeholder="留空 = 本机网段"></div>
+    </div>
+    <div class="row">
+      <div style="flex:0 0 110px"><label>端口</label>
+        <input id="wl-port" placeholder="9"></div>
+      <div style="flex:0 0 110px"><label>连发几枚</label>
+        <input id="wl-repeats" placeholder="1"></div>
+      <div style="flex:1 1 180px"><label>SecureOn 口令（可留空，不会被记下来）</label>
+        <input id="wl-pass" type="password" autocomplete="off" placeholder="4 或 6 字节 hex"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn danger" id="wl-go">唤醒这台</button></div>
+    </div>
+    <label style="display:flex;gap:6px;align-items:center;margin-top:8px;font-size:13px">
+      <input type="checkbox" id="wl-force" style="flex:0 0 auto">
+      邻居表里现在还有它（刚才醒着）也照发 —— 部分主机会因此走一次开机流程</label>
+    <div id="wl-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#wl-out');
+  const top = card.querySelector('#wl-top');
+  const run = async () => {
+    const mac = card.querySelector('#wl-mac').value.trim();
+    if (!mac) {
+      out.innerHTML = '<div class="empty">先写要唤醒哪一台：从设备标签、DHCP 租约或邻居表里抄它的 MAC。</div>';
+      return;
+    }
+    const args = { mac };
+    const iface = card.querySelector('#wl-iface').value.trim();
+    const host = card.querySelector('#wl-host').value.trim();
+    const port = card.querySelector('#wl-port').value.trim();
+    const rep = card.querySelector('#wl-repeats').value.trim();
+    const pass = card.querySelector('#wl-pass').value.trim();
+    if (iface) { args.iface = iface; }
+    if (host) { args.host = host; }
+    if (port) { args.port = Number(port); }
+    if (rep) { args.repeats = Number(rep); }
+    if (pass) { args.secureOn = pass; }
+    if (card.querySelector('#wl-force').checked) { args.force = true; }
+    top.innerHTML = '';
+    // ★ 等批准：这一发会改变对面那台机器，所以必须有人点头，取消就什么都不发生
+    out.innerHTML = '<div class="empty">等你点批准…（取消的话一枚都不发）</div>';
+    const r = await call('net.wol', args);
+    card.querySelector('#wl-pass').value = '';  // 口令不留在输入框里
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">没有发出去：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values || {};
+    const sent = WL_SENT[r.verdict];
+    const awake = WL_CODE[r.verdict];
+    let title, cls;
+    if (sent) { [title, cls] = sent; } else if (awake) { [title, cls] = awake; } else {
+      title = r.verdict || '没给判定'; cls = '';
+    }
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    let say;
+    if (sent) {
+      say = `已经发出去的只证明「从这块网卡到了这个地址」，不证明它醒了。`
+        + (v.needsRelay
+          ? ' ★ 这一发的目标不在本机任何网段里，要经路由器转发 —— '
+            + '多数路由器默认丢掉定向广播，没醒先怀疑这一条。'
+          : ' 过一两分钟回来看邻居表：它回来了才是真醒了。')
+        + (v.seenAt ? ` 发之前邻居表里已经有它（${esc(v.seenAt)}），是你勾了照发才发的。`
+          : ' 发之前邻居表里没有它。');
+    } else if (awake) {
+      say = `没有发。邻居表里现在还有它（${esc(v.seenAt || '没给地址')}），说明它刚才大概率醒着`
+        + '。★ 这不是铁证：条目要几分钟才过期。确定它是关着的话勾上下面那个框再发一次。';
+    } else {
+      say = '后端给了一个这里还没认得的判定，原文在下面展开看。';
+    }
+    const items = [
+      ['唤醒哪台', v.mac],
+      ['从哪块网卡', v.iface ? `${v.iface}（${WL_FROM[v.ifaceFrom] || v.ifaceFrom || '没说怎么选的'}`
+        + (v.ifaceKind ? `，${v.ifaceKind}` : '') + (v.ifaceVirtual ? '，虚拟/隧道口' : '') + '）' : undefined],
+      ['本机地址', v.src ? `${v.src}（${v.subnet}）` : undefined],
+      [sent ? '发到哪' : '本来会发到哪',
+        v.dst ? `${v.dst}:${v.port}（${WL_DST[v.dstKind] || v.dstKind}）` : undefined],
+      ['发了几枚', v.sent === undefined ? undefined
+        : v.sent ? `${v.sent} / 要发 ${v.sends}` : `一枚都没发（要发 ${v.sends}）`],
+      ['帧', v.frame ? `${v.frameBytes} 字节` : undefined],
+      ['口令', v.passwordUsed ? '用过，没写进结果和日志' : undefined],
+    ].filter((x) => x[1] !== undefined && x[1] !== '');
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${say}</div>
+      ${v.frame ? `<div style="margin-top:10px"><label class="dim">发出去的帧（和别人的工具对拍，口令不在里面）</label>
+        <pre class="mono" style="margin:4px 0 0;word-break:break-all;font-size:11.5px">${esc(v.frame)}</pre></div>` : ''}
+      <table style="margin-top:14px"><tr><th></th><th></th></tr>
+        ${items.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+          <td><code>${esc(x)}</code></td></tr>`).join('')}</table>
+      ${sent ? `<p class="hint">没醒的常规原因，按概率排：设备没在开机卡/电源供电（WoL 要待机取电）、
+        固件里这个功能没开、换机器换了网卡所以 MAC 不对、快速启动导致关机后不再监听、
+        以及跨网段那一发被路由器丢了。</p>` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#wl-go').onclick = run;
+  card.querySelector('#wl-mac').onkeydown = (e) => { if (e.key === 'Enter') run(); };
   return card;
 }
 
