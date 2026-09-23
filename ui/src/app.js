@@ -393,8 +393,9 @@ function startPolling(root) {
 // ── 连通性 ──
 
 async function renderProbe(root) {
+  root.appendChild(dualStackCard());
   const card = $(`<div class="card">
-    <h2>连通性</h2>
+    <h2>ping / 探端口</h2>
     <p class="hint">ping 会区分「对方明确回了不可达」和「完全没回应」——前者说明路是通的、问题在对端。</p>
     <div class="row">
       <div><label>目标地址</label><input id="t" placeholder="192.168.1.1 或 fd00::1"></div>
@@ -420,6 +421,136 @@ async function renderProbe(root) {
       addr: card.querySelector('#t').value, port: Number(card.querySelector('#p').value) || undefined });
     say(r.ok ? `${r.note}\n\n${JSON.stringify(r.values, null, 2)}` : r.message);
   };
+}
+
+/*
+ * ── 双栈体检 ──
+ *
+ * ★★ 这是 docs/设计.md 点名的招牌功能，替人做的是只有老手才会做的那一串判断：
+ *   IPv6 有地址、有默认路由，看着一切正常，却出不了外网 —— 而应用优先走 v6，
+ *   于是每次连接先卡几秒再回落 v4。现场表现成「网很慢」而不是「网不通」，
+ *   最容易被查错方向。这一页直接指出那一步。
+ *
+ * ★ 后端只给判定码，码 → 人话全部在这里渲染（多语种靠的就是这条分工）。
+ */
+
+// 顶层判定 → [标题, 颜色, 该怎么做]
+const DS_TOP = {
+  'no-address': ['没拿到地址', 'bad', '两个地址族都没有可用地址、也没有默认路由 —— 这台机器现在基本没网。'],
+  'dual-healthy': ['双栈正常', 'ok', 'IPv4 和 IPv6 都能出外网。'],
+  'v6-egress-broken': ['IPv6 出不了外网', 'bad',
+    'IPv4 正常，但 IPv6 有地址/路由却出不了外网。应用优先走 IPv6，所以每次连接先卡一下再回落到 IPv4 —— 这就是「网很慢」的真身。'
+    + '要么修上游的 IPv6，要么先把这台机器的 IPv6 关掉。'],
+  'v4-egress-broken': ['IPv4 出不了外网', 'bad', 'IPv6 正常，但 IPv4 出不了外网。'],
+  'both-egress-broken': ['两族都出不了外网', 'bad', '两族都有地址，但都出不了外网 —— 多半是纯内网，或上游整个断了。'],
+  'v4-only': ['只有 IPv4，正常', 'ok', '只有 IPv4 能出外网（这台机器没启用 IPv6，或 IPv6 没拿到地址）。'],
+  'v6-only': ['只有 IPv6，正常', 'ok', '只有 IPv6 能出外网。'],
+  'single-no-egress': ['在线，但出不了外网', 'bad', '只有一族在线，而且出不了外网。'],
+};
+// 出口 / 单地址连接 → 人话。★ 这里和探端口用的是同一批码。
+const DS_CONN = {
+  'open': ['通', 'ok'], 'closed': ['被拒绝', 'warn'], 'filtered': ['静默丢包', 'bad'],
+  'no-route': ['没有默认路由', 'bad'], 'error': ['连不上', 'bad'],
+  'skipped': ['未测', ''], 'pending': ['—', ''],
+};
+const DS_GW = {
+  'reachable': ['通', 'ok'], 'no-reply': ['没回应', 'warn'], 'unreachable': ['明确不可达', 'bad'],
+  'no-gateway': ['无下一跳', ''], 'skipped': ['未测', ''],
+};
+const DS_DNS = {
+  'ok': ['解析出记录', 'ok'], 'no-record': ['这一族没有记录', 'warn'],
+  'error': ['解析失败', 'bad'], 'skipped': ['未测', ''],
+};
+
+const pillOf = (map, code) => {
+  const [text, cls] = map[code] || [code || '—', ''];
+  return `<span class="pill ${cls}">${esc(text)}</span>`;
+};
+const tCell = (label, cell) => `<tr><td class="dim">${label}</td><td>${cell}</td></tr>`;
+const ms = (n) => (n || n === 0 ? `${Math.round(n)}ms` : '');
+
+function familyTable(f) {
+  const addrs = (f.addresses || []).length
+    ? `<code>${esc((f.addresses || []).join('  '))}</code>`
+    : '<span class="dim">没有全局地址</span>';
+  const route = f.hasRoute
+    ? `<span class="pill ok">有</span>${f.gateway ? ` <code>${esc(f.gateway)}</code> 经 ${esc(f.routeIface)}` : ''}`
+      + (f.routeCount > 1 ? ` <span class="dim">（共 ${f.routeCount} 条）</span>` : '')
+    : '<span class="pill bad">没有</span>';
+  const gw = pillOf(DS_GW, f.gwReachable) + (f.gwRttMs ? ` <span class="dim">${ms(f.gwRttMs)}</span>` : '');
+  const egress = pillOf(DS_CONN, f.egress)
+    + ` <span class="dim">${esc(f.egressTarget || '')}${f.egressRttMs ? ' ' + ms(f.egressRttMs) : ''}</span>`;
+  const dns = pillOf(DS_DNS, f.dns) + ` <span class="dim">${ms(f.dnsRttMs)}</span>`;
+  return `<div><table>
+    <tr><th colspan="2">${f.family === 'ipv4' ? 'IPv4' : 'IPv6'}</th></tr>
+    ${tCell('地址', addrs)}${tCell('默认路由', route)}${tCell('网关', gw)}
+    ${tCell('出外网', egress)}${tCell('DNS', dns)}
+  </table></div>`;
+}
+
+function attemptRow(title, list) {
+  if (!list || !list.length) return tCell(title, '<span class="dim">域名没有这类记录</span>');
+  const cells = list.map((a) => `<div><code>${esc(a.addr)}</code> ${pillOf(DS_CONN, a.code)}`
+    + ` <span class="dim">${a.code === 'open' || a.rttMs ? ms(a.rttMs) : ''}</span></div>`).join('');
+  return tCell(title, cells);
+}
+
+function eyeballRow(eb) {
+  const map = {
+    'eyeballs-ok': ['不会卡', 'ok'], 'eyeballs-stall': ['★ 会先卡一下', 'bad'],
+    'eyeballs-single': ['只有一族能连，没得选', 'warn'], 'eyeballs-fail': ['这个域名两族都连不上', 'bad'],
+  };
+  const [text, cls] = map[eb.code] || [eb.code, ''];
+  let extra = '';
+  if (eb.code === 'eyeballs-stall') {
+    extra = ` 应用先试 <b>${esc(eb.preferred)}</b>，${eb.connDelayMs}ms 没连上就并行起 <b>${esc(eb.winner)}</b>：`
+      + `守规矩的应用大约卡 <b>${ms(eb.stallMs)}</b>，不守规矩的（串行把 v6 试到超时）最坏卡 <b>${ms(eb.worstMs)}</b>。`;
+  } else if (eb.winner) {
+    extra = ` 应用会先用 <b>${esc(eb.winner)}</b> 连上这个域名。`;
+  }
+  return tCell('Happy Eyeballs', `<span class="pill ${cls}">${esc(text)}</span>${extra}`);
+}
+
+function dualStackCard() {
+  const card = $(`<div class="card">
+    <h2>双栈体检 <span id="ds-top"></span></h2>
+    <p class="hint">一次测完 IPv4 与 IPv6 各自：有没有地址、有没有默认路由、网关通不通、出不出得了外网、DNS 通不通；
+      再对同一个域名的 A 与 AAAA 分别连一次比耗时，按 Happy Eyeballs(RFC 8305) 判断应用会不会先卡一下。
+      ★ 专治「有 IPv6 地址却出不了外网，结果上网很慢」这类现场最难查的问题。</p>
+    <div class="row">
+      <div><label>体检用的域名</label><input id="ds-d" placeholder="默认 www.cloudflare.com"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="ds-go">开始体检</button></div>
+    </div>
+    <div id="ds-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#ds-out');
+  const top = card.querySelector('#ds-top');
+  card.querySelector('#ds-go').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">体检中…（要发几轮连接，约 5 秒）</div>';
+    const domain = card.querySelector('#ds-d').value.trim();
+    const r = await call('net.dualstack.check', domain ? { domain } : {});
+    if (!r.ok) { out.innerHTML = `<div class="empty">体检失败：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [title, cls, advice] = DS_TOP[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      <div class="row" style="margin-top:14px">${familyTable(v.v4)}${familyTable(v.v6)}</div>
+      <table style="margin-top:14px">
+        <tr><th colspan="2">域名 <code>${esc(v.domain.name)}:${v.domain.port}</code>
+          <span class="dim">解析 ${v.domain.lookupMs}ms${v.domain.err ? ' · ' + esc(v.domain.err) : ''}</span></th></tr>
+        ${attemptRow('A 记录（v4）', v.domain.a)}
+        ${attemptRow('AAAA 记录（v6）', v.domain.aaaa)}
+        ${eyeballRow(v.eyeballs)}
+      </table>`;
+  };
+  return card;
 }
 
 // ── 视频流 ──
