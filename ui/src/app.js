@@ -3514,7 +3514,7 @@ function fsLedger(recent) {
     return `<tr>
       <td class="dim">${esc(fsClock(t.at))}</td>
       <td><code>${esc(t.peer || '—')}</code></td>
-      <td class="dim">${esc(t.proto === 'tftp' ? 'tftp' : 'http')}</td>
+      <td class="dim">${esc(['http', 'tftp', 'ftp'].includes(t.proto) ? t.proto : 'http')}</td>
       <td><code>${esc(t.path || '—')}</code></td>
       <td class="dim">${esc(fsSize(t.bytes))}</td>
       <td class="${cls}">${esc(word)}</td>
@@ -3523,9 +3523,9 @@ function fsLedger(recent) {
   return `<div style="max-height:280px;overflow:auto"><table>
     <tr><th>什么时候</th><th>谁取的</th><th>哪个协议</th><th>取了什么</th><th>多少</th><th>结果</th></tr>
     ${rows}</table></div>
-    <p class="hint">只留最近 50 笔。「被拒」那一行是分开的：想上传的（http 的 PUT、tftp 的 WRQ）一律不收，
+    <p class="hint">只留最近 50 笔。「被拒」那一行是分开的：想上传的（http 的 PUT、tftp 的 WRQ、ftp 的 STOR/DELE）一律不收，
       文件名写错只算没找到，不混成「有人在攻击」。协议那一栏看得出设备是从哪个口来取的 ——
-      开着 TFTP 时，老设备走的就是 tftp 那一行。</p>`;
+      同一台设备换个地址栏就会换一行，开着三种协议时这一栏也是「谁在动这个目录」的清单。</p>`;
 }
 
 function fsWarn(lines) {
@@ -3543,9 +3543,11 @@ function fileshareCard() {
     <p class="hint">把本机一个目录开成 http 下载地址 —— 设备的升级页面要填一个
       「固件下载地址」，交换机要把配置文件拉回去，都是这一张。
       ★ 遇到<strong>只认 tftp 的老设备</strong>（填 http 一律「下载失败」），勾上「连 TFTP 一起开」：
-      同一个目录、同样只读，只是多开一个 UDP 口。
+      同一个目录、同样只读，只是多开一个 UDP 口。另一批设备/交换机的地址栏只认
+      <strong>ftp://</strong>，那就勾「连 FTP 一起开」。
       ★ <strong>只读</strong>：只发不收，同网段谁都改不了、删不了本机任何东西
-      （http 只接 GET/HEAD，tftp 的上传请求当场回「不接受上传」）。
+      （http 只接 GET/HEAD，tftp 的上传请求当场回「不接受上传」，
+      ftp 的 STOR/DELE/MKD/RNFR 这些命令压根不认）。
       ★ 只绑你挑的那块网卡上的地址，<strong>不绑 0.0.0.0</strong> ——
       多网卡机器上那等于把目录从办公网甚至公网口也开出去。
       ★ 无鉴权：开着的时候同一网段任何设备不必登录就能把这个目录整个读走，
@@ -3565,6 +3567,8 @@ function fileshareCard() {
         <input id="fs-addrs" placeholder="192.168.1.20 fd00::1（不许写 0.0.0.0）"></div>
       <div style="flex:0 0 110px"><label>TFTP 端口（默认 69）</label>
         <input id="fs-tftpport" placeholder="69"></div>
+      <div style="flex:0 0 110px"><label>FTP 端口（默认 21）</label>
+        <input id="fs-ftpport" placeholder="21"></div>
     </div>
     <div class="row">
       <label style="display:flex;gap:6px;align-items:center;font-size:13px;font-weight:normal;white-space:nowrap">
@@ -3574,6 +3578,10 @@ function fileshareCard() {
         title="老设备的升级页面只认 tftp://，填 http 一律「下载失败」。开了就是多开一个 UDP 口，一样只读、一样不鉴权。">
         <input type="checkbox" id="fs-tftp" style="flex:0 0 auto">
         连 TFTP 一起开（老设备只认它）</label>
+      <label style="display:flex;gap:6px;align-items:center;font-size:13px;font-weight:normal;white-space:nowrap"
+        title="还有一批设备和交换机的地址栏只认 ftp://。开的是只读：上传、删除、改名这些命令当场拒。数据口只绑在这块网卡上。">
+        <input type="checkbox" id="fs-ftp" style="flex:0 0 auto">
+        连 FTP 一起开（交换机/老设备只认 ftp://）</label>
     </div>
     <div class="row" style="margin-top:6px">
       <div style="flex:0 0 auto;min-width:0">
@@ -3598,12 +3606,20 @@ function fileshareCard() {
     const port = v.port || st.port || 0;
     const listing = typeof v.listing === 'boolean' ? v.listing : st.listing;
     const urls = (v.urls && v.urls.length ? v.urls : st.urls) || [];
-    // serve 和 status 两边都带这两个字段（刷一次状态不能丢掉「TFTP 开着」这件事）
+    // serve 和 status 两边都带这几个字段（刷一次状态不能丢掉「多开了哪个协议」这件事）
     const tftp = typeof v.tftp === 'boolean' ? v.tftp : Boolean(st.tftp);
     const tftpPort = v.tftpPort || st.tftpPort || 0;
     const turls = (v.tftpUrls && v.tftpUrls.length ? v.tftpUrls : st.tftpUrls) || [];
+    const ftp = typeof v.ftp === 'boolean' ? v.ftp : Boolean(st.ftp);
+    const ftpPort = v.ftpPort || st.ftpPort || 0;
+    const furls = (v.ftpUrls && v.ftpUrls.length ? v.ftpUrls : st.ftpUrls) || [];
     const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--sunken)';
     const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--line)';
+
+    // 开着哪几种协议说一遍：停掉那一句和状态那一句都要用它，两边各列一份必出错
+    const protos = ['http'];
+    if (tftp) protos.push('tftp');
+    if (ftp) protos.push('ftp');
 
     let say;
     if (verdict === 'share-idle') {
@@ -3612,19 +3628,21 @@ function fileshareCard() {
     } else if (verdict === 'share-stopped') {
       // ★ 停掉之后不再摆下载地址：那几条已经读不到东西了，还做成可复制的样子，
       //   人就照旧往设备里粘，然后回来查「为什么下载失败」。
-      say = `http${tftp ? ' 和 tftp' : ''} 的端口都已经放掉，${esc(root)} 不再对外可读。`
+      say = `${protos.join('、')} 的端口都已经放掉，${esc(root)} 不再对外可读。`
         + `这中间一共被取走 ${v.requests || 0} 次、${esc(fsSize(v.bytes || 0))}。`
         + '已经下到设备里的文件不受影响。';
     } else if (serving && v.iface) {
       say = `目录 <code>${esc(root)}</code> 正从网卡 <b>${esc(v.iface)}</b>`
         + `（${esc(FS_WHY[v.ifaceWhy] || v.ifaceWhy || '怎么定的没说')}）发出去，http 端口 ${port || '—'}`
-        + (tftp ? `、TFTP 端口 ${tftpPort || '—'}` : '') + `。`
+        + (tftp ? `、TFTP 端口 ${tftpPort || '—'}` : '')
+        + (ftp ? `、FTP 端口 ${ftpPort || '—'}` : '') + `。`
         + `只读，不收上传。★ 同一网段的设备不必登录就能读到这个目录里的东西。`;
     } else if (serving) {
       say = `目录 <code>${esc(root)}</code> 正绑在这些地址上：${
         (v.addrs || st.addrInfo || []).map((x) => `<code>${esc(x)}</code>`).join('、')
         }，http 端口 ${port || '—'}`
-        + (tftp ? `、TFTP 端口 ${tftpPort || '—'}` : '') + `。只读，不收上传。`;
+        + (tftp ? `、TFTP 端口 ${tftpPort || '—'}` : '')
+        + (ftp ? `、FTP 端口 ${ftpPort || '—'}` : '') + `。只读，不收上传。`;
     } else {
       say = '后端给了一个这里还没认得的判定，原文在下面展开看。';
     }
@@ -3651,6 +3669,12 @@ function fileshareCard() {
           //   往往比 TCP 松，只报 http 等于少说了一半。
           facts.push(['TFTP 那一侧', `开着，UDP 端口 ${tftpPort || '—'}；一样只读，上传请求一律回「不接受上传」`]);
         }
+        if (ftp) {
+          // ★ 这一栏要说的是「它还额外开了什么」：FTP 每传一个文件要临时开一个数据口，
+          //   只放行 21 的防火墙会卡在取文件那一步 —— 不说，现场会去怀疑设备。
+          facts.push(['FTP 那一侧', `开着，端口 ${ftpPort || '—'}；只读，STOR/DELE/MKD/RNFR 这些命令当场拒`
+            + '；每传一个文件临时开一个数据口（只绑这块网卡的地址），防火墙只放行这一个口会卡在取文件那一步']);
+        }
       }
     }
     const factRows = facts.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
@@ -3668,6 +3692,11 @@ function fileshareCard() {
         <p class="hint">设备那一栏通常只填「文件名」或「地址 + 文件名」：<code>${esc(turls[0] || '')}固件名.bin</code> 这样接。
           ★ TFTP 没有目录列表，文件名必须写全，写错就是「没有这个文件」。
           69 号口绑不上（要更高权限）时，界面上会让它换一个端口，设备的地址栏能填端口就填上。</p></div>` : ''}
+      ${furls.length && serving ? `<div style="margin-top:12px"><label class="dim">FTP 地址（交换机、老设备的配置/固件栏只认 ftp:// 时用这一条）</label>
+        ${furls.map((u) => `<div style="margin-top:4px"><code style="user-select:all;cursor:cell">${esc(u)}</code></div>`).join('')}
+        <p class="hint">多数设备的 ftp 栏要的是「地址 + 文件名」：<code>${esc(furls[0] || '')}固件名.bin</code> 这样接。
+          ★ 要用户名的地方随便填一个就行（这个共享不鉴权），密码同理 —— 别把你别的账号填进去。
+          主动模式（PORT）只允许连回它自己连进来的那个地址，隔着 NAT 的设备会取不到文件，那种设备请让它走 PASV。</p></div>` : ''}
       ${factRows ? `<table style="margin-top:12px"><tr><th></th><th></th></tr>${factRows}</table>` : ''}
       ${fsWarn(v.warnings)}
       ${serving ? `<div style="margin-top:12px"><label class="dim">谁在取、取走了什么（每 3 秒自己刷新）</label>
@@ -3712,6 +3741,11 @@ function fileshareCard() {
       const tp = card.querySelector('#fs-tftpport').value.trim();
       // 不填就交给后端按 69 来：这里替它填一个别的号，等于人没同意过的端口
       if (tp) { args.tftpPort = Number(tp); }
+    }
+    if (card.querySelector('#fs-ftp').checked) {
+      args.ftp = true;
+      const fp = card.querySelector('#fs-ftpport').value.trim();
+      if (fp) { args.ftpPort = Number(fp); }
     }
     top.innerHTML = '';
     // ★ 等批准：开这个共享改的是这台机器对外的可见面，必须有人看一眼再开

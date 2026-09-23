@@ -299,3 +299,27 @@ func firstLine(html string) string {
 	}
 	return html
 }
+
+func Test两个点开头的文件名仍然取得到(t *testing.T) {
+	// ★ 越界判定必须带分隔符：`..草稿.bin` 这样一个真叫这名字的文件，
+	//   按 HasPrefix("..") 会被当成「跑出了根目录」而当场拒掉，
+	//   报的还是那句「这个路径不在共享目录里」—— 现场没人想得起来是文件名的锅。
+	//   （设备升级目录里这种名字不少：下载中途留下的 ..xxx.part、编辑器的 .. 前缀备份）
+	s := tempShare(t, nil)
+	root := s.Status().Root
+	writeFile(t, root, "..草稿.bin", []byte("半个固件"))
+	writeFile(t, root, "..IPCamera_full_V2.4.5.bin.part", []byte("下载中断留下的"))
+
+	for _, name := range []string{"..草稿.bin", "..IPCamera_full_V2.4.5.bin.part"} {
+		resp, body := get(t, base(s)+"/"+name)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%q 取不到：%d", name, resp.StatusCode)
+		}
+		if body == "" {
+			t.Errorf("%q 内容是空的", name)
+		}
+	}
+	if st := s.Status(); st.Denied != 0 {
+		t.Errorf("这些都在根里，不该记成被拒：Denied=%d", st.Denied)
+	}
+}

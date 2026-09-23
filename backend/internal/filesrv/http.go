@@ -141,7 +141,13 @@ func (s *Server) resolve(urlPath string) (os.FileInfo, string, string, error) {
 // noSymlink 从根往下逐段看，任何一段是符号链接就拒。
 func noSymlink(root, full string) error {
 	rel, err := filepath.Rel(root, full)
-	if err != nil || strings.HasPrefix(rel, "..") {
+	if err != nil {
+		return fmt.Errorf("这个路径不在共享目录里")
+	}
+	// ★ 判「跑出去了」必须带上分隔符：只 HasPrefix("..") 的话，
+	//   一个真叫 `..草稿.bin` 的文件会被当成越界拒掉 —— 三个协议一起误伤，
+	//   而报的那句是「这个路径不在共享目录里」，没人想得起来是文件名的锅。
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("这个路径不在共享目录里")
 	}
 	cur := root

@@ -1143,3 +1143,182 @@ func TestTFTP绑不上时不留一个只开了http的共享(t *testing.T) {
 		t.Error("回滚没做干净，http 还在听")
 	}
 }
+
+func Test批准说明里要写明多开了FTP这一件事(t *testing.T) {
+	// 和 TFTP 同一条理由：人点头的是那一句整体。只写 http（+tftp）的话，
+	// 他不知道自己也同意了一个 ftp 口。
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	off := describeFileShare(json.RawMessage(`{"root":"` + dir + `"}`))
+	// ★ 比的是原话不是「FTP」三个字母：目录路径里带着测试名，比单词会一直假绿。
+	if strings.Contains(off, "FTP 端口") || strings.Contains(off, "同时开 FTP") {
+		t.Errorf("没开 FTP 的批准说明里冒出了一句 FTP：%s", off)
+	}
+	on := describeFileShare(json.RawMessage(`{"root":"` + dir + `","ftp":true,"ftpPort":2123}`))
+	if !strings.Contains(on, "FTP 端口") || !strings.Contains(on, "同时开 FTP") {
+		t.Errorf("开了 FTP 的批准说明没把这件事说出来：%s", on)
+	}
+	if !strings.Contains(on, "2123") {
+		t.Errorf("批准说明里没写开在哪个口：%s", on)
+	}
+	if !strings.Contains(on, "只读") {
+		t.Errorf("没说清 FTP 这一侧同样只读：%s", on)
+	}
+	// ★ 数据口这一层必须在批准前说：不说的话，人以为放行一个口就完了，
+	//   现场变成「登录得上、取不到文件」，回头查的是设备。
+	if !strings.Contains(on, "数据口") {
+		t.Errorf("批准说明没提每传一个文件还要临时开数据口：%s", on)
+	}
+}
+
+func Test只填端口不开FTP时先问一句(t *testing.T) {
+	// 静默忽略 ftpPort 的话，人会以为端口生效了，然后回去查设备为什么连不上。
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	_, err := callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t), "ftpPort": 2123})
+	if err == nil {
+		t.Fatal("只填了 ftpPort 也起了起来")
+	}
+	if !strings.Contains(err.Error(), "ftp") {
+		t.Errorf("报错没落在 ftp 上：%v", err)
+	}
+}
+
+func Test两个口同号时不许自己撞自己(t *testing.T) {
+	// http 和 ftp 都是 TCP。同号的话先起的占住，后起的报「被别的服务占了」——
+	// 那句会把人送去查旁边的进程，而抢口的就是我们自己。
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	p := freePort(t)
+	_, err := callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": p, "ftp": true, "ftpPort": p})
+	if err == nil {
+		t.Fatal("http 和 ftp 同一个端口也起了起来")
+	}
+	if !strings.Contains(err.Error(), "同一个号") {
+		t.Errorf("报错没落在两个口同号上：%v", err)
+	}
+}
+
+func Test开了FTP时结果里给出ftp地址(t *testing.T) {
+	shareReset(t)
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	v, err := callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t),
+		"ftp": true, "ftpPort": freePort(t)})
+	if err != nil {
+		t.Fatalf("起共享失败：%v", err)
+	}
+	defer func() {
+		if _, e := callShare(t, fileshareStopTool, map[string]any{}); e != nil {
+			t.Error(e)
+		}
+	}()
+	urls, _ := v.Values["ftpUrls"].([]string)
+	if len(urls) == 0 || !strings.HasPrefix(urls[0], "ftp://127.0.0.1:") {
+		t.Fatalf("没给出可贴的 ftp 地址：%v", v.Values["ftpUrls"])
+	}
+	proto, _ := v.Values["protocols"].([]string)
+	if len(proto) != 2 || proto[1] != "ftp" {
+		t.Errorf("协议一栏没说两种都开着：%v", v.Values["protocols"])
+	}
+	if !strings.Contains(v.Note, "FTP") {
+		t.Errorf("落账那句没提 FTP：%s", v.Note)
+	}
+	if _, err := callShare(t, fileshareStopTool, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 三种一起开：界面那一栏读的是 protocols，少一栏就少一个协议
+	if _, err := callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t),
+		"tftp": true, "tftpPort": freeUDPPort(t), "ftp": true, "ftpPort": freePort(t)}); err != nil {
+		t.Fatalf("三种协议一起开失败了：%v", err)
+	}
+	defer func() {
+		if _, e := callShare(t, fileshareStopTool, map[string]any{}); e != nil {
+			t.Error(e)
+		}
+	}()
+	st, e := callShare(t, fileshareStatusTool, map[string]any{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	all, _ := st.Values["protocols"].([]string)
+	if len(all) != 3 || all[0] != "http" || all[1] != "tftp" || all[2] != "ftp" {
+		t.Errorf("三种协议时 protocols 少了一栏：%v", st.Values["protocols"])
+	}
+	if st.Values["ftp"] != true {
+		t.Errorf("状态里没说 FTP 开着：%v", st.Values["ftp"])
+	}
+	if su, _ := st.Values["ftpUrls"].([]string); len(su) == 0 {
+		t.Errorf("刷一次状态就没有 ftp 地址了：%v", st.Values["ftpUrls"])
+	}
+	if !strings.Contains(st.Note, "ftp 端口") {
+		t.Errorf("状态那句没报 ftp 端口：%s", st.Note)
+	}
+}
+
+func Test停掉时把放掉了哪几个口逐个说出来(t *testing.T) {
+	// 「共享已停」四个字分辨不出是不是三个口都停了，而现场最怕的正是这一条。
+	shareReset(t)
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	ftpPort := freePort(t)
+	if _, err := callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t),
+		"tftp": true, "tftpPort": freeUDPPort(t), "ftp": true, "ftpPort": ftpPort}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := callShare(t, fileshareStopTool, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"http", "tftp", "ftp"} {
+		if !strings.Contains(v.Note, want) {
+			t.Errorf("停掉的句子里没有 %s：%s", want, v.Note)
+		}
+	}
+	if !strings.Contains(v.Note, "放掉") {
+		t.Errorf("停掉的句子没说端口已经放掉：%s", v.Note)
+	}
+	if v.Values["ftp"] != true || v.Values["ftpPort"] != ftpPort {
+		t.Errorf("停掉这一笔丢了 ftp 那一栏：%+v", v.Values)
+	}
+}
+
+func TestFTP绑不上时不留一个只开了http的共享(t *testing.T) {
+	// ★ 批准的是「http + ftp」这个整体：FTP 起不来却把 http 留着，
+	//   等于偷偷改了人点头的那件事。
+	shareReset(t)
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	_, err = callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t),
+		"ftp": true, "ftpPort": port})
+	if err == nil {
+		t.Fatal("ftp 端口被占却起了起来")
+	}
+	st, e := callShare(t, fileshareStatusTool, map[string]any{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if st.Code != verdictShareIdle {
+		t.Errorf("半个共享留在了机上：%+v", st.Values)
+	}
+	fileshare.mu.Lock()
+	srv := fileshare.srv
+	fileshare.mu.Unlock()
+	if srv != nil {
+		t.Error("回滚没做干净，http 还在听")
+	}
+}

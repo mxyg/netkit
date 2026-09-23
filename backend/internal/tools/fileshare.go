@@ -76,9 +76,14 @@ type fileshareArgs struct {
 	Listing  *bool    `json:"listing,omitempty"`
 	TFTP     bool     `json:"tftp,omitempty"`
 	TFTPPort int      `json:"tftpPort,omitempty"`
+	FTP      bool     `json:"ftp,omitempty"`
+	FTPPort  int      `json:"ftpPort,omitempty"`
 }
 
-const fileshareDefaultTFTPPort = 69
+const (
+	fileshareDefaultTFTPPort = 69
+	fileshareDefaultFTPPort  = 21
+)
 
 var fileshareServeTool = ots.Tool{
 	Name:  "net.fileshare.serve",
@@ -89,6 +94,7 @@ var fileshareServeTool = ots.Tool{
 		"★ 只绑指定网卡上的地址，绝不绑 0.0.0.0 —— 多网卡机器上那等于把目录从办公网/公网口也开出去。\n" +
 		"填 tftp=true 时同一个目录再开一个**只读 TFTP**（老设备只认 tftp，它们的升级页面填 http 一律「下载失败」）；\n" +
 		"TFTP 只接读请求，上传（WRQ）当场回「不接受上传」并单独记一笔被拒。\n" +
+		"填 ftp=true 时再开一个**只读 FTP**（还有一批设备/交换机只认 ftp://）；上传、删除、改名一律当场拒。\n" +
 		"不填 iface 就按 IPv4 默认路由那块网卡挑；挑中了会在结果里说清是哪块、哪些地址、开在哪个端口。\n" +
 		"结果里带目录里有多少个条目、多大，以及**目录里有疑似密钥文件时的提醒**（很多人顺手把整个用户目录端出来）。\n" +
 		"同一时刻只允许一个共享。用完请调 net.fileshare.stop 停掉：这两种协议都不鉴权，同网段谁都能读。",
@@ -108,7 +114,11 @@ var fileshareServeTool = ots.Tool{
 	    "tftp": {"type": "boolean",
 	      "description": "要不要连 TFTP 一起开（同一个目录、同样只读）。默认不开。给那些只认 tftp 的老设备用 —— 它们的升级页面填 http 一定失败。开了就是多开一个 UDP 口，同网段谁都能读，批准说明里会写出来。"},
 	    "tftpPort": {"type": "integer", "minimum": 1, "maximum": 65535,
-	      "description": "TFTP 的端口，默认 69（设备的 tftp 栏很多写死了这个号）。69 在 1024 以下，要更高权限才绑得上；绑不上时报错会直说该换端口还是该提权。只在 tftp=true 时有意义。"}
+	      "description": "TFTP 的端口，默认 69（设备的 tftp 栏很多写死了这个号）。69 在 1024 以下，要更高权限才绑得上；绑不上时报错会直说该换端口还是该提权。只在 tftp=true 时有意义。"},
+	    "ftp": {"type": "boolean",
+	      "description": "要不要连 FTP 一起开（同一个目录、同样只读）。默认不开。给那批只认 ftp:// 的设备和交换机用。★ 开的是只读：STOR/DELE/MKD/RNFR 一律当场拒并单独记一笔。数据口只绑在这块网卡上，主动模式（PORT）也只允许连回连进来的那个地址，不借本机去连第三方。"},
+	    "ftpPort": {"type": "integer", "minimum": 1, "maximum": 65535,
+	      "description": "FTP 的端口，默认 21（ftp:// 不写端口就是它）。21 在 1024 以下要更高权限；设备的地址栏没有端口那一栏时只能提权起。只在 ftp=true 时有意义。"}
 	  }
 	}`),
 	Describe: describeFileShare,
@@ -158,6 +168,9 @@ func describeFileShare(raw json.RawMessage) string {
 	if plan.tftp {
 		s += fmt.Sprintf("、TFTP 端口 %d", plan.tftpPort)
 	}
+	if plan.ftp {
+		s += fmt.Sprintf("、FTP 端口 %d", plan.ftpPort)
+	}
 	switch {
 	case err != nil:
 		s += fmt.Sprintf("；网卡没定下来：%s", err)
@@ -171,6 +184,12 @@ func describeFileShare(raw json.RawMessage) string {
 		// ★ 这句不能省：批准的人看到的要是「开共享」三个字的整体，他不知道
 		//   自己同时同意了一个 UDP 口 —— 而 UDP 口在防火墙默认规则里往往更松。
 		s += "。★ 同时开 TFTP（UDP）：老设备只认它；一样只读，一样不鉴权"
+	}
+	if plan.ftp {
+		// ★ FTP 还有第二层：它除了控制口要开一批**数据口**，而且是两段连接。
+		//   不写进这句，批准的人以为点头的是一个口。
+		s += "。★ 同时开 FTP：另一批设备只认 ftp://；一样只读、不鉴权，" +
+			"另外每次传文件会临时开一个数据口（只绑在这块网卡上）"
 	}
 	if len(plan.warnings) > 0 {
 		s += "。★ " + strings.Join(plan.warnings, "；")
@@ -193,6 +212,8 @@ type filesharePlan struct {
 	listing  bool
 	tftp     bool
 	tftpPort int
+	ftp      bool
+	ftpPort  int
 	warnings []string
 }
 
@@ -215,6 +236,25 @@ func planFileShare(a fileshareArgs) (filesharePlan, error) {
 			return p, ots.Errf(ots.ErrInvalidArgument,
 				"tftpPort 只在 tftp=true 时有意义：要先开 TFTP 再填端口")
 		}
+	}
+	p.ftp = a.FTP
+	p.ftpPort = a.FTPPort
+	if p.ftpPort == 0 {
+		p.ftpPort = fileshareDefaultFTPPort
+	}
+	if !p.ftp {
+		p.ftpPort = 0
+		if a.FTPPort != 0 {
+			return p, ots.Errf(ots.ErrInvalidArgument,
+				"ftpPort 只在 ftp=true 时有意义：要先开 FTP 再填端口")
+		}
+	}
+
+	if p.ftp && p.ftpPort == p.port {
+		// 两个 TCP 口同号：先起的占住，后起的报「被别的服务占了」—— 那句会把人送去查
+		// 旁边的进程，可抢口的就是我们自己。这种自己撞自己要在批准之前就说清楚。
+		return p, ots.Errf(ots.ErrInvalidArgument,
+			"ftpPort 不能和 port 是同一个号（%d）：http 和 ftp 都是 TCP，会自己撞自己", p.port)
 	}
 
 	if strings.TrimSpace(a.Root) == "" {
@@ -519,6 +559,7 @@ func serveFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 	srv, err := filesrv.Start(filesrv.Config{
 		Root: plan.root, Addrs: plan.addrs, Port: plan.port, Listing: plan.listing,
 		TFTP: plan.tftp, TFTPPort: plan.tftpPort,
+		FTP: plan.ftp, FTPPort: plan.ftpPort,
 	})
 	if err != nil {
 		return nil, ots.Errf(ots.ErrPermissionRequired, "%s", err)
@@ -531,7 +572,8 @@ func serveFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 		map[string]any{"serving": false},
 		map[string]any{"root": plan.root, "iface": plan.iface, "addrs": plan.addrs,
 			"port": plan.port, "listing": plan.listing,
-			"tftp": plan.tftp, "tftpPort": plan.tftpPort}); jerr == nil {
+			"tftp": plan.tftp, "tftpPort": plan.tftpPort,
+			"ftp": plan.ftp, "ftpPort": plan.ftpPort}); jerr == nil {
 		_ = journal.MarkApplied(id)
 		fileshare.entryID = id
 	}
@@ -549,10 +591,13 @@ func serveFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 		"port":            plan.port,
 		"urls":            srv.URLs(),
 		"listing":         plan.listing,
-		"protocols":       shareProtocols(plan.tftp),
+		"protocols":       shareProtocols(plan.tftp, plan.ftp),
 		"tftp":            plan.tftp,
 		"tftpPort":        plan.tftpPort,
 		"tftpUrls":        srv.TFTPURLs(),
+		"ftp":             plan.ftp,
+		"ftpPort":         plan.ftpPort,
+		"ftpUrls":         srv.FTPURLs(),
 		"readOnly":        true,
 		"possibleSecrets": plan.secrets,
 		"warnings":        plan.warnings,
@@ -568,6 +613,14 @@ func serveFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 		//   起完之后句子里只剩 http，等于事后看不出自己同意过第二个协议。
 		note += fmt.Sprintf("；同时开了只读 TFTP（UDP %d），tftp://%s:%d/… 那种地址现在能用",
 			plan.tftpPort, plan.addrs[0], plan.tftpPort)
+	}
+	if plan.ftp {
+		// ★ 和 TFTP 同一句的理由：起完之后句子里只剩 http，事后就看不出自己同意过第三个协议。
+		//   FTP 这里还多一条要说：每传一个文件临时开一个数据口，只放行 21 的防火墙
+		//   会表现为「登录得上、列得出目录、取文件卡住」—— 先写进这句，别让现场去猜。
+		note += fmt.Sprintf("；同时开了只读 FTP（端口 %d），ftp://%s:%d/… 现在能用，上传/删除一律当场拒；"+
+			"每传一个文件会临时开一个数据口，只放行 %d 的防火墙会卡在取文件那一步",
+			plan.ftpPort, plan.addrs[0], plan.ftpPort, plan.ftpPort)
 	}
 	if len(plan.secrets) > 0 {
 		note += fmt.Sprintf("；★ 目录里有 %d 个文件名看着像密钥（%s），它们同样能被下载",
@@ -591,10 +644,13 @@ func statusFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 	st := srv.Status()
 	vals := map[string]any{
 		"status":    st,
-		"protocols": shareProtocols(plan.tftp),
+		"protocols": shareProtocols(plan.tftp, plan.ftp),
 		"tftp":      plan.tftp,
 		"tftpPort":  plan.tftpPort,
 		"tftpUrls":  st.TFTPURLs,
+		"ftp":       plan.ftp,
+		"ftpPort":   plan.ftpPort,
+		"ftpUrls":   st.FTPURLs,
 		// 开那一刻算好的事实，跟着状态一起回，界面刷一次不丢行。
 		"iface":           plan.iface,
 		"ifaceWhy":        plan.ifaceWhy,
@@ -609,6 +665,9 @@ func statusFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 		st.Root, len(st.AddrInfo), srv.Port())
 	if plan.tftp {
 		note += fmt.Sprintf("、tftp 端口 %d", st.TFTPPort)
+	}
+	if plan.ftp {
+		note += fmt.Sprintf("、ftp 端口 %d", st.FTPPort)
 	}
 	note += fmt.Sprintf("），已下发 %d 次、共 %s", st.Requests, humanSize(st.Bytes))
 	if st.Denied > 0 {
@@ -636,12 +695,22 @@ func stopFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 	}
 	fileshare.srv, fileshare.entryID = nil, ""
 	fileshare.plan = filesharePlan{}
+	// ★ 这句要把**放掉了哪几个口**逐个说出来：开着三种协议时，「共享已停」四个字
+	//   分辨不出是不是三个都停了 —— 现场最怕的正是「以为停了，其实 ftp 那个口还在收」。
+	released := fmt.Sprintf("http %d", st.Port)
+	if st.TFTP {
+		released += fmt.Sprintf("、tftp %d/udp", st.TFTPPort)
+	}
+	if st.FTP {
+		released += fmt.Sprintf("、ftp %d（含每次传输临时开的数据口）", st.FTPPort)
+	}
 	return ots.Verdict{
 		Code: verdictShareStopped,
 		Values: map[string]any{"root": st.Root, "urls": st.URLs, "requests": st.Requests,
-			"bytes": st.Bytes, "tftp": st.TFTP, "tftpPort": st.TFTPPort},
-		Note: fmt.Sprintf("共享已停：%s 不再对外可读（这中间一共被取走 %d 次、%s）",
-			st.Root, st.Requests, humanSize(st.Bytes)),
+			"bytes": st.Bytes, "tftp": st.TFTP, "tftpPort": st.TFTPPort,
+			"ftp": st.FTP, "ftpPort": st.FTPPort},
+		Note: fmt.Sprintf("共享已停：%s 不再对外可读，%s 这几个端口都已经放掉（这中间一共被取走 %d 次、%s）",
+			st.Root, released, st.Requests, humanSize(st.Bytes)),
 	}, nil
 }
 
@@ -667,12 +736,16 @@ func restoreFileShare(log *slog.Logger) {
 }
 
 // shareProtocols 这个共享对外是哪几种协议。界面和批准说明都读它，
-// 不让两边各写一份「http（+tftp）」—— 那种两份的写法一定会有一份忘了改。
-func shareProtocols(tftp bool) []string {
+// 不让两边各写一份「http（+tftp）（+ftp）」—— 那种两份的写法一定会有一份忘了改。
+func shareProtocols(tftp, ftp bool) []string {
+	out := []string{"http"}
 	if tftp {
-		return []string{"http", "tftp"}
+		out = append(out, "tftp")
 	}
-	return []string{"http"}
+	if ftp {
+		out = append(out, "ftp")
+	}
+	return out
 }
 
 func humanSize(n int64) string {

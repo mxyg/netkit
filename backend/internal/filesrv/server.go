@@ -44,6 +44,11 @@ type Config struct {
 	//   真要用时端口一般填 69（要更高权限），起不来会照 bindErr 那句直说是要权限还是要换号。
 	TFTP     bool
 	TFTPPort int
+
+	// FTP 同上：写死 ftp:// 的那批设备（交换机、老 IPC）只认这一种。
+	// ★ 也只处理读：STOR/APPE/DELE/MKD/RNM 一律当场拒。默认关着。
+	FTP     bool
+	FTPPort int
 }
 
 // Transfer 一次取文件：谁取的、取了什么、多少字节、什么时候、成没成。
@@ -68,10 +73,14 @@ type Status struct {
 	// TFTPURLs 只在开了 TFTP 时给：设备那一栏填的是 tftp://…，
 	// 和 http 那几条一起摆出来，人才不会把两种地址抄混。
 	TFTPURLs []string `json:"tftpUrls,omitempty"`
-	Port     int      `json:"port"` // 实际在听的号（填 0 让系统挑时只有这里说得清）
-	// TFTPPort 只在开了 TFTP 时非 0：设备里那行地址要照着它写，别嘴上说 69 而实际不是。
+	// FTPURLs 同理：只认 ftp:// 的那批设备（交换机、老 IPC）要的是这一条。
+	FTPURLs []string `json:"ftpUrls,omitempty"`
+	Port    int      `json:"port"` // 实际在听的号（填 0 让系统挑时只有这里说得清）
+	// TFTPPort / FTPPort 只在各自开着时非 0：设备里那行地址要照着它写，别嘴上说 69 而实际不是。
 	TFTPPort int   `json:"tftpPort,omitempty"`
 	TFTP     bool  `json:"tftp"`
+	FTPPort  int   `json:"ftpPort,omitempty"`
+	FTP      bool  `json:"ftp"`
 	Listing  bool  `json:"listing"` // 目录列表开没开：刷新一次状态也要看得见这一栏
 	Requests int64 `json:"requests"`
 	Bytes    int64 `json:"bytes"`
@@ -100,8 +109,14 @@ type Server struct {
 	// 共用一个通配口就等于绕开「按网卡挑地址」这条线。
 	tfts []*tftpListener
 
+	// ftpls 是每个地址一个 TCP 监听口（FTP）。Stop() 要关得到它，
+	// 否则「立刻停掉」之后 ftp 这个口还在收连接，而界面上已经写着端口都放掉了。
+	ftpls []*ftpListener
+
 	mu       sync.Mutex
-	active   int // 在传的 TFTP 笔数，见 tftpMaxActive
+	active   int                   // 在传的 TFTP 笔数，见 tftpMaxActive
+	ftpSess  int                   // 在线的 FTP 控制连接数，见 ftpMaxSessions
+	ftpLive  map[net.Conn]struct{} // ★ 停的时候要把还在挂着的会话当场断掉
 	since    time.Time
 	reqs     int64
 	bytes    int64
@@ -187,6 +202,16 @@ func Start(cfg Config) (*Server, error) {
 		}
 		s.tfts = ts
 	}
+
+	if cfg.FTP {
+		// ★ 和 TFTP 同一条：FTP 起不来要整个回滚，不许留一个「只开了 http 和 tftp」的共享。
+		fs, ferr := s.startFTP()
+		if ferr != nil {
+			s.Stop()
+			return nil, ferr
+		}
+		s.ftpls = fs
+	}
 	return s, nil
 }
 
@@ -259,11 +284,24 @@ func (s *Server) Stop() {
 		return
 	}
 	s.closed = true
-	srvs, lns, tfts := s.srvs, s.lns, s.tfts
+	srvs, lns, tfts, fts := s.srvs, s.lns, s.tfts, s.ftpls
+	var ftpConns []net.Conn
+	for c := range s.ftpLive {
+		ftpConns = append(ftpConns, c)
+	}
 	s.mu.Unlock()
 	for _, l := range tfts {
 		close(l.done)
 		_ = l.pc.Close() // 正在传的那一发也一起断：Close 之后它的读一定报错
+	}
+	for _, l := range fts {
+		close(l.done)
+		_ = l.ln.Close()
+	}
+	// ★ FTP 的会话要单独掐：光关口只挡得住新连接，已经挂着的那些（还有正在传的）
+	//   会留在原地，而界面上写着「端口都放掉了」—— 停就必须是当场断。
+	for _, c := range ftpConns {
+		_ = c.Close()
 	}
 	for _, hv := range srvs {
 		_ = hv.Close() // Close 而不是 Shutdown：固件传到一半不用等它传完
@@ -326,10 +364,13 @@ func (s *Server) Status() Status {
 		Port:     s.cfg.Port,
 		TFTPPort: s.cfg.TFTPPort,
 		TFTP:     s.cfg.TFTP,
+		FTPPort:  s.cfg.FTPPort,
+		FTP:      s.cfg.FTP,
 		Listing:  s.cfg.Listing,
 		AddrInfo: append([]string(nil), s.cfg.Addrs...),
 		URLs:     s.URLs(),
 		TFTPURLs: s.TFTPURLs(),
+		FTPURLs:  s.FTPURLs(),
 		Requests: s.reqs,
 		Bytes:    s.bytes,
 		Denied:   s.denied,
@@ -352,14 +393,20 @@ func filepathAbs(p string) (string, error) {
 
 // bindErr 把「绑不上」分成现场要区别对待的三类。
 func bindErr(proto, addr string, port int, err error) error {
-	var ose *os.PathError
-	perm := errors.As(err, &ose) && strings.Contains(ose.Err.Error(), "permission")
+	// ★ 只看错误文本，不 errors.As 一个具体类型：HTTP/TFTP/FTP 三处传进来的错长得不一样
+	//   （http 是 *os.LinkError、ListenUDP 是 *net.OpError、Windows 上那句是「forbidden by
+	//   its access permissions」），按类型匹配在某个平台上会静默掉到最笼统那句去。
+	perm := strings.Contains(strings.ToLower(err.Error()), "permission")
 	switch {
 	case perm && proto == "tftp":
 		// ★ 这一句要按 tftp 的现场来给：设备的 tftp 栏很多**写死了 69**，
 		//   「换个端口」对它没用，能做的只有用管理员权限把本程序起起来。
 		return fmt.Errorf("%s:%d 绑不上：tftp 的 69 口要更高权限（1024 以下）。"+
 			"设备的地址栏能填端口就换一个；只能认 69 的话，要用管理员权限启动本程序", addr, port)
+	case perm && proto == "ftp":
+		// ★ FTP 同理：ftp:// 不写端口就是 21，很多设备的地址栏根本没有端口那一栏。
+		return fmt.Errorf("%s:%d 绑不上：ftp 的 21 口要更高权限（1024 以下）。"+
+			"设备的地址栏能写端口就换一个；只能认 21 的话，要用管理员权限启动本程序", addr, port)
 	case perm:
 		return fmt.Errorf("%s:%d 绑不上：这个端口要更高权限（1024 以下）。换个端口，比如 8080", addr, port)
 	case strings.Contains(err.Error(), "address already in use"):

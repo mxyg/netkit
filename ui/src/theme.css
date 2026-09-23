@@ -134,7 +134,13 @@ input, select, textarea {
   border-radius: 5px;
   width: 100%;
 }
-input:focus, select:focus { outline: none; border-color: var(--gold-dim); }
+input:focus, select:focus { outline: none; border-color: var(--gold-dim) }
+
+/* ★ 复选/单选框不吃上面那条 width:100%：勾框被拉成一整条之后，它自己的文字会被推到
+   框外面，一行里放两个以上时框还会压到隔壁那条的文字上（看着像文字里嵌了个框）。 */
+input[type='checkbox'], input[type='radio'] {
+  width: auto; padding: 0; accent-color: var(--gold);
+}
 
 /* ── 顶栏 ── */
 
