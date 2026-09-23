@@ -500,7 +500,7 @@ func Test每一步都记进结果(t *testing.T) {
 }
 
 // 工具本身：分类必须是 read（发流量去观察 [OTS-4.3]），且每个判定码都要在说明里交代。
-func Test工具声明(t *testing.T) {
+func TestMTU工具声明(t *testing.T) {
 	if mtuPathTool.Class != ots.ClassRead {
 		t.Errorf("分类是 %v，探 MTU 只是发流量观察，不该是 mutate", mtuPathTool.Class)
 	}

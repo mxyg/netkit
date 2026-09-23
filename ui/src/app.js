@@ -41,6 +41,7 @@ const PAGES = [
   { id: 'nic', name: '本机网络', render: renderNIC },
   { id: 'dhcp', name: '开启路由（DHCP）', render: renderDHCP },
   { id: 'probe', name: '连通性', render: renderProbe },
+  { id: 'scan', name: '扫描与发现', render: renderScan },
   { id: 'stream', name: '视频流', render: renderStream },
   { id: 'remote', name: '远程', render: renderRemote },
 ];
@@ -1558,6 +1559,258 @@ function mtuCard() {
         ${esc(advice)}</div>
       ${rows ? `<table style="margin-top:14px"><tr><th>包大小（IP 总长）</th><th>结果</th><th>等了</th><th></th></tr>${rows}</table>` : ''}
       <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/*
+ * ── 扫描与发现 ──
+ *
+ * ★ 这一页把「这个网段上都有谁」的三样东西放在一起：主动扫一段（net.subnet.scan）、
+ *   听 v6 的应答顺便看谁还没配网（net.discover，原来只有 API 没有按钮，不合 [OTS-4.5]）、
+ *   以及纯读本机缓存的邻居表（net.neighbors，同样原来没按钮）。
+ *
+ * ★★ 三张卡的可信度不是一回事，界面必须把这层差别留在脸上：
+ *   邻居表是**缓存**（里面没有 ≠ 它不在，而且旧记录可能早就溜了）；
+ *   扫网段是**当场问过**（每台都带着凭什么判定它在线）；
+ *   发现只听得见应 v6 的那些。混成一张「设备清单」就会让人拿着一个漏了一半的表去现场。
+ */
+
+const SUBNET_CODE = {
+  'hosts-found': ['问到了设备', 'ok',
+    '清单在下面，每台都写着凭什么判定它在线。★ 收到自己的 ping 应答最硬，'
+    + '「应了 ARP 但没应 ping」的摄像头很常见（上面有一键禁 ping），别当成不在。'],
+  'no-hosts': ['一个信号都没收到', 'warn',
+    '这不能读成「这个网段是空的」：整段被静默（交换机端口隔离、防火墙拦 ICMP）'
+    + '和「真的没有设备」在结果上长一个样。先确认本机这块网卡真的接在这个网里。'],
+};
+
+// 一台设备被判在线的证据，按强弱分档。★ 不写凭什么，人就不敢信这张表。
+const EVIDENCE = {
+  icmp: ['收到它自己的 ping 应答', 'ok'],
+  arp: ['应了 ARP，没应 ping', 'ok'],
+  'arp-cache': ['本机缓存里的旧记录', 'warn'],
+  tcp: ['端口有应答（连上或被拒）', 'ok'],
+};
+
+const DISCOVER_CODE = {
+  'found-unconfigured': ['有设备还没配好网络', 'warn',
+    '下面标出来的设备只有 IPv6 链路本地地址、没有 IPv4 —— 大概率是刚拆封、还没配网的那台。'
+    + '这正是这一栏最值钱的用途：在一大堆设备里把「需要动手的那台」挑出来。'],
+  'all-configured': ['应答的设备都已经配好地址', 'ok',
+    '没有发现缺 IPv4 地址的设备。★ 这里只听得见应 IPv6 应答的那些，'
+    + '纯 v4 的老设备不在这一栏的视野里，要看整段就去扫网段。'],
+  'no-responder': ['没人应答', 'warn',
+    '一个应答都没收到。可能是这块网卡没插线、不在这个网里，或者上游把 IPv6 邻居发现挡了。'],
+  'no-link-local': ['本机喊不出去', 'bad',
+    '要用的那块网卡连自己的 IPv6 链路本地地址都没有 —— 这个地址是自动生成的，'
+    + '没有它就说明这台的 IPv6 没起来，先去「本机网络」看一眼。'],
+};
+
+async function renderScan(root) {
+  root.appendChild(subnetScanCard());
+  root.appendChild(discoverCard());
+  root.appendChild(neighborsCard());
+}
+
+function subnetScanCard() {
+  const card = $(`<div class="card">
+    <h2>扫一个网段 <span id="nv"></span></h2>
+    <p class="hint">问一遍<b>某个 IPv4 网段上现在有谁</b>。网段留空就扫本机自己所在的各段。
+      ★ 只扫 IPv4：IPv6 一个 /64 有 1.8×10<sup>19</sup> 个地址，逐个问是问不完的，
+      v6 那一套在下面「听谁在应答」那张卡里。</p>
+    <div class="row">
+      <div><label>网段（CIDR，留空 = 本机所在网段）</label><input id="nc" placeholder="192.168.1.0/24"></div>
+      <div style="flex:0 0 150px"><label>只扫某块网卡</label><input id="ni" placeholder="en0 / 以太网"></div>
+      <div style="flex:0 0 110px"><label>最多问几个</label><input id="nm" placeholder="1024"></div>
+      <div style="flex:0 0 110px"><label>每轮等待 ms</label><input id="nw" placeholder="1500"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div><label>TCP 兜底端口（扫路由过来的网段时填）</label>
+        <input id="np" placeholder="留空；或 22,80,554 —— ARP 用不上那段全靠它"></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn primary" id="ngo">开始扫</button></div>
+    <div id="nout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#nout');
+  const top = card.querySelector('#nv');
+  card.querySelector('#ngo').onclick = async () => {
+    top.innerHTML = '';
+    const args = {};
+    const set = (id, key) => { const s = card.querySelector(id).value.trim(); if (s) args[key] = s; };
+    set('#nc', 'cidr'); set('#ni', 'iface'); set('#np', 'tcpPorts');
+    const n = Number(card.querySelector('#nm').value);
+    const w = Number(card.querySelector('#nw').value);
+    if (n > 0) args.maxHosts = n;
+    if (w > 0) args.waitMs = w;
+    out.innerHTML = '<div class="empty">正在扫…（发一轮再等回执，慢设备或者隔着无线就把等待时间调大）</div>';
+    const r = await call('net.subnet.scan', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">扫不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice0] = SUBNET_CODE[r.verdict] || [r.verdict, '', ''];
+    const advice = r.verdict === 'no-hosts' && v.onLink === false
+      ? '这个网段<b>不是</b>本机所在的链路（是路由过来的）：那里 ARP 永远只有网关一条，'
+        + '扫不到人是正常的。带上「TCP 兜底端口」再扫一次才有意义。'
+      : advice0;
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const rows = (v.hosts || []).map((h) => {
+      const [w2, pc] = EVIDENCE[h.evidence] || [h.evidence, ''];
+      return `<tr><td><code>${esc(h.addr)}</code></td><td><code class="dim">${esc(h.mac || '—')}</code></td>
+        <td class="dim">${esc(h.iface || '')}</td>
+        <td><span class="pill ${pc}">${esc(w2)}</span>${h.detail ? ` <span class="dim">${esc(h.detail)}</span>` : ''}</td>
+        <td class="dim">${h.elapsedMs ? esc(h.elapsedMs) + 'ms' : ''}</td></tr>`;
+    }).join('');
+    out.innerHTML = `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>扫了哪些网段</label><div><b><code>${esc((v.subnets || []).join(' '))}</code></b></div></div>
+        <div><label>问过</label><div>${esc(v.asked)} 个地址</div></div>
+        <div><label>在线</label><div><b>${esc(v.alive)}</b></div></div>
+        <div><label>没信号</label><div>${esc(v.noSignal)}</div></div>
+        <div><label>本机链路</label><div>${v.onLink ? '是（ARP 用得上）' : '否（ARP 用不上）'}</div></div>
+      </div>
+      ${v.skippedSelf ? `<p class="dim" style="margin:0 0 10px">这几个地址是本机自己的，没有列进清单：
+        <code>${esc((v.skippedSelf || []).join(' '))}</code>（问自己必然有回执，列出来只会多一行莫名其妙的设备）</p>` : ''}
+      ${v.skippedIface && v.skippedIface.length ? `<p class="dim" style="margin:0 0 10px">跳过了：${esc(v.skippedIface.join('；'))}</p>` : ''}
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${advice}</div>
+      ${rows ? `<table style="margin-top:14px"><tr><th>地址</th><th>MAC</th><th>网卡</th><th>凭什么判定在线</th><th>等了</th></tr>${rows}</table>` : ''}
+      ${v.alive ? `<p class="dim" style="margin-top:10px">「没信号」的那些<b>不是</b>「不在线」的证据 ——
+        它们只是没在这轮里吭声。要确认某一台，去「连通性」页单独 ping 它。</p>` : ''}
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+function discoverCard() {
+  const card = $(`<div class="card">
+    <h2>听谁在应答（找没配网的设备）<span id="dv"></span></h2>
+    <p class="hint">往 IPv6 组播喊一声，谁应答就记下来 —— 现场最常用的一招是
+      <b>在一堆设备里把刚拆封、还没配 IPv4 地址的那台挑出来</b>。★ 它只能听见应 v6 的设备，
+      纯 IPv4 的老设备看不见（那种用上面「扫一个网段」）。</p>
+    <div class="row">
+      <div style="flex:0 0 200px"><label>只在哪块网卡上听</label><input id="di" placeholder="留空 = 所有网卡"></div>
+      <div style="flex:0 0 130px"><label>等待 ms</label><input id="dw" placeholder="1200"></div>
+      <div style="flex:1 1 auto;align-self:flex-end"><button class="btn primary" id="dgo">听一次</button></div>
+    </div>
+    <div id="dout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#dout');
+  const top = card.querySelector('#dv');
+  card.querySelector('#dgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = {};
+    const i = card.querySelector('#di').value.trim();
+    const w = Number(card.querySelector('#dw').value);
+    if (i) args.iface = i;
+    if (w > 0) args.waitMs = w;
+    out.innerHTML = '<div class="empty">正在听…（要等组播应答跑完这一轮）</div>';
+    const r = await call('net.discover', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">听不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = DISCOVER_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const rows = (v.devices || []).map((d) => {
+      const un = !d.hasIPv4;
+      return `<tr${un ? ' style="background:var(--gold-bg)"' : ''}>
+        <td><code class="dim">${esc(d.linkLocal || '')}</code></td>
+        <td>${un ? '<b>没有 IPv4</b>' : `<code>${esc(d.ipv4)}</code>`}</td>
+        <td><code class="dim">${esc(d.mac || '—')}</code></td>
+        <td class="dim">${esc(d.iface || '')}</td>
+        <td class="dim">${d.rttMs ? esc(Math.round(d.rttMs)) + 'ms' : ''}</td>
+        <td class="dim">${d.self ? '本机' : ''}</td></tr>`;
+    }).join('');
+    out.innerHTML = `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>应答</label><div><b>${esc(v.count)}</b> 台</div></div>
+        <div><label>没配好地址</label><div><b>${esc(v.unconfigured || 0)}</b> 台</div></div>
+        <div><label>在哪些网卡上听的</label><div>${esc((v.interfaces || []).join('、')) || '—'}</div></div>
+      </div>
+      ${v.probedV4Networks && v.probedV4Networks.length ? `<p class="dim" style="margin:0 0 10px">
+        为了让「没有 IPv4」这个结论站得住，先把这些网段主动问过一遍：
+        <code>${esc(v.probedV4Networks.join(' '))}</code>（ARP 只是缓存，光靠它会把活设备读成没配网）</p>` : ''}
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      ${rows ? `<table style="margin-top:14px"><tr><th>IPv6 链路本地地址</th><th>IPv4</th><th>MAC</th>
+        <th>网卡</th><th>等了</th><th></th></tr>${rows}</table>` : ''}
+      ${v.skipped && v.skipped.length ? `<p class="dim" style="margin-top:10px">跳过：${esc(v.skipped.join('；'))}</p>` : ''}
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+// ★ 状态这一栏是这张表唯一说人话的地方，而三个平台打的是三套字母：
+//   macOS/Linux 的 ndp 用 R/S/T/I/U，Linux 的 ip neigh 用 REACHABLE/STALE/FAILED，
+//   Windows 直接打「动态/静态」。认不全的原样带出来就行 —— 那比猜错好。
+const NBR_STATE = {
+  R: ['可达', 'ok'],
+  S: ['缓存里的旧记录', 'warn'],
+  T: ['延迟确认', ''],
+  I: ['没解析出来', 'warn'],
+  U: ['不可达', 'bad'],
+  G: ['刚被引用过', ''],
+  REACHABLE: ['可达', 'ok'],
+  STALE: ['缓存里的旧记录', 'warn'],
+  DELAY: ['延迟确认', ''],
+  PROBE: ['正在问', ''],
+  INCOMPLETE: ['没解析出来', 'warn'],
+  FAILED: ['没解析出来', 'warn'],
+  '动态': ['刚问过', 'ok'],
+  '静态': ['手工写死的', 'warn'],
+};
+// ★ 这一张不放顶层判定：它读的是本机缓存，没有「结论」可言 ——
+//   有意义的是每一条的状态，人自己会判断哪几条算数。
+function neighborsCard() {
+  const card = $(`<div class="card">
+    <h2>本机邻居表</h2>
+    <p class="hint">一个包都不发，只读本机现在的邻居表：IPv4 是 ARP 表，IPv6 是 NDP 表，
+      两张表一并给出。用它快速回答「这个 MAC 是哪个 IP」「刚才那个地址是谁」。
+      ★ 这是<b>缓存</b>：表里没有它，<b>不等于</b>它不在 —— 要问「有谁在场」请用上面那张卡。</p>
+    <div class="row">
+      <div style="flex:0 0 160px"><label>看哪一族</label><input id="qf" value="both" placeholder="both / ipv4 / ipv6"></div>
+      <div style="flex:0 0 200px"><label>只看某块网卡</label><input id="qi" placeholder="留空 = 全部"></div>
+      <div style="flex:1 1 auto;align-self:flex-end"><button class="btn" id="qgo">读一次</button></div>
+    </div>
+    <div id="qout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#qout');
+  card.querySelector('#qgo').onclick = async () => {
+    out.innerHTML = '<div class="empty">读取中…</div>';
+    const args = { family: card.querySelector('#qf').value.trim() || 'both' };
+    const i = card.querySelector('#qi').value.trim();
+    if (i) args.iface = i;
+    const r = await call('net.neighbors', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">读不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const ns = (v.neighbors || []).map((n) => {
+      const [w, pc] = NBR_STATE[n.state] || [n.state || '—', ''];
+      // 没有 MAC 就是没解析出来 —— 不管状态那一栏是什么字母，都不许给个绿点
+      const label = n.mac ? w : '没解析出来';
+      const cls = n.mac ? (pc || '') : 'warn';
+      return `<tr><td><code>${esc(n.addr)}</code></td>
+        <td><code class="dim">${esc(n.mac || '—')}</code></td>
+        <td class="dim">${esc(n.iface || '')}</td>
+        <td class="dim">${esc(n.family || '')}</td>
+        <td><span class="pill ${cls}">${esc(label)}</span></td></tr>`;
+    }).join('');
+    out.innerHTML = `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>多少条</label><div><b>${esc(v.count)}</b></div></div>
+        <div><label>其中没解析出 MAC 的</label><div>${esc((v.neighbors || []).filter((n) => !n.mac).length)}</div></div>
+      </div>
+      ${ns ? `<table><tr><th>地址</th><th>MAC</th><th>网卡</th><th>族</th><th>状态</th></tr>${ns}</table>`
+        : '<div class="empty">表是空的 —— 这台机器最近没跟谁通过话。这不是「网段里没人」的证据。</div>'}
+      <p class="dim" style="margin:10px 0 0">「没解析出来」的那几条是内核之前问过、对方没应的占位记录 ——
+        表里有这一行不等于设备在场。★ 这一张卡一个包都不发，它只是把本机现在记着什么念出来。</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };
