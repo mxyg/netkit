@@ -395,6 +395,7 @@ function startPolling(root) {
 async function renderProbe(root) {
   root.appendChild(dualStackCard());
   root.appendChild(traceCard());
+  root.appendChild(mtrCard());
   root.appendChild(dnsCard());
   root.appendChild(certCard());
   root.appendChild(httpCard());
@@ -994,6 +995,151 @@ function traceCard() {
         ${esc(advice)}</div>
       ${(v.traces || []).map(traceFamilyBlock).join('')}
       <p class="hint" style="margin-top:12px"><span class="dim">引擎：${esc(v.engine || '')}</span></p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/*
+ * ── 持续路径质量（MTR 式）──
+ *
+ * ★★ 这一栏存在的理由是：单跑一次 traceroute 全绿，**不能**说这条路没问题。
+ *   「画面隔十几秒花一格」「传两分钟断一下」这种主诉，只有把同一批跳连着问几十次才看得见。
+ * ★ 光把每一跳的丢包率列出来是没用的，甚至会误导：中间设备普遍对 TTL 超时的 ICMP 做限速，
+ *   表上就是一行 100% 丢包，而它后面的每一跳都收得到 —— 那说明被转发的流量它一个都没丢。
+ *   所以这一栏把「这一跳丢的是它自己的回应」和「丢包从这里一路延续到终点」用两种颜色分开画。
+ * ★ 后端只出判定码和每跳注记，句子在这里（多语种靠这条分工）。
+ */
+
+const MTR_CODE = {
+  'quality-ok': ['这条路一直很好', 'ok', '每一跳的丢包和往返都在正常范围里。要是还是觉得卡，那多半不是这条路径的事 —— 换「网页 / 接口探测」看服务自己慢不慢。'],
+  'quality-silent-loss': ['中间有设备不回探测，但路是通的', 'warn',
+    '★ 看着吓人的那一行是**这台设备不爱回话**，不是它丢包：它后面的每一跳都收得到。家用和园区网的路由器普遍给 ICMP 超时做限速。要修的是探测能不能问到自己，不是这条路。'],
+  'quality-path-changed': ['同一跳出现过不止一个地址', 'warn',
+    '多为等价路径负载分担（本来就这样），或者是路由在翻动。翻动本身不卡人，**每次换到一条更烂的路**才会 —— 对照下面的丢包和往返看。'],
+  'quality-latency-jump': ['从某一跳起明显变慢，而且一直到终点都慢', 'bad',
+    '抬升起点那一跳就是分界：它之前还是好的，之后一路都带上这份延迟。要查的是那一段链路（或者出口拥塞），不是终点自己。'],
+  'quality-target-loss': ['中间的跳都正常，只有终点在丢', 'bad',
+    '路是通的（每一跳都替它作证了），丢的是**到终点这最后一段**：终点自己在限速 ICMP、防火墙把它挡了，或者它真的忙不过来。先用 ping / 探端口确认它服不服务。'],
+  'quality-loss': ['从某一跳起，丢包一路延续到终点', 'bad',
+    '★ 这才是真的拥塞/故障点：下面标了从第几跳开始。中间某跳丢但后面能收到，不算这一条 —— 那种是它不爱回话。'],
+  'quality-no-response': ['一个像样的样本都没拿到', 'warn',
+    '★ 这**不说明路断了**：第一跳起就不回 ICMP（整条路都被限速）时就是这个形状。改用 ping / 探端口确认终点到不到得了。'],
+  'no-route': ['本机这一族没有出路', 'bad', '探测包在这台机器上就发不出去 —— v6 被关的招牌表现。查这一族的地址和默认路由，用上方「双栈体检」。'],
+  'needs-privilege': ['命令要管理员权限', 'warn', '持续逐跳探测要发原始包。以管理员身份再跑一次。'],
+  'no-command': ['这台机器没有可用的探测命令', 'warn', '★ 这是工具没有，不是路上没设备 —— 装 traceroute 或 mtr，或换台机器再测。'],
+  'trace-timeout': ['时间用完，只跑到一部分轮', 'warn', '已完成的轮都在下面。要更准的丢包率就调大「几轮」或超时，别调小。'],
+  'name-unresolved': ['域名解析不到地址', 'bad', '还没到探测这一步 —— 先用上方的 DNS 查询把解析查通。'],
+  // 两族并排时，有一族没跑成：结论只覆盖跑成的那族
+  'path-incomplete': ['结论不全，别急着查网络', 'warn',
+    '有一族压根没测成（缺命令或要权限）。跑成的那族结论在下面 —— 没测过的那族既不能说好也不能说坏。'],
+};
+
+const MTR_SHORT = {
+  'quality-ok': '一直很好', 'quality-silent-loss': '假丢包', 'quality-path-changed': '路径在翻动',
+  'quality-latency-jump': '某跳起变慢', 'quality-target-loss': '只有终点丢', 'quality-loss': '一路在丢',
+  'quality-no-response': '没样本', 'no-route': '本机没路', 'needs-privilege': '要权限',
+  'no-command': '没命令', 'trace-timeout': '时间不够',
+};
+
+// 每跳的注记 → 那行的颜色和那一句话。★ 注记是后端给的**判定**，不是样式提示。
+const MTR_FLAG = {
+  'loss-source': ['bad', '丢包从这里开始，并且一路带到了终点'],
+  'target': ['bad', '只有它在丢：中间的跳都收到了'],
+  'silent': ['warn', '只丢自己的回应，转发的流量它一个没丢'],
+  'latency-start': ['warn', '往返从这里开始抬升，并延续到终点'],
+  'path-moved': ['', '这一跳见过不止一个下一跳'],
+  'healthy': ['', ''],
+};
+
+function mtrLossCell(h) {
+  const pct = h.lossPct || 0;
+  const cls = (h.flag === 'loss-source' || h.flag === 'target') ? 'bad' : h.flag === 'silent' ? 'warn' : '';
+  const color = cls === 'bad' ? 'var(--red-bg)' : cls === 'warn' ? 'var(--gold-bg)' : 'var(--green-dim)';
+  const bar = `<div style="height:6px;border-radius:3px;background:var(--panel-2);min-width:56px">
+      <div style="height:6px;width:${Math.max(2, Math.min(100, pct))}%;border-radius:3px;background:${color}"></div></div>`;
+  // ★ 分母必须露出来：只写「12.5%」，人不知道那是 8 个里丢 1 个还是 80 个里丢 10 个，
+  //   而这两种是完全不同的事。
+  return `<div style="display:flex;align-items:center;gap:8px">${bar}
+    <span class="${cls ? 'pill ' + cls : 'dim'}">${pct}%</span>
+    <span class="dim">${h.lost}/${h.snt}</span></div>`;
+}
+
+function mtrFamilyBlock(f) {
+  const [text, cls] = MTR_CODE[f.code] || [f.code, ''];
+  const rows = (f.hops || []).map((h) => {
+    const [fcls, fnote] = MTR_FLAG[h.flag] || ['', ''];
+    const who = h.addr ? `<code>${esc(h.addr)}</code>` : '<span class="dim">不回</span>';
+    const moved = h.addrs && h.addrs.length > 1
+      ? `<div class="dim" style="font-size:12px">还见过 ${esc(h.addrs.filter((a) => a !== h.addr).join('、'))}</div>` : '';
+    const goal = h.isGoal ? '<span class="pill ok">终点</span>' : '';
+    return `<tr${h.flag === 'loss-source' || h.flag === 'target' ? ' class="fresh"' : ''}>
+      <td>${h.hop}${goal}</td>
+      <td>${who}${moved}</td>
+      <td>${mtrLossCell(h)}</td>
+      <td>${h.avgMs || h.avgMs === 0 ? esc(h.avgMs) + 'ms' : '—'}</td>
+      <td>${h.worstMs ? esc(h.worstMs) + 'ms' : '—'}</td>
+      <td class="${fcls === 'bad' ? 'pill bad' : fcls === 'warn' ? 'pill warn' : 'dim'}"
+          style="background:none;border:none;padding:0">${esc(fnote)}${h.mark ? ' ' + esc(h.mark) : ''}</td>
+    </tr>`;
+  }).join('');
+  const head = f.detail || f.tried
+    ? `<div class="dim" style="margin-top:6px;font-size:12.5px">${esc([f.detail, f.tried].filter(Boolean).join(' ｜ '))}</div>` : '';
+  return `<div style="margin-top:14px">
+    <p style="margin:0 0 8px">
+      <b>${esc((f.family || '').toUpperCase())}</b>
+      <span class="pill ${cls}">${esc(MTR_SHORT[f.code] || text)}</span>
+      <span class="dim">${f.roundsDone}/${f.rounds} 轮 · ${esc(f.engine || '')}</span>
+      ${f.partial ? '<span class="pill warn">不完整</span>' : ''}
+      ${f.lossHop ? `<span class="pill bad">丢包起点 第 ${f.lossHop} 跳</span>` : ''}
+      ${f.latencyHop ? `<span class="pill warn">变慢起点 第 ${f.latencyHop} 跳</span>` : ''}
+      ${!f.goalSeen && f.hops && f.hops.length ? '<span class="pill warn">一次都没走到终点</span>' : ''}</p>
+    ${rows ? `<table><tr><th>跳</th><th>设备</th><th>丢包</th><th>平均</th><th>最差</th><th></th></tr>${rows}</table>` :
+      '<p class="hint">这一族一个样本都没拿到。</p>'}
+    ${head}</div>`;
+}
+
+function mtrCard() {
+  const card = $(`<div class="card">
+    <h2>路径质量（逐跳持续探测）<span id="qo"></span></h2>
+    <p class="hint">把「偶尔卡一下 / 隔十几秒花一格」这种主诉查出来：<b>同一批跳连着问几十次</b>，
+      每一跳给出丢包率（带分母）、平均和最差往返。★ 中间某跳丢、后面每跳都收得到，会明说是
+      「这台设备只丢自己的回应，没丢转发」，不当故障报；从某跳起一路丢到终点才算拥塞点，并点名那一跳。
+      装了 mtr 就用它（同样时间样本多一个量级），没装就跑多轮 traceroute，用的是哪个都写出来。</p>
+    <div class="row">
+      <div><label>目标（域名或 IP）</label><input id="qh" placeholder="192.168.1.1 或 camera.example.com"></div>
+      <div style="flex:0 0 110px"><label>地址族</label>
+        <select id="qf"><option value="auto">两族都测</option><option value="v4">只测 v4</option><option value="v6">只测 v6</option></select></div>
+      <div style="flex:0 0 80px"><label>几轮</label><input id="qn" placeholder="8"></div>
+      <div style="flex:0 0 90px"><label>每跳几个</label><input id="qq" placeholder="3"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label><button class="btn primary" id="qgo">开始测量</button></div>
+    </div>
+    <div id="qout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#qout');
+  const top = card.querySelector('#qo');
+  card.querySelector('#qgo').onclick = async () => {
+    top.innerHTML = '';
+    const host = card.querySelector('#qh').value.trim();
+    if (!host) { out.innerHTML = '<div class="empty">先填目标地址。</div>'; return; }
+    out.innerHTML = '<div class="empty">测量中…（默认 8 轮 × 每跳 3 发，最长 1 分钟）</div>';
+    const args = { host, family: card.querySelector('#qf').value };
+    const n = Number(card.querySelector('#qn').value);
+    const q = Number(card.querySelector('#qq').value);
+    if (n > 0) args.rounds = n;
+    if (q > 0) args.perHop = q;
+    const r = await call('net.mtr', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">测不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = MTR_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      ${(v.reports || []).map(mtrFamilyBlock).join('')}
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };

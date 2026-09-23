@@ -182,41 +182,9 @@ func doTrace(ctx context.Context, raw json.RawMessage) (any, error) {
 	// 先定目标各族的地址：填 IP 就直接用，填域名就查一次。
 	// ★ 只有一种记录的目标只追那一种 —— 给只有 A 记录的域名追 v6，
 	//   拿回来的 no-route 会被误读成「v6 坏了」，而它压根没被要求过有 v6。
-	goals := map[string][]netaddr.Addr{}
-	if ip, err := netip.ParseAddr(host); err == nil {
-		fam := "v4"
-		if !ip.Is4() {
-			fam = "v6"
-		}
-		goals[fam] = []netaddr.Addr{{IP: ip}}
-	} else {
-		all, why := resolveTLSHost(ctx, host)
-		if len(all) == 0 {
-			return ots.Verdict{Code: tlsNameUnresolved, Values: map[string]any{"host": host},
-				Note: host + " 解析不到地址，还没到追路径这一步" + whyOf(why)}, nil
-		}
-		for _, x := range all {
-			fam := "v4"
-			if !x.IP.Is4() {
-				fam = "v6"
-			}
-			goals[fam] = append(goals[fam], x)
-		}
-	}
-	families := []string{}
-	for _, fam := range []string{"v4", "v6"} {
-		if want != "auto" && want != fam {
-			continue
-		}
-		if len(goals[fam]) > 0 {
-			families = append(families, fam)
-		}
-	}
-	if len(families) == 0 {
-		// 指定了这一族但目标没这一族的记录：如实说，不偷偷改成一族去追
-		return ots.Verdict{Code: tlsNameUnresolved,
-			Values: map[string]any{"host": host, "askedFamily": want},
-			Note:   host + " 没有 " + want + " 记录，追不了这一族"}, nil
+	goals, families, early := traceTargets(ctx, host, want)
+	if early != nil {
+		return *early, nil
 	}
 
 	// 两族分预算：否则 v6 卡满 60s，v4 一行结果都没有，而「v6 卡住」正是这里要查的东西。
@@ -240,6 +208,53 @@ func doTrace(ctx context.Context, raw json.RawMessage) (any, error) {
 	}
 	code := topTraceCode(out)
 	return ots.Verdict{Code: code, Values: values, Note: traceNote(code, out)}, nil
+}
+
+// traceTargets 定「目标各族有哪些地址」和「这一次要跑哪几族」。
+// ★ 路径追踪和持续路径质量必须共用这一段：两处各写一遍的话，
+//
+//	迟早有一处会偷偷改变「域名只有一种记录时跑不跑另一族」的规矩 ——
+//	那正是「v6 到底测没测」这个问题的答案。
+//
+// 第三个返回值非空时，调用方直接把它当结果返回（解析不到、指定的族没记录）。
+func traceTargets(ctx context.Context, host, want string) (map[string][]netaddr.Addr, []string, *ots.Verdict) {
+	goals := map[string][]netaddr.Addr{}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		fam := "v4"
+		if !ip.Is4() {
+			fam = "v6"
+		}
+		goals[fam] = []netaddr.Addr{{IP: ip}}
+	} else {
+		all, why := resolveTLSHost(ctx, host)
+		if len(all) == 0 {
+			return nil, nil, &ots.Verdict{Code: tlsNameUnresolved, Values: map[string]any{"host": host},
+				Note: host + " 解析不到地址，还没到追路径这一步" + whyOf(why)}
+		}
+		for _, x := range all {
+			fam := "v4"
+			if !x.IP.Is4() {
+				fam = "v6"
+			}
+			goals[fam] = append(goals[fam], x)
+		}
+	}
+	families := []string{}
+	for _, fam := range []string{"v4", "v6"} {
+		if want != "auto" && want != fam {
+			continue
+		}
+		if len(goals[fam]) > 0 {
+			families = append(families, fam)
+		}
+	}
+	if len(families) == 0 {
+		// 指定了这一族但目标没这一族的记录：如实说，不偷偷改成一族去追
+		return nil, nil, &ots.Verdict{Code: tlsNameUnresolved,
+			Values: map[string]any{"host": host, "askedFamily": want},
+			Note:   host + " 没有 " + want + " 记录，追不了这一族"}
+	}
+	return goals, families, nil
 }
 
 func whyOf(s string) string {
