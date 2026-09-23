@@ -141,21 +141,25 @@ async function renderNIC(root) {
                : '<div class="empty">一块都没有拿到地址。检查网线、交换机，或者用「开启路由」自己发地址。</div>'}
   </div>`));
 
-  if (!off.length) return;
-  const rest = $(`<div class="card">
-    <h2>没在用的网卡 <span class="pill">${off.length}</span></h2>
-    <p class="hint">虚拟网卡、没插线的、被禁用的。排查时一般不用管。</p>
-    <button class="btn" id="more">展开</button>
-    <div id="offbox" style="display:none;margin-top:10px"></div>
-  </div>`);
-  root.appendChild(rest);
-  const box = rest.querySelector('#offbox');
-  rest.querySelector('#more').onclick = (e) => {
-    const openNow = box.style.display === 'none';
-    box.style.display = openNow ? 'block' : 'none';
-    e.target.textContent = openNow ? '收起' : '展开';
-    if (openNow && !box.innerHTML) box.innerHTML = `<table>${head}${off.map(row).join('')}</table>`;
-  };
+  if (off.length) {
+    const rest = $(`<div class="card">
+      <h2>没在用的网卡 <span class="pill">${off.length}</span></h2>
+      <p class="hint">虚拟网卡、没插线的、被禁用的。排查时一般不用管。</p>
+      <button class="btn" id="more">展开</button>
+      <div id="offbox" style="display:none;margin-top:10px"></div>
+    </div>`);
+    root.appendChild(rest);
+    const box = rest.querySelector('#offbox');
+    rest.querySelector('#more').onclick = (e) => {
+      const openNow = box.style.display === 'none';
+      box.style.display = openNow ? 'block' : 'none';
+      e.target.textContent = openNow ? '收起' : '展开';
+      if (openNow && !box.innerHTML) box.innerHTML = `<table>${head}${off.map(row).join('')}</table>`;
+    };
+  }
+  // ★ 路由表放在这一页最下面：平时不看，但它回答的是这一页唯一没法从网卡表看出来的
+  //   那一问 ——「同一个目的地，本机打算从哪块网卡送出去」。
+  root.appendChild(routesCard());
 }
 
 // ── 开启路由（DHCP）──
@@ -3221,6 +3225,216 @@ function wolCard() {
   };
   card.querySelector('#wl-go').onclick = run;
   card.querySelector('#wl-mac').onkeydown = (e) => { if (e.key === 'Enter') run(); };
+  return card;
+}
+
+// ── 路由表：去往一个地址，到底从哪块网卡出去 ──
+//
+// ★★ 这张表是本项目一半结论的地基（wol 说「从哪块网卡发」、dualstack 看「有没有默认
+//   路由」、trace 的第一跳就是它），可用户原先没有任何地方能看到它。
+//   多网卡工控机上「时通时不通」「换台机器就通」，十有八九就是这张表里有两条在打架。
+//
+// ★ 界面上只说**该走哪**，一个字都不说「走得到」：这一读纯在本机，一个包都没发。
+//   把「按本机规则该走这条路」写成「能通」，是这类工具最常见的越界。
+
+const RT_CODE = {
+  'routes-listed': ['已读到本机路由表', ''],
+  'route-found': ['出口确定了', 'ok'],
+  'no-route': ['没有路可走', 'bad'],
+  'route-mismatch': ['按表算的和系统选的不一样', 'warn'],
+  'route-split': ['一个名字解出几个地址，走的路不一样', 'warn'],
+  'route-local': ['这个地址就是本机自己', 'warn'],
+  'multi-default-route': ['同族有多条默认路由', 'bad'],
+  'table-unreadable': ['这台机器上读不到路由表', 'bad'],
+};
+const RT_FROM = {
+  os: '系统自己给的',
+  table: '按表算的（照这张表做最长前缀匹配）',
+};
+
+function routesCard() {
+  const card = $(`<div class="card">
+    <h2>路由表 <span id="rt-top"></span></h2>
+    <p class="hint">本机所有出口的总账，并且能问一句「去往这个地址会从哪块网卡出去」。
+      ★ 纯读本机，一个探测包都不发（只有你填的是域名时解析一次）；
+      所以它答的是<strong>该走哪</strong>，不是<strong>走不走得到</strong>。
+      多网卡机器上「时通时不通」、插了 VPN 之后某个网段上不去，都是这张表里两条在打架。
+      表按系统选路的优先级排：越具体的网段越靠前，默认路由压在最后 ——
+      按顺序从上往下看第一条盖得住的，就是实际生效的那条。</p>
+    <div class="row">
+      <div style="flex:1 1 240px"><label>去往哪儿（地址或域名，留空 = 只看表）</label>
+        <input id="rt-dest" placeholder="192.168.1.100 / fd00::1 / camera.local"></div>
+      <div style="flex:0 0 150px"><label>看哪一族</label>
+        <select id="rt-family">
+          <option value="">两族都看</option>
+          <option value="ipv4">只看 IPv4</option>
+          <option value="ipv6">只看 IPv6</option>
+        </select></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="rt-go">读一下</button></div>
+    </div>
+    <div id="rt-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#rt-out');
+  const top = card.querySelector('#rt-top');
+
+  const destOf = (r) => (r.destination === '0.0.0.0/0' || r.destination === '::/0')
+    ? 'default' : r.destination;
+  const isDefault = (r) => r.destination === '0.0.0.0/0' || r.destination === '::/0';
+
+  // 一行「该走哪」的答复。并列、问不到、直连，全部要说在明处。
+  const decideLine = (d, ties, extra) => {
+    const parts = [`去往 <code>${esc(d.addr)}</code> 从 <b>${esc(d.iface || '（没给网卡名）')}</b> 出去`];
+    parts.push(d.gateway ? `下一跳 <code>${esc(d.gateway)}</code>`
+      : '是本网段直连，不经过网关');
+    if (d.from === 'table') {
+      // 按表算的答案：把真正生效的那一条指给人看（表里就有这一行，高亮着）
+      parts.push(`命中的是 <code>${esc(destOf(d))}</code> 那一行`);
+    }
+    parts.push(`依据：${RT_FROM[d.from] || d.from}`);
+    if (d.metric) parts.push(`度量 ${d.metric}`);
+    if (d.src) parts.push(`本机用 <code>${esc(d.src)}</code>`);
+    if (ties) {
+      parts.push(`★ 还有 ${ties} 条同样匹配，而本机没给可比的依据（表里不带度量），`
+        + '这里列的只是其中一条 —— 别把它当成「就这一条路」');
+    }
+    if (extra) parts.push(extra);
+    return parts.join('；') + '。';
+  };
+
+  const run = async () => {
+    const args = {};
+    const dest = card.querySelector('#rt-dest').value.trim();
+    const fam = card.querySelector('#rt-family').value;
+    if (dest) args.dest = dest;
+    if (fam) args.family = fam;
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">读中…</div>';
+    const r = await call('net.routes', args);
+    if (!r.ok) {
+      // ★ 解不开名字这一句必须留着：不写「.local 走 mDNS」，
+      //   人会以为那台设备下线了，接着去 ping —— 而 ping 同样解不开这个名字。
+      out.innerHTML = `<div class="empty">没读到：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values || {};
+    const [title, cls] = RT_CODE[r.verdict] || [r.verdict || '没给判定', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+
+    let say;
+    switch (r.verdict) {
+      case 'route-found':
+        say = decideLine(v.decision || {}, v.ties || 0,
+          v.osUnavailable ? '★ 系统那边问不到（这个平台没有「问一句」的命令，或者它没答），所以这一条是照表算的' : '');
+        break;
+      case 'multi-default-route':
+        say = '同一族有两条以上的默认路由。★ 出外网走哪条不看表的顺序，只看度量 —— '
+          + '这就是「ping 得通一半」「插了 VPN 某个网段上不去」最常见的来源。'
+          + '下面「默认路由」那一栏把每一条挂在哪块网卡都列出来了。'
+          + '★ 先按网卡名分一下：多出来的那些如果都挂在 utun / ppp / tun / tap 这类'
+          + '隧道口上，那是 VPN 自己在收路线，一般不算故障；'
+          + '两块物理网卡（en / eth / WLAN 之类）各带一条默认路由，才是真会时通时不通的那种。';
+        break;
+      case 'no-route':
+        say = v.familyRoutes === 0
+          ? `<code>${esc(v.destAddr || v.dest)}</code> 是个 ${v.family === 'ipv6' ? 'IPv6' : 'IPv4'} 地址，`
+            + `可这张表里 ${v.family === 'ipv6' ? 'IPv6' : 'IPv4'} 一条路由都没有 —— 这台机器这一族<strong>没启用</strong>。`
+            + '★ 不是防火墙拦的，也不是对端不理：先去把这一族开起来，查防火墙是白查。'
+          : `表里 ${v.familyRoutes} 条 ${v.family === 'ipv6' ? 'IPv6' : 'IPv4'} 路由，`
+            + `没有一条盖得住 <code>${esc(v.destAddr || v.dest)}</code>。`
+            + '★ 到不了它是<strong>没路</strong>，不是「对端不理」—— 这两个的下一步完全不同：'
+            + '没路要加路由（或换一块有路口的网卡），不理才去查对端和防火墙。';
+        break;
+      case 'route-mismatch':
+        say = '★ 按表算是一个出口，系统自己给的是另一个 —— 这台机器的路由不能靠看表判断。'
+          + 'Linux 上多半是策略路由（每块网卡各自一张表，主表那条不算数）。'
+          + '以系统给的那一条为准，两个答案都摆在下面。';
+        break;
+      case 'route-split':
+        say = `${esc(v.dest)} 解出 ${v.destAddrs ? v.destAddrs.length : (v.paths || []).length} 个地址，`
+          + '而它们走的路不一样。★ 实际走哪条由应用挑哪个地址决定，不由本机决定 —— '
+          + '所以这不是配置错误，是必须看见的事实（一个域名同时给 v4/v6、或者轮询解析就是这样）。';
+        break;
+      case 'route-local':
+        say = `<code>${esc(v.destAddr || v.dest)}</code> 是<strong>本机自己的地址</strong> —— `
+          + '发往它会走回环，不会出网卡。★ 如果你以为它是另一台设备，那就是两台机器的 IP 撞了'
+          + '（现场最常见：设备的固定地址被误配到了本机网卡上）。'
+          + '这时候「能 ping 通」恰恰是假象，通的是自己。';
+        break;
+      case 'table-unreadable':
+        say = '这台机器上一条路由都没读到。★ 这<strong>不等于</strong>「这台机器没有路由」—— '
+          + '多半是这个平台这里的读取方式还没实现，或者被系统挡住了。'
+          + '换成只填一族的 IPv4 / IPv6 再试一次；要查出口请直接用「路径追踪」。';
+        break;
+      default:
+        say = '下面就是本机的路由表。★ 只看了本机，一个包都没发。'
+          + '想知道「去往某个地址会从哪块网卡出去」，把地址填上面问一句 —— '
+          + '光看表要自己在几十行里做最长前缀匹配，很容易看漏一条压住默认路由的 /24。';
+    }
+
+    // ★ 高亮哪一行「就是这一条」：按表算的能精确到行；问系统拿到的只能按
+    //   「同一块网卡 + 同一个下一跳」指回去，而直连答案没有下一跳 —— 那样一整片
+    //   本网段路由都符合条件。标十行等于说「这十行都是答案」，是假话，所以
+    //   指不准就一行都不标。
+    const mark = r.verdict === 'route-mismatch' ? v.byTable : v.decision;
+    const hits = new Set();
+    if (mark) {
+      (v.routes || []).forEach((x, i) => {
+        const same = mark.from === 'table'
+          ? mark.destination === x.destination && mark.iface === x.iface
+          : !!mark.gateway && mark.iface === x.iface && mark.gateway === x.gateway;
+        if (same) hits.add(i);
+      });
+      if (mark.from !== 'table' && hits.size !== 1) hits.clear();
+    }
+    const rows = (v.routes || []).map((x, i) => {
+      const hit = hits.has(i);
+      return `<tr${hit ? ' style="background:var(--green-bg)"' : ''}>
+        <td class="dim">${x.family === 'ipv6' ? 'v6' : 'v4'}</td>
+        <td><code>${esc(destOf(x))}</code>${isDefault(x) ? ' <span class="pill">默认</span>' : ''}</td>
+        <td>${x.gateway ? `<code>${esc(x.gateway)}</code>` : '<span class="dim">直连（不经网关）</span>'}</td>
+        <td><b>${esc(x.iface || '—')}</b></td>
+        <td class="dim">${x.metric ? x.metric : '—'}</td>
+      </tr>`;
+    }).join('');
+    const hasMetric = (v.routes || []).some((x) => x.metric);
+
+    const pathRows = (v.paths || []).map((p) => `<tr>
+      <td><code>${esc(p.addr)}</code></td>
+      <td><b>${esc(p.iface || '—')}</b></td>
+      <td>${p.gateway ? `<code>${esc(p.gateway)}</code>` : '<span class="dim">直连</span>'}</td>
+      <td class="dim">${esc(destOf(p))}</td>
+      <td class="dim">${esc(RT_FROM[p.from] || p.from || '')}</td>
+    </tr>`).join('');
+
+    const oneRow = (label, d) => d ? `<tr><td class="dim" style="white-space:nowrap">${esc(label)}</td>
+      <td>${d.iface ? `<b>${esc(d.iface)}</b>` : '—'}${d.gateway ? ` · 下一跳 <code>${esc(d.gateway)}</code>` : ' · 直连'}
+        ${d.from === 'table' ? `· 命中 <code>${esc(destOf(d))}</code>` : ''}${d.metric ? ` · 度量 ${d.metric}` : ''}
+        · <span class="dim">${esc(RT_FROM[d.from] || d.from || '')}</span></td></tr>` : '';
+
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${say}</div>
+      ${v.defaults && v.defaults.length ? `<p class="hint" style="margin-top:8px">默认路由：${
+        v.defaults.map((d) => `${esc(d.iface || '?')}（下一跳 ${esc(d.gateway || '无')}，${d.family}）`).join('；')
+      }${v.multiDefault ? ' ★ 同族不止一条' : ''}</p>` : ''}
+      ${r.verdict === 'route-mismatch' ? `<table style="margin-top:12px"><tr><th></th><th>答案</th></tr>
+        ${oneRow('系统自己选的', v.byOS)}${oneRow('按表算的', v.byTable)}</table>` : ''}
+      ${pathRows ? `<table style="margin-top:12px"><tr><th>解出的地址</th><th>出口网卡</th>
+        <th>下一跳</th><th>命中</th><th>依据</th></tr>${pathRows}</table>` : ''}
+      ${rows ? `<div style="margin-top:12px;max-height:360px;overflow:auto">
+        <table><tr><th>族</th><th>目的</th><th>下一跳</th><th>出口网卡</th><th>度量</th></tr>
+        ${rows}</table></div>
+        ${hasMetric ? '' : `<p class="hint">这张表里一条度量都没给（macOS 的读取方式就不带这一栏）—— `
+          + '碰到并列时这里没法替你判谁生效，会照实写在结论里。</p>'}` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#rt-go').onclick = run;
+  card.querySelector('#rt-dest').onkeydown = (e) => { if (e.key === 'Enter') run(); };
+  run();  // 只读本机，不要人点头：进页面就把表摆出来
   return card;
 }
 

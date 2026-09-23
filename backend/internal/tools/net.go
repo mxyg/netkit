@@ -23,7 +23,7 @@ import (
 // Register 把本包的工具装进注册表。
 func Register(r *ots.Registry) {
 	r.MustRegister(interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, neighborsTool, discoverTool,
-		dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool)
+		dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool)
 	RegisterAddress(r)
 	RegisterDHCP(r)
 	RegisterRemote(r)
