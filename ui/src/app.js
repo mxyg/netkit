@@ -394,6 +394,7 @@ function startPolling(root) {
 
 async function renderProbe(root) {
   root.appendChild(dualStackCard());
+  root.appendChild(dnsCard());
   const card = $(`<div class="card">
     <h2>ping / 探端口</h2>
     <p class="hint">ping 会区分「对方明确回了不可达」和「完全没回应」——前者说明路是通的、问题在对端。</p>
@@ -549,6 +550,67 @@ function dualStackCard() {
         ${attemptRow('AAAA 记录（v6）', v.domain.aaaa)}
         ${eyeballRow(v.eyeballs)}
       </table>`;
+  };
+  return card;
+}
+
+// ★ 每个码带一句「下一步往哪查」—— 这三类问题的处理办法完全不同，
+//   只写「解析失败」等于把人送回原地。
+const DNS_CODE = {
+  resolved: ['解析到记录', 'ok', ''],
+  'no-record': ['域名在，但没有这类记录', 'warn',
+    '这是 NODATA：域名存在，只是没配你要的这类记录（比如只配了 A、没配 AAAA）。不是故障。'],
+  nxdomain: ['域名不存在', 'bad', '服务器明确说这个域名没有 —— 先核对是不是拼错了。'],
+  'server-failure': ['服务器自己查不到', 'bad',
+    'SERVFAIL 是服务器那一边的问题（它的上游或转发坏了），换一台服务器大概率就能出结果。'],
+  refused: ['服务器拒绝查询', 'bad', '这台解析器不给递归查询（常见于只服务内网的 DNS），换一台公共 DNS 再问。'],
+  timeout: ['没有任何回应', 'bad',
+    '分不清是服务器挂了、53 端口被拦、还是没有路由。换成问 8.8.8.8 或网关，能分清是哪一层。'],
+  unreachable: ['连不上这台服务器', 'bad', '连地址都到不了 —— 先确认这台 DNS 在不在本网、有没有路由。'],
+  'bad-response': ['回的不是 DNS 报文', 'bad', '这个端口后面大概不是 DNS 服务。'],
+};
+
+function dnsCard() {
+  const card = $(`<div class="card">
+    <h2>DNS 查询 <span id="dqv"></span></h2>
+    <p class="hint">点名问一台 DNS 服务器，看它回什么。★ 现场有一大类问题是「网络是好的，就是解析不对」，
+      而它又分三种：服务器没回、它说查不到、答案本身不对（劫持 / 配了内网 DNS 却在查公网）—— 处理办法完全不同。</p>
+    <div class="row">
+      <div><label>域名（查 PTR 就填 IP）</label><input id="dqn" placeholder="www.example.com"></div>
+      <div><label>记录类型</label><select id="dqt">
+        <option>A</option><option>AAAA</option><option>CNAME</option><option>MX</option>
+        <option>TXT</option><option>NS</option><option>SOA</option><option>PTR</option><option>SRV</option>
+      </select></div>
+      <div><label>问哪台服务器（留空=系统配的）</label><input id="dqs" placeholder="192.168.1.1 或 223.5.5.5"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label><button class="btn primary" id="dqgo">查询</button></div>
+    </div>
+    <div id="dqout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#dqout');
+  const v = card.querySelector('#dqv');
+  card.querySelector('#dqgo').onclick = async () => {
+    v.innerHTML = '';
+    out.innerHTML = '<div class="empty">查询中…</div>';
+    const args = { name: card.querySelector('#dqn').value.trim(), type: card.querySelector('#dqt').value };
+    const srv = card.querySelector('#dqs').value.trim();
+    if (srv) args.server = srv;
+    if (!args.name) { out.innerHTML = '<div class="empty">先填要查的域名或 IP。</div>'; return; }
+    const r = await call('net.dns.query', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">查不了：${esc(r.message)}</div>`; return; }
+    const [text, cls, advice] = DNS_CODE[r.verdict] || [r.verdict, '', ''];
+    v.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const val = r.values;
+    const sys = (val.systemServers || []).map((s) => `${s.addr}${s.iface ? '（' + s.iface + '）' : ''}`).join('、');
+    const rows = (val.answers || []).map((a) => `<tr><td class="dim">${esc(a.type)}</td>
+        <td><code>${esc(a.value)}</code></td><td class="dim">TTL ${a.ttl}</td></tr>`).join('');
+    const chain = (val.cnameChain || []).map((c) => `<div class="dim"><code>${esc(c)}</code></div>`).join('');
+    out.innerHTML = `
+      ${advice ? `<p class="hint">${esc(advice)}</p>` : ''}
+      <p class="hint">问的 <code>${esc(val.server)}</code>${val.via === 'tcp' ? '（UDP 被截断，改走 TCP）' : ''}
+        · 用时 ${val.elapsedMs}ms · rcode ${esc(val.rcode || '')}${sys ? ` · 系统配的 DNS：${esc(sys)}` : ''}</p>
+      ${chain ? `<p class="hint">CNAME 链：${chain}</p>` : ''}
+      ${rows ? `<table><tr><th>类型</th><th>值</th><th></th></tr>${rows}</table>`
+             : '<div class="empty">这台服务器没给任何答案。</div>'}`;
   };
   return card;
 }
