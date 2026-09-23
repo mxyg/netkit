@@ -2658,6 +2658,7 @@ function auditCard() {
  */
 async function renderTools(root) {
   root.appendChild(subnetCalcCard());
+  root.appendChild(macCard());
 }
 
 // ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
@@ -2753,6 +2754,103 @@ function subnetCalcCard() {
   card.querySelector('#sc-go').onclick = run;
   card.querySelector('#sc-cidr').onkeydown = (e) => { if (e.key === 'Enter') run(); };
   card.querySelector('#sc-peer').onkeydown = (e) => { if (e.key === 'Enter') run(); };
+  return card;
+}
+
+// ── MAC / OUI 查询 ──
+
+// ★ 每个码带一句「所以下一步做什么」：这一栏真正的分歧不是「认不认识厂商」，
+//   而是**这个地址能不能当设备身份** —— 全零要去查网卡，组播不是一台设备，
+//   本机管理位置着的会把一台数成好几台。认不出厂商名不影响它是个好身份。
+const MA_CODE = {
+  'mac-unset': ['没读到 MAC', 'bad',
+    '六个字节全零 —— 这不是「厂商库里缺这一条」，是这块网卡根本没把地址交出来'
+    + '（MAC 没烧进去、驱动没读上来、或那是个没配地址的虚拟接口）。去查网卡，别换库、别换工具。'],
+  'mac-broadcast': ['广播地址', 'bad',
+    '全一只能用来发，不许当任何设备的源地址。邻居表里出现它，记下的是协议帧的目的地，不是一台设备。'],
+  'protocol-group': ['不是一台设备', '', (v) => v.who
+    ? `这是${v.who}，出处 ${v.whoSrc} —— 协议规定的地址。${v.whoWhy || ''}`
+    : '第一个字节最低位是 1，说明它是发给「一组地址」的，本来就不对应某一台设备。'],
+  'virtual-nic': ['像是虚机 / 容器', 'warn', (v) =>
+    `${v.who}（依据 ${v.whoSrc}）。${v.whoWhy || ''}`
+    + ' ★ 这是按软件的默认地址段推的，属推测 —— 不是哪里的登记信息。'],
+  'locally-administered': ['地址是软件造的', 'warn',
+    '本机管理位是置着的：iOS / Android 的私有 Wi-Fi 地址、Windows 的随机 MAC、MAC 克隆都在这里。'
+    + '别拿它当设备唯一标识 —— 同一台设备换个网络就可能换一个，用它做统计会把一台数成好几台。'],
+  'device-address': ['厂商发的地址', 'ok', (v) => v.who
+    ? `厂商多半是 ${v.who}。${v.whoWhy || ''}`
+    : '这个地址可以当设备身份用。' + (v.vendorWhy || '')],
+};
+
+function macCard() {
+  const card = $(`<div class="card">
+    <h2>MAC 地址 <span id="ma-top"></span></h2>
+    <p class="hint">粘什么写法都认：02:42:ac:11:00:02、02-42-ac-11-00-02、0242.ac11.0002（交换机）、
+      0242ac110002（连写）。答的是「这个地址能不能当设备身份」，不只是「它是谁」：
+      全零是网卡没交出地址，组播本来就不是一台设备，本机管理位置着的多半是随机地址或虚机网卡。
+      ★ 厂商名默认不报 —— IEEE 那张注册表是非商业许可，不打进安装包；
+      要这一栏有名字，把后端的环境变量 NETKIT_OUI_FILE 指到你从 ieee.org 下的 oui.txt。
+      纯解析，不发任何包。</p>
+    <div class="row">
+      <div style="flex:1 1 320px"><label>要问的 MAC / 以太网地址</label>
+        <input id="ma-mac" placeholder="02:42:ac:11:00:02"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="ma-go">查</button></div>
+    </div>
+    <div id="ma-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#ma-out');
+  const top = card.querySelector('#ma-top');
+  const run = async () => {
+    const args = { mac: card.querySelector('#ma-mac').value.trim() };
+    if (!args.mac) { out.innerHTML = '<div class="empty">先填要问的 MAC。</div>'; return; }
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">查中…</div>';
+    const r = await call('net.mac.analyze', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">查不了：${esc(r.message || r.error)}</div>`; return; }
+    const v = r.values;
+    const [title, cls, advice] = MA_CODE[r.verdict] || [r.verdict || '没给判定', '', ''];
+    const say = typeof advice === 'function' ? advice(v) : advice;
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    // ★ 只列后端真给了的字段：组播地址不给接口标识，非 Docker 前缀不给反推的 IPv4，
+    //   硬排上去就会显示「IPv6 接口标识：undefined」，而那一栏看起来像真的
+    const items = [
+      ['这个地址', v.canonical], ['交换机写法', v.dotForm], ['连写', v.bareForm],
+      ['地址长度', v.family === 'eui-64' ? `${v.octets} 字节（EUI-64）` : `${v.octets} 字节`],
+      ['第一个字节', `${v.firstOctet}（二进制 ${v.firstOctetBin}）`],
+      // ★ 全零 / 全一不谈「发给谁、哪来的」：那两栏会把人带回「这是台设备的地址」，
+      //   而这一档的结论恰恰是它不属于任何设备
+      v.special ? ['这种地址', v.special === 'all-zero'
+        ? '六个字节全零 —— 不是任何设备的地址' : '六个字节全一 —— 广播，只用于发']
+        : ['发给谁', v.group ? '一组地址（组播）' : '一台设备（单播）'],
+      !v.special && ['地址哪来的', v.administered === 'local'
+        ? '本机管理 —— 不是哪家厂商名下的地址（随机地址、虚机网卡、协议组播都在这里）'
+        : '全球唯一 —— 前缀是 IEEE 分给某厂商的'],
+      // ★ 「厂商前缀」这个名字只给真在厂商名下的地址用：组播、随机地址、全零 / 全一
+      //   的前 3 字节不在任何厂商名下，标成「厂商前缀」就是在编一个没登记的归属
+      v.special || v.administered !== 'global' || v.group ? ['前 3 字节', v.oui] : ['厂商前缀', v.oui],
+      v.special || v.administered !== 'global' || v.group ? ['其余字节', v.nic] : ['设备位', v.nic],
+      ['IPv6 接口标识', v.iid && `${v.iid}（EUI-64，SLAAC 配出来的地址里就是这段）`],
+      ['藏着的 IPv4', v.derivedIPv4 && `${v.derivedIPv4}（Docker 把容器地址写进了后四字节）`],
+    ].filter((x) => x && x[1] !== undefined && x[1] !== '');
+    const bold = [];
+    if (v.who) bold.push(['来路', `${v.who}（${v.whoBasis === 'standard' ? '协议规定，是事实'
+      : v.whoBasis === 'registry' ? '按你挂的厂商表查的' : '软件约定推的，属推测'}）`]);
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(say)}</div>
+      <table style="margin-top:14px"><tr><th></th><th></th></tr>
+        ${items.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+          <td><code>${esc(x)}</code></td></tr>`).join('')}
+        ${bold.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+          <td><b>${esc(x)}</b></td></tr>`).join('')}</table>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#ma-go').onclick = run;
+  card.querySelector('#ma-mac').onkeydown = (e) => { if (e.key === 'Enter') run(); };
   return card;
 }
 
