@@ -416,6 +416,7 @@ async function renderProbe(root) {
   root.appendChild(card);
   root.appendChild(udpCard());
   root.appendChild(scanCard());
+  root.appendChild(mtuCard());
   const o = card.querySelector('#o');
   const say = (s) => { o.style.display = 'block'; o.textContent = s; };
   card.querySelector('#bp').onclick = async () => {
@@ -1444,6 +1445,118 @@ function scanCard() {
         : v.portsOmitted ? `<p class="dim" style="margin-top:14px">扫了 ${esc(v.scanned)} 个端口，逐端口的明细就不列了
             —— 一整屏「关着」里没有一条是信息，反而会把真开着的几个埋掉。开着的端口已经在上面列出来了，
             要看某几个的明细，把端口填窄一点再扫一次。</p>` : ''}
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/**
+ * net.mtu.path 的六种判定。
+ * ★★ 「大包过不去」这件事有两种归属，处理的人完全不同，所以文案必须分开：
+ *   mtu-path  → 路上某个环节压小了尺寸，要照这个数设本机网卡（或去查中间那一跳）
+ *   mtu-local → 是本机网卡自己装不下，路上根本没测到更小的限制 —— 别去查隧道
+ *   mtu-no-response 那一档是这一栏的**安全阀**：对方不回 ICMP 时什么都测不出来，
+ *   把它说成「路径 MTU 就是 N」会让人照着设一个错的网卡 MTU。
+ */
+const MTU_CODE = {
+  'mtu-path': ['路上有个更小的限制', 'warn',
+    '大包就是在中间某个环节被挡住的：隧道、PPPoE、VPN、或者被人改小过 MTU 的交换机口。'
+    + '把这台机器的网卡 MTU 设成上面那个数（或更小）就能过去；要根治就去查中间那一环。'],
+  'mtu-local': ['上限是本机网卡，路上没测到更小的限制', 'ok',
+    '没撞到比本机网卡更小的尺寸。大包发不出去的话，先查本机这块网卡的 MTU 和分片设置，'
+    + '别去翻隧道和路由器 —— 这一趟没看到它们挡过东西。'],
+  'mtu-no-limit-found': ['测到上限都没被挡', 'ok',
+    '这次的「最大测到」是上面填的那个值，所以只能说到这儿都是通的。想确认更大的尺寸，'
+    + '把上限调大再测一次，多花的只是几次二分。'],
+  'mtu-no-response': ['对方不回回执，这一栏测不出东西', 'bad',
+    '连起手的那个小包都没回执 —— 这台主机不回 ICMP，或者这条路把差错报文挡了。'
+    + '★ 这不代表 MTU 有问题：「收不到回执」和「大包真的过不去」长得一模一样。先用上面的 ping 看它在不在。'],
+  'mtu-no-route': ['包根本没出去', 'bad',
+    '到这个地址没有路，一个包都没发出去，所以跟路径 MTU 无关。查自己：网卡起来了吗、'
+    + '和它是不是同一个网段（看「本机网络」那一页，和这一页顶部的双栈体检）。'],
+  'mtu-df-unsupported': ['这台机器上测不了', 'bad',
+    '这一栏靠的是「不许分片」那个套接字选项；它设不上、或者设上了内核却照旧自己把大包切开时，'
+    + '量出来的数会大得离谱。宁可不给结论，也不端一个假的 MTU 出来 —— 那是会照着设进网卡的。'],
+};
+
+// 逐个尺寸的探测记录。二分不一定正好测到「第一个过不去」的那个，所以明细要摆出来给人看。
+const MTU_OUTCOME = {
+  'through': ['过得去', 'ok'],
+  'too-big': ['太大被挡', 'bad'],
+  'silent': ['没回执', 'warn'],
+  'no-route': ['没路', 'bad'],
+  'error': ['发不出去', 'warn'],
+};
+
+function mtuCard() {
+  const card = $(`<div class="card">
+    <h2>路径 MTU <span id="mv"></span></h2>
+    <p class="hint">查<b>「连得上、小包都好，就是大包过不去」</b>：视频一出来就卡、传文件传到一半断，
+      而 ping 和端口探测都正常 —— 因为它们在路上过的包本来就不大。隧道 / VPN / PPPoE /
+      被改小过 MTU 的端口都会这样。做法是给一个 UDP 包设「不许分片」，二分地试不同大小，
+      看从哪儿开始发不出去。<b>只收 IP。</b></p>
+    <div class="row">
+      <div><label>目标地址（只收 IP）</label><input id="ma" placeholder="192.168.1.64"></div>
+      <div style="flex:0 0 130px"><label>探测端口</label><input id="mp" placeholder="9253（留空即可）"></div>
+      <div style="flex:0 0 130px"><label>最大测到</label><input id="mm" placeholder="留空 = 本机网卡 MTU"></div>
+      <div style="flex:0 0 110px"><label>单尺寸等待 ms</label><input id="mt" placeholder="700"></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn primary" id="mgo">开始探</button></div>
+    <div id="mout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#mout');
+  const top = card.querySelector('#mv');
+  card.querySelector('#mgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = { addr: card.querySelector('#ma').value };
+    const p = Number(card.querySelector('#mp').value);
+    const m = Number(card.querySelector('#mm').value);
+    const t = Number(card.querySelector('#mt').value);
+    if (p > 0) args.port = p;
+    if (m > 0) args.maxSize = m;
+    if (t > 0) args.timeoutMs = t;
+    out.innerHTML = '<div class="empty">正在二分探大小…（大约十几步，每步最多等一个超时）</div>';
+    const r = await call('net.mtu.path', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">探不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = MTU_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const e = v.egress || {};
+    const rows = (v.steps || []).map((s) => {
+      const [w, pc] = MTU_OUTCOME[s.outcome] || [s.outcome, ''];
+      return `<tr><td><code>${esc(s.size)}</code></td><td><span class="pill ${pc}">${esc(w)}</span></td>
+        <td class="dim">${s.elapsedMs ? esc(s.elapsedMs) + 'ms' : ''}</td>
+        <td class="dim">${esc(s.detail || '')}</td></tr>`;
+    }).join('');
+    // 那个「数」是这一栏的全部产出：路径 MTU / 至少能过 / 本机上限，三种说法各配一个数
+    const figure = v.pathMtu != null
+      ? `<div><label>路径 MTU（IP 包总长）</label><div style="font-size:26px"><b>${esc(v.pathMtu)}</b> 字节</div></div>`
+      : v.carriesAtLeast != null
+        ? `<div><label>至少能过</label><div style="font-size:26px"><b>${esc(v.carriesAtLeast)}</b> 字节</div></div>`
+        : '';
+    out.innerHTML = `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>目标</label><div><b><code>${esc(v.target)}</code></b></div></div>
+        ${figure}
+        <div><label>出口网卡</label><div>${e.mtu ? `<code>${esc(e.iface)}</code> MTU ${esc(e.mtu)}` : '<span class="dim">没读到</span>'}</div></div>
+        <div><label>探测端口</label><div>${esc(v.port)}</div></div>
+        <div><label>靠哪一层测的</label><div>${esc(v.engine)}</div></div>
+      </div>
+      ${v.dfVerified === false ? `<div style="background:var(--red-bg);border:1px solid var(--red-line);
+        border-radius:6px;padding:9px 12px;margin-bottom:12px;font-size:13px">
+        这台机器上「不许分片」设上了却不干活（超过网卡 MTU 的包照发出去，内核自己切开了）。
+        这样量出来的任何 MTU 都是假的，所以没有给数。</div>` : ''}
+      ${v.warning === 'below-ipv6-min' ? `<div style="background:var(--gold-bg);border:1px solid var(--gold-dim);
+        border-radius:6px;padding:9px 12px;margin-bottom:12px;font-size:13px">
+        IPv6 链路上按规定至少该能过 1280 字节，这里测出来比它还小 —— 中间有设备不守规矩，
+        这个数别当成正常的路径 MTU 用。</div>` : ''}
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      ${rows ? `<table style="margin-top:14px"><tr><th>包大小（IP 总长）</th><th>结果</th><th>等了</th><th></th></tr>${rows}</table>` : ''}
       <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
