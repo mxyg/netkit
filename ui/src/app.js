@@ -416,6 +416,7 @@ async function renderProbe(root) {
     <div class="out" id="o" style="margin-top:12px;display:none"></div>
   </div>`);
   root.appendChild(card);
+  root.appendChild(portProcCard());
   root.appendChild(pingWatchCard());
   root.appendChild(udpCard());
   root.appendChild(scanCard());
@@ -777,6 +778,121 @@ function checkupCard() {
       </table>
       <p class="hint" style="margin-top:10px">★ 只有 v4/v6 分开给的两项（到网关、出外网）才算得清「有一族出得去一半」——
         那种机器不会断网，但每次连接都慢半拍。</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/*
+ * ── 端口占用反查 ──
+ *
+ * ★★ 「这个端口被谁占了」问的其实是「我要不要动手」，所以四种结论各配一段话：
+ *   occupied      —— 要腾口就得停它，但先分清是不是那个服务的守护进程
+ *   outbound-only —— 那是本机当客户端连出去留下的临时口，停它等于掐自己的会话
+ *   free          —— 真没人用（只对本机成立，别人的用户 / 容器还要管理员权限）
+ *   partial       —— 只读到一部分：这一栏最要紧的就是不许被读成 free
+ *   判定由后端给，这里只把人话和「下一步」写出来。
+ */
+const PP_CODE = {
+  occupied: ['有人正在听这个口', 'bad',
+    '要腾这个口就得停掉列出来的那个进程。★ 停之前先确认它是不是你要起的那个服务的守护进程 —— '
+    + '有的服务由 xinetd / launchd 这类父进程拉起，停父的没用，停子的马上又被拉起来。'],
+  'outbound-only': ['不是被占着，是本机连出去留下的口', 'warn',
+    '这个本地端口上没有任何监听，列出来的是本机当客户端连出去时内核顺手占住的临时端口。'
+    + '★ 去停它等于把正在跑的会话掐断，而且你要起的服务照样起不来。'
+    + '如果报「地址已在使用」，接着查 IPv6 上的同一个口 —— v6only 和双栈绑定不是一回事。'],
+  free: ['这个口没人用', 'ok',
+    '本机没有任何进程在听它，也没有本机发起的连接在用它。★ 这一句只对本机成立 —— '
+    + '要是服务起不来并报「地址已在使用」，多半是另一个用户或容器命名空间占的口，那要用管理员权限再问一次。'],
+  partial: ['只读到一部分，不能下结论', 'bad',
+    '看不到那些进程不等于没在听 —— 非管理员读不到别人进程的句柄。'
+    + '★ 用管理员权限再问一次才算数，别把这一栏当「没人用」。'],
+  listening: ['本机在听这些口', 'ok',
+    '这里只列监听，也就是这台机器对外提供的服务；本机连出去占用的临时端口没算进来。'
+    + '★ 想看某个口的全部用途，把端口号填进去再问一次。'],
+  'no-listener': ['一个监听都没有', 'warn',
+    '这台机器现在不对外提供任何服务 —— 从别的机器看过来，它所有端口都是关着的。'],
+  unsupported: ['这个平台读不到', '',
+    '这个操作系统上没有可靠的「端口 → 进程」读法。★ 读不到不等于没人占用，所以这里不去猜一个答案 —— '
+    + '要查请在这台机器上用系统自带的工具。'],
+};
+
+function ppRow(u) {
+  const fam = u.family === 'ipv6' ? '6' : u.family === 'ipv4' ? '4' : '';
+  // ★ 没有 PID 和「有 PID 却看不到名字」是两件事：前者是内核自己占着
+  //   （TIME_WAIT 那类，本来就没有主人），后者才是权限不够。
+  //   写成一句，会让人白跑一趟 sudo。
+  const svc = u.pid ? (u.process ? `<code>${esc(u.process)}</code>`
+                                 : '<span class="dim">看不到（权限不够）</span>')
+                   : '<span class="dim">内核（连接留下的，还在等时租）</span>';
+  // ★ UDP 那条提示只对 UDP 用：TCP 三个读法都给得出状态，真给不出时留空，
+  //   别把「不知道」写成一句听着像结论的话。
+  const state = u.state ? esc(u.state)
+    : (u.proto === 'udp' ? '<span class="dim">绑上了（UDP 没有监听状态）</span>' : '<span class="dim">—</span>');
+  const peer = u.foreign ? `<div class="dim">→ ${esc(u.foreign)}</div>` : '';
+  return `<tr><td>${esc(u.proto)}${fam}</td>
+    <td><code>${esc(u.local || '*')}</code>:<b>${u.port}</b>${peer}</td>
+    <td>${state}</td>
+    <td>${svc}${u.user ? ` <span class="dim">${esc(u.user)}</span>` : ''}</td>
+    <td>${u.pid ? u.pid : '<span class="dim">—</span>'}</td></tr>`;
+}
+
+function portProcCard() {
+  const card = $(`<div class="card">
+    <h2>这个端口被谁占了 <span id="pp-top"></span></h2>
+    <p class="hint">读本机内核的端口表，把「有进程在听」「本机连出去留下的临时口」「真没人用」「只读到一部分」
+      分开答 —— 这四种的下一步完全不同，而探端口只能从外面看，看不出本机里是谁占着。
+      ★ 只给进程名和 PID，不给命令行（命令行里常有口令，而结果会发给 AI）。纯读本机，不发任何包。</p>
+    <div class="row">
+      <div style="flex:0 0 200px"><label>端口号（留空 = 列出全部在听的）</label><input id="pp-port" placeholder="554"></div>
+      <div style="flex:0 0 150px"><label>协议</label><select id="pp-proto">
+        <option value="both">TCP 和 UDP</option><option value="tcp">只看 TCP</option>
+        <option value="udp">只看 UDP</option></select></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="pp-go">查</button></div>
+    </div>
+    <p class="hint" style="margin-top:8px">★ 查 UDP 要单独选一下：很多服务的口在 TCP 上根本没有，
+      而 UDP 没有「监听」这个状态位 —— 绑上就算。</p>
+    <div id="pp-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#pp-out');
+  const top = card.querySelector('#pp-top');
+  card.querySelector('#pp-go').onclick = async () => {
+    const args = {};
+    const p = Number(card.querySelector('#pp-port').value.trim());
+    if (p) args.port = p;
+    const proto = card.querySelector('#pp-proto').value;
+    if (proto !== 'both') args.proto = proto;
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">读本机端口表…（要扫一遍进程句柄，一两秒）</div>';
+    const r = await call('net.port.process', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">查不了：${esc(r.message || r.error)}</div>`; return; }
+    const v = r.values;
+    const [title, cls, advice] = PP_CODE[r.verdict] || [r.verdict || '没给判定', '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const rows = [...(v.listening || []), ...(v.connections || [])];
+    const listed = (v.listening || []).length;
+    const total = v.listenerCount || listed;
+    // ★ 没读成功（unsupported）时一行计数都不给 —— 那时候任何「在听 0 个」都是假结论。
+    const warn = v.partial ? ' · <b>只读到一部分，看不到不等于没有</b>' : '';
+    let head = '';
+    if (v.port) {
+      head = `<p class="hint" style="margin-top:12px">这个口上共 ${v.count} 条记录`
+        + `（其中在听的 ${total} 个${v.proto ? `，只看 ${v.proto.toUpperCase()}` : ''}）${warn}</p>`;
+    } else if (v.count !== undefined) {
+      head = `<p class="hint" style="margin-top:12px">本机在听 ${total} 个端口`
+        + (v.truncated ? `，这里只列出前 ${listed} 个（还有 ${total - listed} 个没列，填上端口号再问）` : '')
+        + (v.totalRead ? ` · 本机一共在用 ${v.totalRead} 个套接字` : '') + warn + '</p>';
+    }
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      ${rows.length ? `<table style="margin-top:14px">
+        <tr><th>协议</th><th>本机地址</th><th>状态</th><th>进程</th><th>PID</th></tr>
+        ${rows.map(ppRow).join('')}</table>${head}` : head}
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };
