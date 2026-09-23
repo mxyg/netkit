@@ -415,6 +415,7 @@ async function renderProbe(root) {
   </div>`);
   root.appendChild(card);
   root.appendChild(udpCard());
+  root.appendChild(scanCard());
   const o = card.querySelector('#o');
   const say = (s) => { o.style.display = 'block'; o.textContent = s; };
   card.querySelector('#bp').onclick = async () => {
@@ -1343,6 +1344,106 @@ function udpCard() {
       </div>
       <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
         ${esc(advice)}${v.detail ? `<div class="dim" style="margin-top:6px;font-size:12.5px">${esc(v.detail)}</div>` : ''}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/*
+ * ── 端口扫描 ──
+ *
+ * ★ 这一栏买到的不是「快」，是**形状**：单个端口关着不值一提，一片端口里有一个回了拒绝
+ *   就说明主机是活的；反过来一个回执都没有，那连机器在不在都不知道 —— 下一步完全两回事，
+ *   所以界面不许把这两种都写成「扫不到」。
+ * ★★ 结果超过 200 个端口时后端不给逐端口明细（只给汇总和 openPorts）：
+ *   两千条 closed 没有一条是信息，却足以把开着的几个埋掉。这里要把省掉了说清楚。
+ */
+const SCAN_CODE = {
+  'ports-open': ['有端口开着', 'ok',
+    '下面列出来的端口连上了。要知道某个服务为什么不通，再用上面的单端口探测看它答得多慢。'],
+  'ports-closed': ['没有端口开着，但主机是活的', 'warn',
+    '有端口明确回了拒绝 —— 拒绝说明对方收到了包并且答了，所以主机在、路也通，只是这些端口上没有服务。'
+    + '★ 别把它当成「机器挂了」去查链路。'],
+  'ports-no-response': ['一个都没回话', 'bad',
+    '所有端口都静默。这不能说明主机不在：整段被防火墙静默丢、地址根本没人用，都是这个形状。'
+    + '先用上面的 ping 看机器在不在，再查对端的防火墙。'],
+  'ports-no-route': ['包根本没出去', 'bad',
+    '到这个地址没有路 —— 一个包都没发出去，所以这跟对端防不防火没有关系。查自己：网卡起来了吗、'
+    + '和它是不是同一个网段（看「本机网络」那一页，和这一页顶部的双栈体检）。'],
+};
+
+// 单端口状态沿用 net.tcp.probe 那三个码，界面和体检项因此只有一套词。
+const SCAN_STATUS = {
+  'open': ['开着', 'ok'],
+  'closed': ['关着', 'bad'],
+  'filtered': ['没回话', 'warn'],
+  'no-route': ['没路', 'bad'],
+  'error': ['判不出来', 'warn'],
+};
+
+function scanCard() {
+  const card = $(`<div class="card">
+    <h2>扫一片端口 <span id="sv"></span></h2>
+    <p class="hint">对<b>一台</b>主机批量做 TCP 连接探测。端口可以写 <code>22,80,443</code>、区间
+      <code>8000-8010</code>、混着写；留空扫一批现场常用端口（含 RTSP / ONVIF / 各厂商 SDK 端口）。
+      ★ 一次连太多端口，有些摄像机会当成爆破把这台机器临时锁掉 —— 在生产设备上把并发和端口数都收着点。</p>
+    <div class="row">
+      <div><label>目标地址（只收 IP）</label><input id="sa" placeholder="192.168.1.64"></div>
+      <div><label>端口（留空 = 常用端口集）</label><input id="spts" placeholder="22,80,554,37777 或 8000-8100"></div>
+      <div style="flex:0 0 110px"><label>单端口等待 ms</label><input id="stim" placeholder="500"></div>
+      <div style="flex:0 0 110px"><label>同时几个</label><input id="scnc" placeholder="32"></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn primary" id="sgo">开始扫</button></div>
+    <div id="sout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#sout');
+  const top = card.querySelector('#sv');
+  card.querySelector('#sgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = { addr: card.querySelector('#sa').value };
+    const pts = card.querySelector('#spts').value.trim();
+    const t = Number(card.querySelector('#stim').value);
+    const c = Number(card.querySelector('#scnc').value);
+    if (pts) args.ports = pts;
+    if (t > 0) args.timeoutMs = t;
+    if (c > 0) args.maxConcurrency = c;
+    out.innerHTML = '<div class="empty">正在扫…（最坏要等「端口数 ÷ 并发数」轮超时，端口多就慢）</div>';
+    const r = await call('net.ports.scan', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">扫不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = SCAN_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const open = (v.openPorts || []).map((p) => `<code>${esc(p)}</code>`).join(' ') || '<span class="dim">无</span>';
+    const rows = (v.ports || []).map((p) => {
+      const [w, pc] = SCAN_STATUS[p.status] || [p.status, ''];
+      return `<tr><td><code>${esc(p.port)}</code></td><td><span class="pill ${pc}">${esc(w)}</span></td>
+        <td class="dim">${p.elapsedMs ? esc(p.elapsedMs) + 'ms' : ''}</td>
+        <td class="dim">${esc(p.detail || '')}</td></tr>`;
+    }).join('');
+    out.innerHTML = `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>目标</label><div><b><code>${esc(v.target)}</code></b></div></div>
+        <div><label>扫了</label><div>${esc(v.scanned)} 个</div></div>
+        <div><label>开着</label><div><b>${esc(v.open)}</b></div></div>
+        <div><label>关着</label><div>${esc(v.closed)}</div></div>
+        <div><label>没回话</label><div>${esc(v.filtered)}</div></div>
+        <div><label>没路</label><div>${esc(v.noRoute || 0)}</div></div>
+      </div>
+      <div style="margin-bottom:12px"><label>开着的端口</label><div>${open}</div></div>
+      ${v.warning === 'many-connections' ? `<div style="background:var(--gold-bg);border:1px solid var(--gold-dim);
+        border-radius:6px;padding:9px 12px;margin-bottom:12px;font-size:13px">
+        这次连了 ${esc(v.scanned)} 个端口。不少摄像头和录像机把短时间内的批量连接当成爆破，
+        会把这台机器临时锁几分钟 —— 扫完发现「突然什么都不通了」，先想到这个。</div>` : ''}
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      ${rows ? `<table style="margin-top:14px"><tr><th>端口</th><th>状态</th><th>等了</th><th></th></tr>${rows}</table>`
+        : v.portsOmitted ? `<p class="dim" style="margin-top:14px">扫了 ${esc(v.scanned)} 个端口，逐端口的明细就不列了
+            —— 一整屏「关着」里没有一条是信息，反而会把真开着的几个埋掉。开着的端口已经在上面列出来了，
+            要看某几个的明细，把端口填窄一点再扫一次。</p>` : ''}
       <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;

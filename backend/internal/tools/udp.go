@@ -97,7 +97,7 @@ func doUDPProbe(ctx context.Context, raw json.RawMessage) (any, error) {
 	//   报错要说清楚下一步干什么，光说「看不懂地址」会让人以为是写法问题。
 	addr, port, err := netaddr.SplitHostPort(a.Addr)
 	if err != nil {
-		if host, ok := udpLooksLikeName(a.Addr); ok {
+		if host, ok := addrLooksLikeName(a.Addr); ok {
 			return nil, ots.Errf(ots.ErrInvalidArgument,
 				"%q 不是 IP —— 这里只收 IP，域名先用 net.dns.query 查出地址再来探", host)
 		}
@@ -207,9 +207,9 @@ func udpFamily(addr netaddr.Addr) string {
 	return "ipv4"
 }
 
-// udpLooksLikeName 从 addr 里剥出地址部分，判断它是不是「写了个域名」。
+// addrLooksLikeName 从 addr 里剥出地址部分，判断它是不是「写了个域名」。
 // 只为了一句能对上下一步的报错 —— SplitHostPort 只会说「看不懂地址」。
-func udpLooksLikeName(s string) (string, bool) {
+func addrLooksLikeName(s string) (string, bool) {
 	s = strings.TrimSpace(s)
 	host := s
 	if h, _, err := net.SplitHostPort(s); err == nil {
