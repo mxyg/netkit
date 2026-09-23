@@ -22,7 +22,7 @@ import (
 
 // Register 把本包的工具装进注册表。
 func Register(r *ots.Registry) {
-	r.MustRegister(interfacesTool, tcpProbeTool, pingTool, rtspProbeTool, neighborsTool, discoverTool,
+	r.MustRegister(interfacesTool, tcpProbeTool, udpProbeTool, pingTool, rtspProbeTool, neighborsTool, discoverTool,
 		dualStackTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, timeCheckTool)
 	RegisterAddress(r)
 	RegisterDHCP(r)

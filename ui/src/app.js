@@ -414,6 +414,7 @@ async function renderProbe(root) {
     <div class="out" id="o" style="margin-top:12px;display:none"></div>
   </div>`);
   root.appendChild(card);
+  root.appendChild(udpCard());
   const o = card.querySelector('#o');
   const say = (s) => { o.style.display = 'block'; o.textContent = s; };
   card.querySelector('#bp').onclick = async () => {
@@ -1258,6 +1259,91 @@ function timeCard() {
         ${v.spreadMs ? `<span class="dim">源之间最大差 ${esc(humanMs(v.spreadMs))}</span>` : ''}</p>
       <table style="margin-top:10px"><tr><th>时间源</th><th>结果</th><th>偏差</th><th>往返</th><th>它的上游</th><th>问/回</th></tr>
         ${(v.sources || []).map(timeSourceRow).join('')}</table>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/*
+ * ── UDP 探测 ──
+ *
+ * ★ UDP 没有「连上」这回事，所以这里最容易被含混带过去：没人回你，可能是端口开着
+ *   但它不答你这句话，也可能是防火墙把包丢了 —— 现场要查的方向完全不同。
+ *   后端拿一次对照探测把这两种分开，界面就把四种结果各自说清楚，不许合成一句「不通」。
+ */
+const UDP_CODE = {
+  'udp-responsive': ['有回包', 'ok', '这个端口后面确实有个会答话的服务 —— 不用再猜了。'],
+  'udp-closed': ['端口没人监听', 'warn',
+    '对方回了 ICMP 端口不可达：主机是活的，只是这个端口没有服务。要么是服务没起来，要么你打错了端口。'],
+  'udp-silent-alive': ['端口不出声，机器是活的', 'warn',
+    '目标端口没答，但同一台机器的对照端口出声了 —— 至少能排除「整机不对」。剩下的两种还得往下分：'
+    + '端口开着但它不答你这一句（换成协议里真实的一条报文再问一次），或者这个端口被单独拦了。'],
+  'udp-silent': ['UDP 整段静默', 'bad',
+    '目标端口和对照端口都没出声。分不清是机器不在、还是这条路把 UDP 整段丢了 —— '
+    + '先用上面的 ping 看机器在不在，再往上查防火墙/交换机。'],
+  'unknown': ['判不出来', 'warn', '包根本没发出去（看原始结果里的 detail），这不算端口不通。'],
+};
+
+function udpCard() {
+  const card = $(`<div class="card">
+    <h2>探 UDP 端口 <span id="uv"></span></h2>
+    <p class="hint">向一个 UDP 端口发一发看它答不答。<b>多数服务不认识空包</b> ——
+      只想知道「5060 上有没有 SIP」，就把 <code>payload</code> 填成协议里真实的一句话（或用
+      <code>payloadHex</code> 发二进制报文），否则它不理你，你只能拿到「没反应」。
+      对照探测会再打一个肯定没人监听的端口，用它的反应把「这台机器不对」和「只是这个端口的事」分开；
+      生产设备上不想到处发包可以关掉。</p>
+    <div class="row">
+      <div><label>目标地址（只收 IP）</label><input id="ua" placeholder="192.168.1.1"></div>
+      <div style="flex:0 0 90px"><label>端口</label><input id="up" placeholder="5060"></div>
+      <div><label>发的内容（留空 = 空包）</label><input id="upay" placeholder="OPTIONS sip:1sip:1 SIP/2.0"></div>
+      <div style="flex:0 0 130px"><label>或十六进制</label><input id="uphex" placeholder="00010000"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:0 0 130px"><label>对照端口</label><input id="uctl" placeholder="50000"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400">
+          <input type="checkbox" id="unctlo" style="width:auto"> 不跑对照，只发目标这一发</label></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="ugo">探一下</button></div>
+    </div>
+    <div id="uout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#uout');
+  const top = card.querySelector('#uv');
+  card.querySelector('#ugo').onclick = async () => {
+    top.innerHTML = '';
+    const args = { addr: card.querySelector('#ua').value };
+    const p = Number(card.querySelector('#up').value);
+    const hex = card.querySelector('#uphex').value.trim();
+    const ctl = Number(card.querySelector('#uctl').value);
+    const pay = card.querySelector('#upay').value;
+    if (p > 0) args.port = p;
+    if (pay) args.payload = pay;
+    if (hex) args.payloadHex = hex;
+    if (ctl > 0) args.controlPort = ctl;
+    args.noControl = card.querySelector('#unctlo').checked;
+    out.innerHTML = '<div class="empty">正在发…（要跑对照的话最坏等两个超时）</div>';
+    const r = await call('net.udp.probe', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">探不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = UDP_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const c = v.control;
+    out.innerHTML = `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>目标</label><div><b><code>${esc(v.target)}</code></b></div></div>
+        <div><label>回包</label><div>${v.answered ? `<b>${esc(v.bytes)} 字节</b>` : '<span class="dim">没有</span>'}</div></div>
+        <div><label>等了</label><div>${esc(v.elapsedMs)}ms</div></div>
+        <div><label>对照端口</label><div>${c
+          ? `<code>:${esc(c.port)}</code> ${c.answered ? '<span class="pill ok">出声了</span>' : '<span class="pill warn">也没出声</span>'}`
+          : '<span class="dim">没跑</span>'}</div></div>
+      </div>
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}${v.detail ? `<div class="dim" style="margin-top:6px;font-size:12.5px">${esc(v.detail)}</div>` : ''}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };
