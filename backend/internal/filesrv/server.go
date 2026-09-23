@@ -38,6 +38,12 @@ type Config struct {
 	Addrs   []string
 	Port    int
 	Listing bool // 目录列表开不开
+
+	// TFTP 是给**只认 tftp 的那批老设备**的：它们的固件页面连不上 http。
+	// ★ 默认关着：多开一个口就是多一处对外可见面，而多数设备用不到它。
+	//   真要用时端口一般填 69（要更高权限），起不来会照 bindErr 那句直说是要权限还是要换号。
+	TFTP     bool
+	TFTPPort int
 }
 
 // Transfer 一次取文件：谁取的、取了什么、多少字节、什么时候、成没成。
@@ -59,11 +65,17 @@ type Status struct {
 	Root     string   `json:"root,omitempty"`
 	AddrInfo []string `json:"addrInfo,omitempty"`
 	URLs     []string `json:"urls,omitempty"`
-	Port     int      `json:"port"`    // 实际在听的号（填 0 让系统挑时只有这里说得清）
-	Listing  bool     `json:"listing"` // 目录列表开没开：刷新一次状态也要看得见这一栏
-	Requests int64    `json:"requests"`
-	Bytes    int64    `json:"bytes"`
-	Denied   int64    `json:"denied"`
+	// TFTPURLs 只在开了 TFTP 时给：设备那一栏填的是 tftp://…，
+	// 和 http 那几条一起摆出来，人才不会把两种地址抄混。
+	TFTPURLs []string `json:"tftpUrls,omitempty"`
+	Port     int      `json:"port"` // 实际在听的号（填 0 让系统挑时只有这里说得清）
+	// TFTPPort 只在开了 TFTP 时非 0：设备里那行地址要照着它写，别嘴上说 69 而实际不是。
+	TFTPPort int   `json:"tftpPort,omitempty"`
+	TFTP     bool  `json:"tftp"`
+	Listing  bool  `json:"listing"` // 目录列表开没开：刷新一次状态也要看得见这一栏
+	Requests int64 `json:"requests"`
+	Bytes    int64 `json:"bytes"`
+	Denied   int64 `json:"denied"`
 	// NotFound 单独一个数，不并进 Denied：
 	// ★ 文件名写错在现场是常态，把它算进「被拒」会让一个干净的共享看着像被攻击过，
 	//   而真正该警惕的那一类（有人 POST 上传、想翻出目录）就被这个数埋掉了。
@@ -84,7 +96,12 @@ type Server struct {
 	//   永远「不相等」，目录页标题就成了 ../../private/tmp/xxx 那种没人看得懂的东西。
 	rootReal string
 
+	// tfts 是每个地址上一个 UDP 监听口（TFTP）。和 HTTP 一样一地址一个口：
+	// 共用一个通配口就等于绕开「按网卡挑地址」这条线。
+	tfts []*tftpListener
+
 	mu       sync.Mutex
+	active   int // 在传的 TFTP 笔数，见 tftpMaxActive
 	since    time.Time
 	reqs     int64
 	bytes    int64
@@ -141,7 +158,7 @@ func Start(cfg Config) (*Server, error) {
 			s.stopListeners(started)
 			// ★ 端口被占和地址不能绑要分开报：前者是「换个端口」，
 			//   后者是「这个地址本机没有，你是不是想开在别块网卡上」。
-			return nil, bindErr(a, s.cfg.Port, err)
+			return nil, bindErr("http", a, s.cfg.Port, err)
 		}
 		started = append(started, ln)
 		if s.cfg.Port == 0 {
@@ -159,7 +176,73 @@ func Start(cfg Config) (*Server, error) {
 		s.srvs = append(s.srvs, hv)
 		go func(srv *http.Server, ln net.Listener) { _ = srv.Serve(ln) }(hv, ln)
 	}
+
+	if cfg.TFTP {
+		// ★ TFTP 起不来要**整个回滚**，不许留一个只开了 http 的共享：
+		//   批准说明里写的是两种协议，人点头的是那个整体，留下半个比全起不来更坏。
+		ts, terr := s.startTFTP()
+		if terr != nil {
+			s.Stop()
+			return nil, terr
+		}
+		s.tfts = ts
+	}
 	return s, nil
+}
+
+// startTFTP 在每个地址上各起一个 UDP 监听口。
+func (s *Server) startTFTP() ([]*tftpListener, error) {
+	var out []*tftpListener
+	for _, a := range s.cfg.Addrs {
+		// ★ 用 ResolveUDPAddr 而不是 ParseIP：带区的地址（fe80::1%en0 这种链路本地，
+		//   交换机管理口常用）ParseIP 会解成 nil，而 nil 在 ListenUDP 里是**绑所有网卡** ——
+		//   一个「只开管理口」的共享就这么从别的口也漏出去了。
+		ua, err := net.ResolveUDPAddr(tftpFamily(a), net.JoinHostPort(strings.Trim(a, "[]"), strconv.Itoa(s.cfg.TFTPPort)))
+		if err != nil {
+			return nil, fmt.Errorf("这个地址本机没有：%s（%v）", a, err)
+		}
+		pc, err := net.ListenUDP(tftpFamily(a), ua)
+		if err != nil {
+			for _, l := range out {
+				_ = l.pc.Close()
+			}
+			return nil, bindErr("tftp", a, s.cfg.TFTPPort, err)
+		}
+		// 系统挑中几号要读回来（填 69 以下时现场最常见就是「这台机器上这个号被占了 / 要权限」）
+		if s.cfg.TFTPPort == 0 {
+			s.cfg.TFTPPort = pc.LocalAddr().(*net.UDPAddr).Port
+		}
+		ln := &tftpListener{pc: pc, done: make(chan struct{})}
+		out = append(out, ln)
+		go s.serveTFTP(ln)
+	}
+	return out, nil
+}
+
+// tftpFamily 按地址自己判断用哪个 socket 族：v6 地址给 udp6，其余 udp4。
+// ★ 不能用一个双栈口收两族的请求 —— 那样 v4 来的请求，回话的源地址就说不清了。
+func tftpFamily(addr string) string {
+	if strings.Contains(addr, ":") {
+		return "udp6"
+	}
+	return "udp4"
+}
+
+// TFTPURLs 每个地址一条 tftp 地址（设备固件页面里那一栏要的就是这个形状）。
+func (s *Server) TFTPURLs() []string {
+	if !s.cfg.TFTP {
+		return nil
+	}
+	var u []string
+	for _, a := range s.cfg.Addrs {
+		if strings.Contains(a, ":") {
+			u = append(u, fmt.Sprintf("tftp://[%s]:%d/", a, s.cfg.TFTPPort))
+		} else {
+			u = append(u, fmt.Sprintf("tftp://%s:%d/", a, s.cfg.TFTPPort))
+		}
+	}
+	sort.Strings(u)
+	return u
 }
 
 func (s *Server) stopListeners(lns []net.Listener) {
@@ -176,8 +259,12 @@ func (s *Server) Stop() {
 		return
 	}
 	s.closed = true
-	srvs, lns := s.srvs, s.lns
+	srvs, lns, tfts := s.srvs, s.lns, s.tfts
 	s.mu.Unlock()
+	for _, l := range tfts {
+		close(l.done)
+		_ = l.pc.Close() // 正在传的那一发也一起断：Close 之后它的读一定报错
+	}
 	for _, hv := range srvs {
 		_ = hv.Close() // Close 而不是 Shutdown：固件传到一半不用等它传完
 	}
@@ -237,9 +324,12 @@ func (s *Server) Status() Status {
 		Running:  !s.closed,
 		Root:     s.cfg.Root,
 		Port:     s.cfg.Port,
+		TFTPPort: s.cfg.TFTPPort,
+		TFTP:     s.cfg.TFTP,
 		Listing:  s.cfg.Listing,
 		AddrInfo: append([]string(nil), s.cfg.Addrs...),
 		URLs:     s.URLs(),
+		TFTPURLs: s.TFTPURLs(),
 		Requests: s.reqs,
 		Bytes:    s.bytes,
 		Denied:   s.denied,
@@ -261,10 +351,15 @@ func filepathAbs(p string) (string, error) {
 }
 
 // bindErr 把「绑不上」分成现场要区别对待的三类。
-func bindErr(addr string, port int, err error) error {
+func bindErr(proto, addr string, port int, err error) error {
 	var ose *os.PathError
 	perm := errors.As(err, &ose) && strings.Contains(ose.Err.Error(), "permission")
 	switch {
+	case perm && proto == "tftp":
+		// ★ 这一句要按 tftp 的现场来给：设备的 tftp 栏很多**写死了 69**，
+		//   「换个端口」对它没用，能做的只有用管理员权限把本程序起起来。
+		return fmt.Errorf("%s:%d 绑不上：tftp 的 69 口要更高权限（1024 以下）。"+
+			"设备的地址栏能填端口就换一个；只能认 69 的话，要用管理员权限启动本程序", addr, port)
 	case perm:
 		return fmt.Errorf("%s:%d 绑不上：这个端口要更高权限（1024 以下）。换个端口，比如 8080", addr, port)
 	case strings.Contains(err.Error(), "address already in use"):

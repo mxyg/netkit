@@ -69,12 +69,16 @@ var fileshare = struct {
 }{mu: sync.Mutex{}}
 
 type fileshareArgs struct {
-	Root    string   `json:"root"`
-	Iface   string   `json:"iface,omitempty"`
-	Addrs   []string `json:"addrs,omitempty"`
-	Port    int      `json:"port,omitempty"`
-	Listing *bool    `json:"listing,omitempty"`
+	Root     string   `json:"root"`
+	Iface    string   `json:"iface,omitempty"`
+	Addrs    []string `json:"addrs,omitempty"`
+	Port     int      `json:"port,omitempty"`
+	Listing  *bool    `json:"listing,omitempty"`
+	TFTP     bool     `json:"tftp,omitempty"`
+	TFTPPort int      `json:"tftpPort,omitempty"`
 }
+
+const fileshareDefaultTFTPPort = 69
 
 var fileshareServeTool = ots.Tool{
 	Name:  "net.fileshare.serve",
@@ -83,9 +87,11 @@ var fileshareServeTool = ots.Tool{
 		"（设备的升级页面要一个 http://…/xxx.bin，就是这个）。\n" +
 		"★ 只读：只接 GET/HEAD，不收上传，改不了也删不了本机任何文件。\n" +
 		"★ 只绑指定网卡上的地址，绝不绑 0.0.0.0 —— 多网卡机器上那等于把目录从办公网/公网口也开出去。\n" +
+		"填 tftp=true 时同一个目录再开一个**只读 TFTP**（老设备只认 tftp，它们的升级页面填 http 一律「下载失败」）；\n" +
+		"TFTP 只接读请求，上传（WRQ）当场回「不接受上传」并单独记一笔被拒。\n" +
 		"不填 iface 就按 IPv4 默认路由那块网卡挑；挑中了会在结果里说清是哪块、哪些地址、开在哪个端口。\n" +
 		"结果里带目录里有多少个条目、多大，以及**目录里有疑似密钥文件时的提醒**（很多人顺手把整个用户目录端出来）。\n" +
-		"同一时刻只允许一个共享。用完请调 net.fileshare.stop 停掉：这是无鉴权的，同网段谁都能读。",
+		"同一时刻只允许一个共享。用完请调 net.fileshare.stop 停掉：这两种协议都不鉴权，同网段谁都能读。",
 	Schema: json.RawMessage(`{
 	  "type": "object",
 	  "additionalProperties": false,
@@ -96,9 +102,13 @@ var fileshareServeTool = ots.Tool{
 	    "addrs": {"type": "array", "items": {"type": "string"},
 	      "description": "直接指定绑哪些地址（覆盖 iface）。★ 不接受 0.0.0.0 / :: —— 那是要绕开按网卡挑地址这条线，请改成填 iface。"},
 	    "port": {"type": "integer", "minimum": 1, "maximum": 65535,
-	      "description": "端口，默认 8080。1024 以下要更高权限，起不来会直说。设备固件页面写死了 80 就填 80。"},
+	      "description": "HTTP 端口，默认 8080。1024 以下要更高权限，起不来会直说。设备固件页面写死了 80 就填 80。"},
 	    "listing": {"type": "boolean",
-	      "description": "开不开目录列表，默认 true。开着=设备/人能翻文件名（固件版本号本身也是信息）；关掉就只能知道完整文件名才取到走。现场图快一般开着，要收口就关掉。"}
+	      "description": "开不开目录列表，默认 true。开着=设备/人能翻文件名（固件版本号本身也是信息）；关掉就只能知道完整文件名才取到走。现场图快一般开着，要收口就关掉。"},
+	    "tftp": {"type": "boolean",
+	      "description": "要不要连 TFTP 一起开（同一个目录、同样只读）。默认不开。给那些只认 tftp 的老设备用 —— 它们的升级页面填 http 一定失败。开了就是多开一个 UDP 口，同网段谁都能读，批准说明里会写出来。"},
+	    "tftpPort": {"type": "integer", "minimum": 1, "maximum": 65535,
+	      "description": "TFTP 的端口，默认 69（设备的 tftp 栏很多写死了这个号）。69 在 1024 以下，要更高权限才绑得上；绑不上时报错会直说该换端口还是该提权。只在 tftp=true 时有意义。"}
 	  }
 	}`),
 	Describe: describeFileShare,
@@ -144,11 +154,10 @@ func describeFileShare(raw json.RawMessage) string {
 		root = abs
 	}
 	plan, err := planFileShare(a)
-	port := a.Port
-	if port == 0 {
-		port = fileshareDefaultPort
+	s := fmt.Sprintf("把目录 %s 开成只读共享（不能上传、不能改），HTTP 端口 %d", root, plan.port)
+	if plan.tftp {
+		s += fmt.Sprintf("、TFTP 端口 %d", plan.tftpPort)
 	}
-	s := fmt.Sprintf("把目录 %s 开成只读 HTTP 共享（不能上传、不能改），端口 %d", root, port)
 	switch {
 	case err != nil:
 		s += fmt.Sprintf("；网卡没定下来：%s", err)
@@ -157,6 +166,11 @@ func describeFileShare(raw json.RawMessage) string {
 	default:
 		s += fmt.Sprintf("；开在网卡 %s 上（%s），绑 %s",
 			plan.iface, plan.ifaceWhy, strings.Join(plan.addrs, "、"))
+	}
+	if plan.tftp {
+		// ★ 这句不能省：批准的人看到的要是「开共享」三个字的整体，他不知道
+		//   自己同时同意了一个 UDP 口 —— 而 UDP 口在防火墙默认规则里往往更松。
+		s += "。★ 同时开 TFTP（UDP）：老设备只认它；一样只读，一样不鉴权"
 	}
 	if len(plan.warnings) > 0 {
 		s += "。★ " + strings.Join(plan.warnings, "；")
@@ -177,6 +191,8 @@ type filesharePlan struct {
 	ifaceWhy string // 界面和批准说明都要说清是怎么定的（同 net.wol 的 ifaceFrom）
 	port     int
 	listing  bool
+	tftp     bool
+	tftpPort int
 	warnings []string
 }
 
@@ -187,6 +203,19 @@ func planFileShare(a fileshareArgs) (filesharePlan, error) {
 		p.port = fileshareDefaultPort
 	}
 	p.listing = a.Listing == nil || *a.Listing
+	p.tftp = a.TFTP
+	p.tftpPort = a.TFTPPort
+	if p.tftpPort == 0 {
+		p.tftpPort = fileshareDefaultTFTPPort
+	}
+	if !p.tftp {
+		p.tftpPort = 0
+		if a.TFTPPort != 0 {
+			// 只填了 tftpPort 没填 tftp：这一句是必要的，否则他会以为端口生效了
+			return p, ots.Errf(ots.ErrInvalidArgument,
+				"tftpPort 只在 tftp=true 时有意义：要先开 TFTP 再填端口")
+		}
+	}
 
 	if strings.TrimSpace(a.Root) == "" {
 		return p, ots.Errf(ots.ErrInvalidArgument, "没给要共享的目录")
@@ -489,6 +518,7 @@ func serveFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 
 	srv, err := filesrv.Start(filesrv.Config{
 		Root: plan.root, Addrs: plan.addrs, Port: plan.port, Listing: plan.listing,
+		TFTP: plan.tftp, TFTPPort: plan.tftpPort,
 	})
 	if err != nil {
 		return nil, ots.Errf(ots.ErrPermissionRequired, "%s", err)
@@ -500,7 +530,8 @@ func serveFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 	if id, jerr := journal.Register("file-share", describeFileShare(raw),
 		map[string]any{"serving": false},
 		map[string]any{"root": plan.root, "iface": plan.iface, "addrs": plan.addrs,
-			"port": plan.port, "listing": plan.listing}); jerr == nil {
+			"port": plan.port, "listing": plan.listing,
+			"tftp": plan.tftp, "tftpPort": plan.tftpPort}); jerr == nil {
 		_ = journal.MarkApplied(id)
 		fileshare.entryID = id
 	}
@@ -518,15 +549,25 @@ func serveFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 		"port":            plan.port,
 		"urls":            srv.URLs(),
 		"listing":         plan.listing,
+		"protocols":       shareProtocols(plan.tftp),
+		"tftp":            plan.tftp,
+		"tftpPort":        plan.tftpPort,
+		"tftpUrls":        srv.TFTPURLs(),
 		"readOnly":        true,
 		"possibleSecrets": plan.secrets,
 		"warnings":        plan.warnings,
 	}
-	note := fmt.Sprintf("已在 %s 上把 %s 开成只读共享（端口 %d，%d 个条目约 %s）",
+	note := fmt.Sprintf("已在 %s 上把 %s 开成只读共享（http 端口 %d，%d 个条目约 %s）",
 		plan.iface, plan.root, plan.port, plan.entries, humanSize(plan.bytes))
 	if plan.iface == "" {
-		note = fmt.Sprintf("已把 %s 开成只读共享（绑 %s，端口 %d，%d 个条目约 %s）",
+		note = fmt.Sprintf("已把 %s 开成只读共享（绑 %s，http 端口 %d，%d 个条目约 %s）",
 			plan.root, strings.Join(plan.addrs, "、"), plan.port, plan.entries, humanSize(plan.bytes))
+	}
+	if plan.tftp {
+		// ★ note 里也要带上 TFTP：这个口的批准是**人看着这句点的**，
+		//   起完之后句子里只剩 http，等于事后看不出自己同意过第二个协议。
+		note += fmt.Sprintf("；同时开了只读 TFTP（UDP %d），tftp://%s:%d/… 那种地址现在能用",
+			plan.tftpPort, plan.addrs[0], plan.tftpPort)
 	}
 	if len(plan.secrets) > 0 {
 		note += fmt.Sprintf("；★ 目录里有 %d 个文件名看着像密钥（%s），它们同样能被下载",
@@ -550,7 +591,10 @@ func statusFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 	st := srv.Status()
 	vals := map[string]any{
 		"status":    st,
-		"protocols": []string{"http"},
+		"protocols": shareProtocols(plan.tftp),
+		"tftp":      plan.tftp,
+		"tftpPort":  plan.tftpPort,
+		"tftpUrls":  st.TFTPURLs,
 		// 开那一刻算好的事实，跟着状态一起回，界面刷一次不丢行。
 		"iface":           plan.iface,
 		"ifaceWhy":        plan.ifaceWhy,
@@ -561,8 +605,12 @@ func statusFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 		"possibleSecrets": plan.secrets,
 		"warnings":        plan.warnings,
 	}
-	note := fmt.Sprintf("目录 %s 正被 %d 个地址共享出去（端口 %d），已下发 %d 次、共 %s",
-		st.Root, len(st.AddrInfo), srv.Port(), st.Requests, humanSize(st.Bytes))
+	note := fmt.Sprintf("目录 %s 正被 %d 个地址共享出去（http 端口 %d",
+		st.Root, len(st.AddrInfo), srv.Port())
+	if plan.tftp {
+		note += fmt.Sprintf("、tftp 端口 %d", st.TFTPPort)
+	}
+	note += fmt.Sprintf("），已下发 %d 次、共 %s", st.Requests, humanSize(st.Bytes))
 	if st.Denied > 0 {
 		// ★ 只算真被拒的那些（想上传、想翻出目录）。文件名没对上单独一句：
 		//   混在一起的话，一个只是抄错了固件名的现场也会读成「有人在试这个共享」。
@@ -591,7 +639,7 @@ func stopFileShare(ctx context.Context, raw json.RawMessage) (any, error) {
 	return ots.Verdict{
 		Code: verdictShareStopped,
 		Values: map[string]any{"root": st.Root, "urls": st.URLs, "requests": st.Requests,
-			"bytes": st.Bytes},
+			"bytes": st.Bytes, "tftp": st.TFTP, "tftpPort": st.TFTPPort},
 		Note: fmt.Sprintf("共享已停：%s 不再对外可读（这中间一共被取走 %d 次、%s）",
 			st.Root, st.Requests, humanSize(st.Bytes)),
 	}, nil
@@ -616,6 +664,15 @@ func restoreFileShare(log *slog.Logger) {
 			"改动", e.What, "时间", e.At.Format(time.RFC3339))
 		_ = journal.MarkReverted(e.ID, "进程重启：监听器已随上次进程退出而释放")
 	}
+}
+
+// shareProtocols 这个共享对外是哪几种协议。界面和批准说明都读它，
+// 不让两边各写一份「http（+tftp）」—— 那种两份的写法一定会有一份忘了改。
+func shareProtocols(tftp bool) []string {
+	if tftp {
+		return []string{"http", "tftp"}
+	}
+	return []string{"http"}
 }
 
 func humanSize(n int64) string {

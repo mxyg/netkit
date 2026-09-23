@@ -81,6 +81,7 @@ func shareReset(t *testing.T) {
 			fileshare.srv = nil
 		}
 		fileshare.entryID = ""
+		fileshare.plan = filesharePlan{}
 	})
 }
 
@@ -1021,5 +1022,124 @@ func Test状态刷新不丢开共享时那几行(t *testing.T) {
 	}
 	if after.Values["iface"] != nil || after.Code != verdictShareIdle {
 		t.Errorf("停了还留着网卡信息：%+v", after.Values)
+	}
+}
+
+func Test批准说明里要写明多开了TFTP这一件事(t *testing.T) {
+	// ★ 人点头的是批准说明那一句「整体」。只写 http 的话，他并不知道
+	//   自己同时同意了一个 UDP 口 —— 而防火墙对 UDP 的默认放行往往更松。
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	off := describeFileShare(json.RawMessage(`{"root":"` + dir + `"}`))
+	// ★ 这里比对的是那句原话，不是「TFTP」这个单词 —— 目录路径里带着测试名，
+	//   测试名里就有这三个字母，比单词的话这条会一直假绿。
+	if strings.Contains(off, "TFTP 端口") || strings.Contains(off, "同时开 TFTP") {
+		t.Errorf("没开 TFTP 的批准说明里冒出了一句 TFTP：%s", off)
+	}
+	on := describeFileShare(json.RawMessage(`{"root":"` + dir + `","tftp":true,"tftpPort":6933}`))
+	if !strings.Contains(on, "TFTP 端口") || !strings.Contains(on, "UDP") {
+		t.Errorf("开了 TFTP 的批准说明没把这件事说出来：%s", on)
+	}
+	if !strings.Contains(on, "6933") {
+		t.Errorf("批准说明里没写开在哪个口：%s", on)
+	}
+	if !strings.Contains(on, "只读") {
+		t.Errorf("没说清 TFTP 这一侧同样只读：%s", on)
+	}
+}
+
+func Test只填端口不开TFTP时先问一句(t *testing.T) {
+	// 静默忽略 tftpPort 的话，人会以为端口生效了，然后回去查设备为什么连不上。
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	v, err := callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t), "tftpPort": 6933})
+	if err == nil {
+		t.Fatalf("只填了 tftpPort 也起了起来：%+v", v)
+	}
+	if !strings.Contains(err.Error(), "tftp") {
+		t.Errorf("报错没落在 tftp 上：%v", err)
+	}
+}
+
+func Test开了TFTP时结果里给出tftp地址(t *testing.T) {
+	// 老设备的升级页面要的就是 tftp://ip/文件名 这一串；没带回来的话，
+	// 这个功能等于只多开了一个口。
+	shareReset(t)
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	v, err := callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t),
+		"tftp": true, "tftpPort": freeUDPPort(t)})
+	if err != nil {
+		t.Fatalf("起共享失败：%v", err)
+	}
+	urls, _ := v.Values["tftpUrls"].([]string)
+	if len(urls) == 0 || !strings.HasPrefix(urls[0], "tftp://127.0.0.1:") {
+		t.Fatalf("没给出可贴的 tftp 地址：%v", v.Values["tftpUrls"])
+	}
+	proto, _ := v.Values["protocols"].([]string)
+	if len(proto) != 2 || proto[1] != "tftp" {
+		t.Errorf("协议一栏没说两种都开着：%v", v.Values["protocols"])
+	}
+	// ★ note 里也要有：批准的人看的就是这句话，起完之后只剩 http 等于事后看不出
+	if !strings.Contains(v.Note, "TFTP") {
+		t.Errorf("落账那句没提 TFTP：%s", v.Note)
+	}
+	// 状态刷新时这两条都得还在（界面上它每 3 秒刷一次）
+	st, err := callShare(t, fileshareStatusTool, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if su, _ := st.Values["tftpUrls"].([]string); len(su) == 0 {
+		t.Errorf("刷一次状态就没有 tftp 地址了：%v", st.Values["tftpUrls"])
+	}
+	if st.Values["tftp"] != true {
+		t.Errorf("状态里没说 TFTP 开着：%v", st.Values["tftp"])
+	}
+	if _, err := callShare(t, fileshareStopTool, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := callShare(t, fileshareStatusTool, map[string]any{})
+	if au, _ := after.Values["tftpUrls"].([]string); len(au) != 0 {
+		t.Errorf("停了还报着 tftp 地址：%v", au)
+	}
+}
+
+func TestTFTP绑不上时不留一个只开了http的共享(t *testing.T) {
+	// ★ 批准的是「http + tftp」这个整体：TFTP 起不来却把 http 留着，
+	//   等于偷偷改了人点头的那件事 —— 而且界面上一眼看不出少了什么。
+	shareReset(t)
+	shareJournal(t)
+	dir := shareDir(t, map[string]string{"fw.bin": "abc"})
+	busy, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	port := busy.LocalAddr().(*net.UDPAddr).Port
+
+	_, err = callShare(t, fileshareServeTool, map[string]any{
+		"root": dir, "addrs": []string{"127.0.0.1"}, "port": freePort(t),
+		"tftp": true, "tftpPort": port})
+	if err == nil {
+		t.Fatal("tftp 端口被占却起了起来")
+	}
+	if !strings.Contains(err.Error(), "已经被别的服务占了") && !strings.Contains(err.Error(), "绑不上") {
+		t.Errorf("报错没落在端口上：%v", err)
+	}
+	st, e2 := callShare(t, fileshareStatusTool, map[string]any{})
+	if e2 != nil {
+		t.Fatal(e2)
+	}
+	if st.Code != verdictShareIdle {
+		t.Errorf("半个共享留在了机上：%+v", st.Values)
+	}
+	// 那个 http 端口也要放掉：占着不用最坏
+	fileshare.mu.Lock()
+	srv := fileshare.srv
+	fileshare.mu.Unlock()
+	if srv != nil {
+		t.Error("回滚没做干净，http 还在听")
 	}
 }
