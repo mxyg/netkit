@@ -396,6 +396,7 @@ async function renderProbe(root) {
   root.appendChild(dualStackCard());
   root.appendChild(traceCard());
   root.appendChild(mtrCard());
+  root.appendChild(timeCard());
   root.appendChild(dnsCard());
   root.appendChild(certCard());
   root.appendChild(httpCard());
@@ -1140,6 +1141,123 @@ function mtrCard() {
       <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
         ${esc(advice)}</div>
       ${(v.reports || []).map(mtrFamilyBlock).join('')}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/**
+ * ── 校时检查（net.time.check）──
+ *
+ * ★ 这一栏存在的原因：时钟不对的症状从来不长在「时间」上 —— 证书报「还没生效」、
+ *   日志排不成序、租约被判过期，现场查了半天查的是网络和证书。
+ * ★ 「差了多少」和「是谁不对」是两件事：只有一个源答的时候，那 3 年既可能是本机错、
+ *   也可能是对方错 —— 所以只有一个源时这一栏只报偏差，不指认谁错。
+ */
+
+const TIME_CODE = {
+  'time-ok': ['时钟是对的', 'ok', '几个时间源说的都对得上，本机时钟和标准只差几十毫秒以内 —— 证书、租约、日志排序不会因此出问题。要是还在报「证书没生效」，那是别的事。'],
+  'time-skewed': ['时钟有偏差', 'warn', '偏差不小，但还没到会把证书和租约判错的程度。★ 只有一个源答的时候，这里只说差多少，不说谁不对 —— 想指认本机，需要多个源互相印证。'],
+  'time-way-off': ['时钟差得足以让别的东西出错', 'bad', '这个量级上，证书会被判「还没生效」或「已过期」、租约会被算成早到期、日志时间戳排不进正确的顺序 —— 现场看到的「网有问题」，根在这里。至于是不是本机不对，看下面那行：多个源互相印证过才敢指认。'],
+  'time-servers-disagree': ['时间源之间自己就对不上', 'warn', '★ 这时候不能指认本机不对：至少有一个时间源自己就是坏的（或者中间有设备在改写 NTP）。先看下面哪一行和别的不一样，把它从服务器列表里去掉再问一次。'],
+  'time-no-response': ['一个时间源都没回', 'warn', '最常见是 UDP 123 被挡（很多出口默认不放）。★ 这只说明「问不到标准时间」，不说明本机的钟是坏的 —— 要判断时钟，先放行 NTP 或者换成内网的时钟源。'],
+  'time-kiss-rejected': ['时间源拒答', 'warn', '对方明确回了「不给」：RATE 是问得太密被限速，STEP 是它直说你的钟偏得超过它的容错 —— 后者等于替你确认了「时钟确实不对」。看下面每一行的码分别是哪一种。'],
+  'time-bad-response': ['回的不是 NTP', 'bad', '端口上有回应，但内容不是时间戳。多为链路上有设备在冒充/改写 NTP，或者这个端口上挂着别的服务。换一个端口或换一台服务器再问。'],
+  'name-unresolved': ['服务器域名解析不出来', 'bad', '还没到问时间这一步 —— 用上方「DNS 查询」把解析查通，或者直接填 IP。'],
+};
+
+const TIME_SHORT = {
+  'time-ok': '时钟对的', 'time-skewed': '有偏差', 'time-way-off': '差得离谱',
+  'time-servers-disagree': '源对不上', 'time-no-response': '问不到',
+  'time-kiss-rejected': '被拒答', 'time-bad-response': '回的不是NTP', 'name-unresolved': '解析不出',
+  'answered': '答了',
+};
+
+// 偏差要给人读成「慢了多少」而不是一个浮点数：几十毫秒和差三年，是两种完全不同的活。
+function humanMs(ms) {
+  const a = Math.abs(ms);
+  if (a < 1000) return a.toFixed(1) + ' 毫秒';
+  if (a < 60000) return (a / 1000).toFixed(a < 10000 ? 1 : 0) + ' 秒';
+  if (a < 3600000) return Math.floor(a / 60000) + ' 分 ' + Math.round((a % 60000) / 1000) + ' 秒';
+  if (a < 86400000) return Math.floor(a / 3600000) + ' 小时 ' + Math.floor((a % 3600000) / 60000) + ' 分';
+  return (a / 86400000).toFixed(a < 864000000 ? 1 : 0) + ' 天';
+}
+
+// 后端出 RFC3339（带毫秒），界面把它写成能一眼读完的一行。
+function fmtStamp(s) {
+  return s ? s.replace('T', ' ') : '—';
+}
+
+function timeSourceRow(s) {
+  const [text, cls] = TIME_CODE[s.code] || [s.code, ''];
+  const answered = s.code === 'answered';
+  const dir = answered ? (s.offsetMs > 0 ? '本机慢' : '本机快') : '';
+  return `<tr>
+    <td><code>${esc(s.server)}</code>${s.leap ? `<div class="dim" style="font-size:12px">闰秒预警：${s.leap === 'insert' ? '接下来要插一秒' : '这一分钟删过一秒'}</div>` : ''}</td>
+    <td><span class="pill ${answered ? '' : cls}">${esc(TIME_SHORT[s.code] || text)}</span>
+        ${s.kiss ? `<span class="pill warn">${esc(s.kiss)}</span>` : ''}</td>
+    <td>${answered ? `<b>${humanMs(s.offsetMs)}</b> <span class="dim">${dir}</span>` : '—'}</td>
+    <td>${answered && s.rttMs ? esc(s.rttMs) + 'ms' : '—'}</td>
+    <td>${answered ? `<span class="dim">stratum ${esc(s.stratum)}${s.refId ? ' ← ' + esc(s.refId) : ''}</span>` : '—'}</td>
+    <td class="dim">${esc(s.samples)}/${esc(s.answers)}${s.detail ? `<div style="font-size:12px">${esc(s.detail)}</div>` : ''}</td>
+  </tr>`;
+}
+
+function timeCard() {
+  const card = $(`<div class="card">
+    <h2>校时检查 <span id="wv"></span></h2>
+    <p class="hint">问一台权威时间源「现在几点」。★ 时钟不对的症状从来不长在时间上 ——
+      <b>证书报「还没生效」、日志排不成序、租约被判过期</b>，现场查了半天查的是别的东西。
+      这一栏给偏差（带方向和量级）、给「本机说几点 / 标准说几点」，并且<b>只有多个时间源互相印证时</b>
+      才说「是本机的钟不对」；只问到一个源时只报差多少、不指认谁错。源之间对不上，会点出有个源自己就坏了。</p>
+    <div class="row">
+      <div><label>时间源（留空问默认公网源；内网有自己的时钟源就填它的地址）</label>
+        <input id="ws" placeholder="192.168.1.1, ntp.internal（逗号分隔）"></div>
+      <div style="flex:0 0 90px"><label>端口</label><input id="wp" placeholder="123"></div>
+      <div style="flex:0 0 100px"><label>每个源问几次</label><input id="wn" placeholder="3"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label><button class="btn primary" id="wgo">对一下表</button></div>
+    </div>
+    <div id="wout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#wout');
+  const top = card.querySelector('#wv');
+  card.querySelector('#wgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = {};
+    const sv = card.querySelector('#ws').value.split(',').map((x) => x.trim()).filter(Boolean);
+    if (sv.length) args.servers = sv;
+    const p = Number(card.querySelector('#wp').value);
+    const n = Number(card.querySelector('#wn').value);
+    if (p > 0) args.port = p;
+    if (n > 0) args.samples = n;
+    out.innerHTML = '<div class="empty">正在问时间源…（各源并行，最长约 10 秒）</div>';
+    const r = await call('net.time.check', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = TIME_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const answered = v.agreeSources > 0;
+    // ★ 指认「谁不对」的底气只来自源之间的一致：一个源的时候这句话不能说。
+    const blame = v.attribution === 'corroborated'
+      ? `<span class="pill ok">${v.agreeSources} 个源说得一致 → 是本机的钟不对</span>` :
+      v.attribution === 'conflict' ? '<span class="pill warn">源之间对不上 → 不能指认本机</span>' :
+      v.attribution === 'single-source' ? '<span class="pill warn">只问到一个源 → 只报偏差，不说谁错</span>' :
+      '<span class="pill warn">没问到任何标准时间 → 无从指认</span>';
+    out.innerHTML = `
+      ${answered ? `<div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>本机说</label><div><b>${esc(fmtStamp(v.localTime))}</b></div></div>
+        <div><label>标准时间（${esc(v.checkedWith || '')}）</label><div><b>${esc(fmtStamp(v.standardTime))}</b></div></div>
+        <div><label>差</label><div><span class="pill ${cls}">${esc(humanMs(v.offsetMs))}，本机${v.localSlow ? '慢' : '快'}</span></div></div>
+      </div>` : ''}
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}</div>
+      <p style="margin:10px 0 0">${blame}
+        ${v.spreadMs ? `<span class="dim">源之间最大差 ${esc(humanMs(v.spreadMs))}</span>` : ''}</p>
+      <table style="margin-top:10px"><tr><th>时间源</th><th>结果</th><th>偏差</th><th>往返</th><th>它的上游</th><th>问/回</th></tr>
+        ${(v.sources || []).map(timeSourceRow).join('')}</table>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };
