@@ -396,6 +396,7 @@ async function renderProbe(root) {
   root.appendChild(dualStackCard());
   root.appendChild(dnsCard());
   root.appendChild(certCard());
+  root.appendChild(httpCard());
   const card = $(`<div class="card">
     <h2>ping / 探端口</h2>
     <p class="hint">ping 会区分「对方明确回了不可达」和「完全没回应」——前者说明路是通的、问题在对端。</p>
@@ -727,8 +728,143 @@ function certCard() {
   return card;
 }
 
-async function renderStream(root) {
+// 网页探测的码 → 人话。★ 后端只给码，句子在这儿（多语种靠这条分工）。
+const HTTP_CODE = {
+  'http-ok': ['通了', 'ok', '状态码是 2xx。慢不慢看下面那行分段耗时 —— 卡在网络还是卡在服务端，处理的人完全不同。'],
+  'http-redirect': ['它在跳转，还没到终点', 'warn',
+    '全链在下面。★ 现场最常见的两种：http 没跳到 https（内容混拦，浏览器会提示不安全），或者跳到了一个本机到不了的内网地址。'],
+  'http-client-error': ['请求本身的事（4xx）', 'warn',
+    '服务是活着的、明确回了话，拒的是这个请求：地址不对、没登录、或者方法不让用。往地址和权限上查，别往网络上查。'],
+  'http-server-error': ['服务端自己出错了（5xx）', 'bad',
+    '网络这一趟是通的（它回话了），问题在它后面：程序异常、上游服务坏了、或者超出负载。'],
+  'http-redirect-loop': ['重定向绕圈', 'bad',
+    '跳到这一链里已经来过的地址，永远到不了终点。多为反向代理和站点互相把 http 改 https、https 又改回 http。'],
+  'http-timeout': ['整条请求超时', 'bad',
+    '哪一段没走完看下面的分段：耗时是 0 的那一段就是没走到的那一段。'],
+  'not-http': ['这个端口回的不是 HTTP', 'warn',
+    '多半是 RTSP、RTMP 或设备自己的私有协议 —— 视频流用「视频流」那一页探。'],
+  'wrong-scheme': ['协议前缀写反了', 'warn',
+    '★ 这不是故障：把地址开头的 http / https 换成另一个就能通。省得去查一个根本没坏的服务。'],
+  'tls-handshake-failed': ['TLS 握手被对方拒了', 'bad',
+    '常见于它要求客户端证书，或者双方的协议版本没有交集。细节看原始结果里的 detail。'],
+  'name-unresolved': ['域名解析不到地址', 'bad', '还没走到连接这一步 —— 先用上方的 DNS 查询把解析查通。'],
+  'closed': ['端口关着', 'bad', '对方明确拒绝：这个端口上没有 HTTP 服务（机器本身是活的）。'],
+  'filtered': ['没有任何回应', 'bad', '分不清端口是关着还是被静默丢了 —— 换 net.ping 看主机在不在。'],
+  'unreachable': ['地址到不了', 'bad', '连路由都不通，先确认地址填对了、和它之间有没有路。'],
+};
+
+// 分段耗时条：四段按各自占比铺颜色，一眼看出长的那截是谁。
+// ★ 「慢在网络」和「慢在服务端」的分工就是这一页存在的全部理由，所以非要把比例画出来不可。
+function timingBar(tm, answered) {
+  const segs = [
+    ['解析', tm.lookupMs, 'var(--gold-dim)'],
+    ['连接', tm.connectMs, 'var(--green-dim)'],
+    ['TLS', tm.tlsMs, 'var(--green-bg)'],
+    ['服务端', tm.serverMs, 'var(--red-bg)'],
+  ];
+  const net = (tm.lookupMs || 0) + (tm.connectMs || 0) + (tm.tlsMs || 0);
+  const app = tm.serverMs || 0;
+  const rest = Math.max(0, (tm.totalMs || 0) - net - app);
+  const parts = segs.concat([['其他', rest, 'var(--panel-2)']]);
+  const total = Math.max(1, parts.reduce((s, [, ms]) => s + ms, 0));
+  const bar = parts.filter(([, ms]) => ms > 0)
+    .map(([name, ms, color]) =>
+      `<div title="${esc(name)} ${ms}ms" style="flex:${ms};background:${color};
+        display:flex;align-items:center;justify-content:center;font-size:11px;white-space:nowrap;overflow:hidden">
+        ${ms >= total * 0.12 ? esc(name) : ''}</div>`).join('');
+  const list = parts.filter(([, ms]) => ms > 0)
+    .map(([name, ms]) => `${esc(name)} <b>${ms}</b>ms`).join(' <span class="dim">·</span> ');
+  // 结论只在差距明显时给：两段差不多时硬要说谁慢，是拿一个 800ms 的样本编故事。
+  // ★★ 更要紧的是**只在问到回话时给**：没走到终点的话 serverMs 天生是 0，
+  //   这时候说「慢在网络侧」等于把「没回话」编成了一句归因，方向可能完全反了。
+  let say = '';
+  if (!answered) {
+    // ★★ 没走到终点时**不做归因**：端口直接拒、TLS 谈崩、回话回一半超时，
+    //   在数字上是同一种形状（后面几段都是 0）。硬说「慢在网络侧」会把人往错方向带，
+    //   而上面那个判定条已经把是哪种情况说清楚了。
+    say = `<span class="pill bad">没走到终点</span>
+      <span class="dim">分段耗时停在哪儿，路就断在哪儿 —— 服务端那一段根本没开始计时，不做归因。</span>`;
+  } else if (app >= net * 2 && app > 200) {
+    say = `<span class="pill warn">慢在应用侧</span> <span class="dim">网络三段加起来 ${net}ms，服务端自己想 ${app}ms —— 找维护这个服务的人，网络这边没问题。</span>`;
+  } else if (net >= app * 2 && net > 200) {
+    say = `<span class="pill bad">慢在网络侧</span> <span class="dim">解析+连接+TLS 共 ${net}ms，服务端只想了 ${app}ms —— 往链路、TLS 握手和 DNS 上查。</span>`;
+  }
+  // 什么都没花到（比如端口直接关着）就别画一条空 bar —— 空条比没有条更像坏了
+  const spent = parts.some(([, ms]) => ms > 0);
+  if (!spent && !say) return '';
+  return `${spent ? `<div style="display:flex;height:18px;border-radius:4px;overflow:hidden;background:var(--panel-2)">${bar}</div>
+    <p class="hint" style="margin:8px 0 0">${list} <span class="dim">·</span> 总计 <b>${esc(tm.totalMs)}</b>ms
+      ${tm.ttfbMs ? `（首字节 ${tm.ttfbMs}ms）` : ''}</p>` : ''}
+    ${say ? `<p class="hint" style="margin:${spent ? '6px' : '0'} 0 0">${say}</p>` : ''}`;
+}
+
+function httpCard() {
   const card = $(`<div class="card">
+    <h2>网页 / 接口探测 <span id="hv"></span></h2>
+    <p class="hint">问一个 HTTP(S) 地址要状态码，并把耗时拆成 <b>解析 / 连接 / TLS / 等回话</b> 四段 ——
+      前三段慢是网络的事，最后一段慢是服务端的事。★ 重定向链每一跳都留着（自动跟随会把「它 301 到哪儿」吃掉）。
+      证书顺带判一次，但<b>不因证书坏就不给状态码</b>。不下载正文。</p>
+    <div class="row">
+      <div><label>地址</label><input id="hu" placeholder="192.168.1.64 或 https://cam.example.com/login"></div>
+      <div style="flex:0 0 110px"><label>方法</label><select id="hm"><option>GET</option><option>HEAD</option></select></div>
+      <div style="flex:0 0 110px"><label>最多跟几跳</label><input id="hr" placeholder="10，填 0 只看第一跳"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label><button class="btn primary" id="hgo">探测</button></div>
+    </div>
+    <div id="hout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#hout');
+  const top = card.querySelector('#hv');
+  card.querySelector('#hgo').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">请求中…</div>';
+    const args = { url: card.querySelector('#hu').value.trim() };
+    if (!args.url) { out.innerHTML = '<div class="empty">先填地址。</div>'; return; }
+    const m = card.querySelector('#hm').value;
+    if (m === 'HEAD') args.method = 'HEAD';
+    const r = Number(card.querySelector('#hr').value);
+    if (r >= 0 && card.querySelector('#hr').value.trim() !== '') args.maxRedirects = r;
+    const res = await call('net.http.probe', args);
+    if (!res.ok) { out.innerHTML = `<div class="empty">探测不了：${esc(res.message)}</div>`; return; }
+    const v = res.values;
+    const [text, cls, advice] = HTTP_CODE[res.verdict] || [res.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const chain = (v.redirects || []).map((h, i) => `<div>
+        <span class="dim">#${i + 1}</span>
+        <span class="pill ${h.status >= 200 && h.status < 300 ? 'ok' : h.status >= 500 ? 'bad' : h.status >= 400 ? 'warn' : ''}">${h.status}</span>
+        <code>${esc(h.url)}</code>${h.location ? ` <span class="dim">→</span> <code>${esc(h.location)}</code>` : ''}
+        <span class="dim">${h.ms}ms</span></div>`).join('');
+    const t = v.tls;
+    // 证书那块仍然用 CERT_CODE 的文案：同一套码，不在这儿再抄一遍
+    const tlsRow = t ? tCell('证书', `<span class="pill ${(CERT_CODE[t.verdict] || ['', ''])[1]}">
+        ${esc((CERT_CODE[t.verdict] || [t.verdict])[0])}</span>
+      <span class="dim">${esc(t.protocol || '')} · ${esc(t.subject || '')}${
+      t.daysLeft === undefined ? '' : t.daysLeft < 0 ? ` · 已过期 ${-t.daysLeft} 天` : ` · 剩 ${t.daysLeft} 天`}</span>`) : '';
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice)}${v.reason ? `<div class="dim" style="margin-top:6px">${esc(v.reason)}</div>` : ''}
+        ${v.detail ? `<div class="dim" style="margin-top:6px"><code>${esc(v.detail)}</code></div>` : ''}</div>
+      ${v.timings ? `<div style="margin-top:14px">${timingBar(v.timings, v.status)}</div>` : ''}
+      <table style="margin-top:14px">
+        ${tCell('结果', `<span class="pill ${cls}">${esc(v.status || text)}</span>
+          <code>${esc(v.method || 'GET')} ${esc(v.url)}</code>
+          <span class="dim">${esc(v.proto || '')}${v.server ? ' · ' + esc(v.server) : ''}
+            ${v.contentType ? ' · ' + esc(v.contentType) : ''}
+            ${v.contentLength ? ' · ' + esc(v.contentLength) + ' 字节' : ''}</span>`)}
+        ${v.remote ? tCell('实际连到', `<code>${esc(v.remote)}</code>
+          <span class="dim">域名两族都有记录时，这一条决定该往 v4 还是 v6 查</span>`) : ''}
+      </table>
+      ${chain ? `<p class="hint" style="margin:12px 0 4px">重定向链${v.redirectCount ? `（跟了 ${v.redirectCount} 跳）` : ''}</p>
+        <div style="font-size:13.5px;line-height:1.9">${chain}</div>` : ''}
+      ${tlsRow ? `<table>${tlsRow}</table>` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+async function renderStream(root) {  const card = $(`<div class="card">
     <h2>视频流探测</h2>
     <p class="hint">输入取流地址，直接告诉你编码、**真实分辨率**、帧率。不需要播放器，也不解码。</p>
     <label>RTSP 地址</label>
