@@ -2659,6 +2659,7 @@ function auditCard() {
 async function renderTools(root) {
   root.appendChild(subnetCalcCard());
   root.appendChild(macCard());
+  root.appendChild(macRandomCard());
 }
 
 // ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
@@ -2851,6 +2852,90 @@ function macCard() {
   };
   card.querySelector('#ma-go').onclick = run;
   card.querySelector('#ma-mac').onkeydown = (e) => { if (e.key === 'Enter') run(); };
+  return card;
+}
+
+// ── 随机 / 克隆 MAC 生成 ──
+
+// ★ 两种模式的差别不是「好不好看」，是**这个地址在谁名下**：
+//   纯随机置了本机管理位，不属于任何厂商，随便用；保留厂商前缀就是去别人名下的段里造地址，
+//   随机位一算出来只有两千多万，撞上真设备是「几台机器同时时通时不通」，得让人自己决定。
+const MR_CODE = {
+  'random-generated': ['可以放心用', 'ok',
+    '本机管理位是置着的、组播位是清着的：能当设备源地址，也不在任何厂商名下的地址段里。'
+    + '随机部分 40 位，局域网里撞不上真设备。★ 这里只是生成了字符串，本机网卡地址没动。'],
+  'clone-generated': ['保留了你给的前缀', 'warn', (v) =>
+    `前缀 ${v.prefix} 原样保留，随机部分只剩 ${v.randomBits} 位（${v.space} 个组合）。`
+    + (v.vendorBlock
+      ? '★ 这个前缀是 IEEE 登记给某家厂商的 —— 那一段里的真设备是活着的，撞上就是两台机器同一个 MAC，'
+        + '症状是「几台机器同时时通时不通」，比配不上难查得多。确认要再用。'
+      : '这个前缀本身是本机管理段，不在任何厂商名下。')],
+};
+
+function macRandomCard() {
+  const card = $(`<div class="card">
+    <h2>随机 MAC <span id="mr-top"></span></h2>
+    <p class="hint">生成能直接用的地址：默认把本机管理位置着、组播位清着 —— 少处理一位，
+      症状都不是「生成失败」而是配上去收不到回包，或者撞进别人名下的地址段。
+      填了前缀就是克隆模式（有些系统的授权看 MAC 前缀），那一档会把随机位还剩多少、
+      是不是在厂商名下算给你看。★ 只生成字符串，不改任何网卡设置。</p>
+    <div class="row">
+      <div style="flex:1 1 200px"><label>生成几个（1~10）</label>
+        <input id="mr-count" placeholder="1"></div>
+      <div style="flex:1 1 260px"><label>保留的前缀（可留空；也可粘一个完整 MAC）</label>
+        <input id="mr-prefix" placeholder="00:1a:2b"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn primary" id="mr-go">生成</button></div>
+    </div>
+    <div id="mr-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#mr-out');
+  const top = card.querySelector('#mr-top');
+  const run = async () => {
+    const args = {};
+    const c = card.querySelector('#mr-count').value.trim();
+    // ★ 只 trim 显示、不按 trim 后的空不空来决定发不发：输入框里敲了几个空格就算「给了前缀」，
+    //   这里替它丢掉等于偷偷换成纯随机，而人要的是克隆 —— 后端专门拦这一条，界面不许绕过
+    const p = card.querySelector('#mr-prefix').value;
+    if (c && !/^\d+$/.test(c)) {
+      out.innerHTML = '<div class="empty">生成不了：「几个」那一栏要写 1~10 的数字。</div>';
+      return;
+    }
+    if (c) { args.count = Number(c); }
+    if (p !== '') { args.prefix = p; }
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">生成中…</div>';
+    const r = await call('net.mac.random', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">生成不了：${esc(r.message || r.error)}</div>`; return; }
+    const v = r.values;
+    const [title, cls, advice] = MR_CODE[r.verdict] || [r.verdict || '没给判定', '', ''];
+    const say = typeof advice === 'function' ? advice(v) : advice;
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const f = v.formats || {};
+    const items = [
+      ['模式', v.mode === 'clone' ? `克隆（保留 ${v.prefix}）` : '纯随机（本机管理 + 单播）'],
+      ['随机部分', `${v.randomBits} 位，${v.space} 个组合`],
+      ['第一个字节怎么处理', v.firstOctetPolicy],
+      ['第一个的其它写法', `${f.dash || ''} / ${f.dot || ''} / ${f.bare || ''}`],
+    ].filter((x) => x[1] !== undefined && x[1] !== '');
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(say)}</div>
+      <div style="margin-top:12px;display:flex;flex-direction:column;gap:6px">
+        ${(v.macs || []).map((m) => `<code class="mono" style="font-size:15px;user-select:all;cursor:pointer" title="点一下整条选中">${esc(m)}</code>`).join('')}
+      </div>
+      <table style="margin-top:14px"><tr><th></th><th></th></tr>
+        ${items.map(([k, x]) => `<tr><td class="dim" style="white-space:nowrap">${esc(k)}</td>
+          <td><code>${esc(x)}</code></td></tr>`).join('')}</table>
+      <p class="hint">点上面任意一个地址选中后可复制；要看看它会被读成什么，粘到上面那张「MAC 地址」卡里查一次。</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#mr-go').onclick = run;
+  card.querySelector('#mr-count').onkeydown = (e) => { if (e.key === 'Enter') run(); };
+  card.querySelector('#mr-prefix').onkeydown = (e) => { if (e.key === 'Enter') run(); };
   return card;
 }
 
