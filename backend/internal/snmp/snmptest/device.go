@@ -15,6 +15,7 @@ package snmptest
 import (
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -116,6 +117,18 @@ func Ticks(v uint64) Value    { return Value{Tag: snmp.TagTimeTicks, U: v} }
 func MAC(b []byte) Value      { return Value{Tag: snmp.TagOctetString, B: b} }
 func Addr(ip net.IP) Value    { return Value{Tag: snmp.TagIPAddress, IP: ip} }
 func Object(oid string) Value { return Value{Tag: snmp.TagOID, OID: oid} }
+
+// Bind 直接拼一个 VarBind（不经网络）：列 OID + 行号 + 值。
+//
+// ★ 用在「考点是算法而不是报文」的那几条测试上（比如两遍读数相减）。
+//
+//	走一遍假设备的话，一条测试里就同时有设备行为又有算法，哪边错了都分不出来。
+func Bind(columnOID string, row int, v Value) snmp.VarBind {
+	return snmp.VarBind{
+		OID: strings.TrimPrefix(columnOID, ".") + "." + strconv.Itoa(row),
+		Tag: v.Tag, Val: v.raw(),
+	}
+}
 
 func (d *Device) Addr() string { return d.pc.LocalAddr().String() }
 
@@ -361,6 +374,41 @@ func (d *Device) Ports() []int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]int(nil), d.seenPorts...)
+}
+
+// Set 在跑起来以后改一栏的值（没有这栏就加进去）。
+//
+// ★ 为什么需要：计数器类的那几栏（ifInOctets、dot1dTpFdb 的流量、PoE 的功率）
+//
+//	真正的考点是**两次读之间的差**。值写死在表里的话，第二遍读到的一样，
+//	差永远是 0 —— 于是「回绕算错了」这种最要紧的 bug 恰恰测不出来。
+//	所以这里要能在两次读当中把计数器推一把。
+func (d *Device) Set(oid string, v Value) {
+	o := strings.TrimPrefix(oid, ".")
+	e := fakeEntry{oid: o, tag: v.Tag, val: v.raw()}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := range d.entries {
+		if d.entries[i].oid == o {
+			d.entries[i] = e
+			return
+		}
+	}
+	d.entries = append(d.entries, e)
+	sort.Slice(d.entries, func(i, j int) bool { return snmp.CmpOID(d.entries[i].oid, d.entries[j].oid) < 0 })
+}
+
+// Del 删掉一栏：用来复现「第一遍读得到、第二遍设备不给了」（换视图、重启后配置没回来）。
+func (d *Device) Del(oid string) {
+	o := strings.TrimPrefix(oid, ".")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := range d.entries {
+		if d.entries[i].oid == o {
+			d.entries = append(d.entries[:i], d.entries[i+1:]...)
+			return
+		}
+	}
 }
 
 // SetDropNext 让后面 N 个请求不答（测重传）。

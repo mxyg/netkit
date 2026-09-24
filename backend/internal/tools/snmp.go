@@ -620,8 +620,15 @@ func humanUptime(secs uint64) string {
 	if x := secs % d / hur; x > 0 || len(parts) > 0 {
 		parts = append(parts, strconv.FormatUint(x, 10)+" 小时")
 	}
-	if x := secs % hur / 60; x > 0 || len(parts) == 0 {
+	if x := secs % hur / 60; x > 0 || len(parts) == 0 && secs >= 60 {
 		parts = append(parts, strconv.FormatUint(x, 10)+" 分")
+	}
+	// ★ 一小时以内把秒也带上：「这个口 0 分前才翻过状态」在现场等于没说 ——
+	//   查的就是这一格，10 秒前和 59 分前是两个完全不同的结论。
+	if secs < hur {
+		if x := secs % 60; x > 0 || len(parts) == 0 {
+			parts = append(parts, strconv.FormatUint(x, 10)+" 秒")
+		}
 	}
 	return strings.Join(parts, "")
 }

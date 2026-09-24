@@ -2415,9 +2415,324 @@ function snmpMacCard() {
   return card;
 }
 
+/**
+ * 端口表这一张独有的判定。共用的那些（no-reply / error / 只认另一档）退回 SNMP_CODE 那一份，
+ * ★ 不在两处各写一遍 —— 写两遍就会有一遍过期。
+ * 「口不行」在这里被拆成三件下一步完全相反的事：有人关着（去问是谁关的）、
+ * 链路断了（去查线和对端）、在错包（去查模块和两端速率/双工匹配）。
+ */
+const SNMP_PORTS_CODE = {
+  'snmp-ok': ['读到了', 'ok',
+    '表读回来了。★ 这不等于「这些口都还好」：整张表里有口 down 是正常现象（没插线的空口本来就该 down），'
+    + '要判断某一个口，把名字或编号填进去点名再问一次，那一次的判定才说得出「断了还是被关着」。'],
+  'snmp-port-down': ['链路没起来', 'bad',
+    '管理上是开着的、链路上是断的 —— 这一条查物理层：对端开没开机、这根线、对端的口、光模块型号波长对不对。'
+    + '★ oper 是「等外部动作」或「下层没起」时别去查线：前者物理层已经好了，在等 802.1X/STP；'
+    + '后者是聚合口的成员没起来，要往下看成员口。'],
+  'snmp-port-disabled': ['这个口是被关着的', 'warn',
+    'admin 本身就是 down —— 有人在设备上 shutdown 了它，不是链路故障，照着「查线」去跑一趟是白跑。'
+    + '要恢复得在设备上开回来（本工具只读，一行配置都不改）。'],
+  'snmp-port-errors': ['链路能用但在错包', 'warn',
+    '口是 up 的，可这一段在错包/丢包：链路活着但在烂。最常见的是线或模块在坏，'
+    + '其次是两端速率/双工不匹配（一头自协商一头强制最容易出这个）。'
+    + '★ 把「读两遍之间等几秒」调大再问一次，看这几个数是不是在持续涨 —— 涨着才是要动手的那一个。'],
+  'snmp-port-not-found': ['没有点名的那个口', 'warn',
+    '★ 先分清是哪一种：填 ifIndex 时只问了那一个编号（设备一栏都没给 = 没这个接口号）；'
+    + '按名字查且表读全了，才是这台真没有这个名字的口。面板上的「第 5 口」在很多设备上就是不等'
+    + '于 ifIndex 5（编号按槽位排、子接口还会插号），先把表列一遍对着 name 认。'],
+  'snmp-not-walked': ['表没读全，下不了结论', 'warn',
+    '读到「最多列几个」那一档就停了，后面还有什么谁都不知道 —— 此刻「没这个口」和'
+    + '「其余口都还好」这两句都不成立。把限量提到能盖住整张表再问一次。'],
+  'snmp-no-data': ['这台没给出端口表', 'warn',
+    '设备答了话（团体名是对的），只是 ifTable 是空的。要么它不做转发'
+    + '（一台主机把 SNMP 服务开着而已），要么这张表被藏进了别的视图 —— 换团体名再问一次 net.snmp.probe。'],
+};
+
+// oper 的七个值翻成人话。★ 名字（up/dormant/lowerLayerDown）留在这儿而不是后端：
+// 后端给的是设备原文，界面上要的是「所以这一步该查什么」。
+const PORT_OPER = {
+  up: ['在转发', 'ok'],
+  down: ['没链路', 'bad'],
+  testing: ['测试模式', 'warn'],
+  unknown: ['问不出来', 'warn'],
+  dormant: ['等外部动作', 'warn'],
+  notPresent: ['不在位', 'warn'],
+  lowerLayerDown: ['下层没起', 'warn'],
+};
+
+// 顶上一格（判定）。★「链路没起来」只适用于 oper=down：后端把 oper 不是 up 的都归到
+// snmp-port-down 这一个代码里，而 dormant / lowerLayerDown / notPresent 的下一步
+// 和「查线」完全相反（等放行、看成员口、看模块）。给它们挂一颗红「链路没起来」，
+// 等于界面上把后端那句「这两种别去查线」推翻了一遍。
+const PORT_DOWN_HINT = {
+  down: ['链路没起来', 'bad',
+    '管理上是开着的、链路上是断的 —— 这一条查物理层：对端开没开机、这根线、对端的口、光模块型号波长对不对。'],
+  dormant: ['物理层好了，还没进转发', 'warn',
+    '★ 这一步别去查线：链路上已经起来了，是被上面卡住的 —— 802.1X 没放行、STP 还在监听/学习、或者口没划进 VLAN。'
+    + '查那三样，不是查这根线。'],
+  lowerLayerDown: ['这个口下面那一层没起', 'warn',
+    '★ 别查这个口的线：它是一个聚合口/子接口，它的成员口没起来所以它起不来。'
+    + '往下看成员口（把「口名或编号」留空列一遍整张表，看是哪几个成员 down）。'],
+  notPresent: ['这个口的部件不在位', 'warn',
+    '模块没插、或者这台不支持这个口 —— 不是故障。换一个在位的口再看。'],
+  testing: ['口在测试模式', 'warn',
+    'admin 是 testing（设备在做线测），这一趟的状态不代表正常转发时的状态。'],
+  unknown: ['状态问不出来', 'warn',
+    '★ 这一条不能说它是通的还是断的：设备自己答不出这个口的链路状态（驱动/固件没往上送）。'
+    + '先换一种问法确认它在不在（整张表列一遍、或者去 ARP 表里看），别照这句话去机房查线。'],
+};
+
+// 流量计数器是拿来比大小的，不是拿来精读的：换算成 SI 单位（网络设备上的
+// G 本来就是十进制），而且只给三位有效数字 —— 一秒前还在涨的数写成
+// 1623456789 反而像个准数。
+function humanOctets(n) {
+  const unit = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0;
+  let v = Number(n);
+  while (v >= 1000 && i < unit.length - 1) { v /= 1000; i += 1; }
+  return `${v >= 100 ? v.toFixed(0) : v.toFixed(v >= 10 ? 1 : 2)}${unit[i]}`;
+}
+
+// 端口表。★ 一格里同时给「现在能不能转发、跑多快、这一段错了多少包、这个状态持续多久」，
+// 这几件事在现场是同一趟巡检要一起看的，拆成四张表就没人对着读了。
+function portRowsHTML(es) {
+  if (!es || !es.length) return '';
+  const has = (...ks) => es.some((e) => ks.some((k) => e[k] !== undefined));
+  const withRate = has('inMbps', 'outMbps', 'inRateWhy', 'outRateWhy');
+  const withTotal = has('inOctets', 'inOctets32', 'outOctets', 'outOctets32');
+  const withErr = has('inErrors', 'outErrors', 'inDiscards', 'outDiscards',
+    'inErrorsDelta', 'outErrorsDelta', 'inDiscardsDelta', 'outDiscardsDelta');
+  const withSince = has('sinceChange');
+  const dash = '<span class="dim">—</span>';
+
+  const who = (e) => `
+    <div><code>${esc(e.name || e.descr || 'ifIndex ' + e.ifIndex)}</code>
+      <span class="dim">#${esc(e.ifIndex)}</span></div>
+    ${e.alias ? `<div class="dim">${esc(e.alias)}</div>` : ''}
+    ${e.kind && e.kind !== '物理网口' ? `<div class="dim">${esc(e.kind)}</div>` : ''}`;
+
+  // ★ 被关着的口要在这格里同时看得见：只写 oper 会把「有人 shutdown」显示成「断了」。
+  const state = (e) => {
+    const o = PORT_OPER[e.oper] || ['状态没读到', 'warn'];
+    const bits = [`<span class="pill ${o[1]}">${esc(o[0])}</span>`];
+    if (e.admin && e.admin !== 'up') bits.push('<span class="pill warn">被关着</span>');
+    // 后端那句解释里，开头往往就是这一格已经写过的词（「没链路 / 没链路」）。
+    // 重复的那截切掉，只留括号里补充的那半句。
+    let m = e.operMeaning || '';
+    if (m === o[0]) m = '';
+    else if (e.oper !== 'up' && m.startsWith(o[0])) m = m.slice(o[0].length);
+    if (m && e.oper !== 'up') bits.push(`<div class="dim">${esc(m)}</div>`);
+    return bits.join(' ');
+  };
+
+  const speed = (e) => {
+    if (e.speedMbps !== undefined) return `${esc(e.speedMbps)}M`;
+    // ifSpeed 顶格 = 这一栏问不出准数，只能说「至少」：写成 4294M 是假准数。
+    if (e.speedAtLeast !== undefined) return `<span class="pill warn">≥4.29G</span>`;
+    return dash;
+  };
+
+  // 「这一段速率」这一列只有 110px：后端那句整话（「这台不给读这一向的字节数」）
+  // 放进去会把整列顶成三行，谁都读不下去。→ 格子里给短标签 + 悬停给整话，
+  // 表下面配一行图例。★ 两种「没有数」不给合成一个词：那是三种下一步相反的病。
+  const whyCell = (e, k, why, st) => {
+    if (e[k] !== undefined) return esc(e[k]);
+    if (e[why] === undefined) return dash;
+    // ★ 分档看后端的 inRateStatus / outRateStatus，不去正则那句人话：文案改一个字，
+    //   两种下一步相反的病就会被分到同一个标签里。
+    const s = e[st] === 'unreliable' ? '算不准' : '不给读';
+    return `<span class="dim" title="${esc(e[why])}">${s}</span>`;
+  };
+  const rate = (e) => `↓ ${whyCell(e, 'inMbps', 'inRateWhy', 'inRateStatus')}`
+    + ` ↑ ${whyCell(e, 'outMbps', 'outRateWhy', 'outRateStatus')}<div class="dim">M</div>`;
+
+  const total = (e) => {
+    const one = (hc, low) => {
+      if (e[hc] !== undefined) return humanOctets(e[hc]);
+      // ★ 32 位那一栏单标出来：这一档的数会绕回，不能和 64 位的放一个口径比。
+      //   写成 7.65MB³² 界面上看着像「7.65MB32」这个数。
+      if (e[low] !== undefined) {
+        return `${humanOctets(e[low])}<span class="dim" title="这一栏只有 32 位，千兆口 34 秒就绕回一圈">（32 位）</span>`;
+      }
+      // 表里有行给了字节数、这一行没给 = 这一向这台不给读，不是 0。
+      if (withTotal) return '<span class="dim" title="这一向的字节数设备没给，不是 0">不给读</span>';
+      return dash;
+    };
+    return `↓ ${one('inOctets', 'inOctets32')} ↑ ${one('outOctets', 'outOctets32')}`;
+  };
+
+  const counts = (label, dIn, dOut, cIn, cOut) => (e) => {
+    const cell = (k) => (e[k] === undefined ? dash : esc(e[k]));
+    const got = e[dIn] !== undefined || e[dOut] !== undefined || e[cIn] !== undefined || e[cOut] !== undefined;
+    if (!got) return '';
+    return `<div>${label} ${cell(dIn)} / ${cell(dOut)}`
+      + `<span class="dim"> 共 ${cell(cIn)}/${cell(cOut)}</span></div>`;
+  };
+  const errCell = counts('错包', 'inErrorsDelta', 'outErrorsDelta', 'inErrors', 'outErrors');
+  const discCell = counts('丢包', 'inDiscardsDelta', 'outDiscardsDelta', 'inDiscards', 'outDiscards');
+
+  const since = (e) => (e.sinceChange === undefined ? dash
+    : `${esc(e.sinceChange)}<div class="dim">前换的状态</div>`);
+
+  const head = `<tr><th>口</th><th style="width:150px">现在</th><th style="width:70px">线速</th>
+    ${withRate ? '<th style="width:110px">这一段速率</th>' : ''}
+    ${withTotal ? '<th style="width:150px">一共跑了</th>' : ''}
+    ${withErr ? '<th style="width:190px">错包 / 丢包（入/出）</th>' : ''}
+    ${withSince ? '<th style="width:110px">这个状态多久了</th>' : ''}</tr>`;
+
+  // ★ 格子里的短标签必须在表下面对回整句话，否则「不给读」和「算不准」看着像
+  //   同一个「读不出来」——而它们的下一步相反（换团体名 / 把测量间隔调短）。
+  const whySet = new Set();
+  for (const e of es) {
+    for (const k of ['inRateStatus', 'outRateStatus']) {
+      if (e[k] === 'unreliable') whySet.add('算不准');
+      else if (e[k] === 'no-counter') whySet.add('不给读');
+    }
+  }
+  if (withTotal && es.some((e) => e.inOctets === undefined && e.inOctets32 === undefined
+    && e.outOctets === undefined && e.outOctets32 === undefined)) whySet.add('不给读');
+  const legendText = {
+    '不给读': '「不给读」= 这一向的字节数这台没给 —— 不是 0，也不是「没流量」',
+    '算不准': '「算不准」= 计数器对不上（绕了不止一圈、被重置过，或者两遍用的不是同一档），宁可不给数',
+  };
+  const legend = whySet.size
+    ? `<p class="hint" style="margin:6px 0 0">${[...whySet].map((w) => legendText[w]).join('；')}。`
+      + '<span class="dim">（鼠标停在格子上有整句话）</span></p>' : '';
+
+  return `<table>${head}
+    ${es.map((e) => `<tr>
+      <td>${who(e)}</td>
+      <td>${state(e)}${e.mtu ? `<div class="dim">MTU ${esc(e.mtu)}</div>` : ''}</td>
+      <td>${speed(e)}</td>
+      ${withRate ? `<td>${rate(e)}</td>` : ''}
+      ${withTotal ? `<td>${total(e)}</td>` : ''}
+      ${withErr ? `<td>${errCell(e)}${discCell(e)}</td>` : ''}
+      ${withSince ? `<td>${since(e)}</td>` : ''}
+    </tr>`).join('')}
+  </table>${legend}`;
+}
+
+function snmpPortsCard() {
+  const card = $(`<div class="card">
+    <h2>这个口到底怎么样（端口表） <span id="spstat"></span></h2>
+    <p class="hint">读一台设备的端口表：<b>开着没有、链路起来没有、跑多快、这一段流了多少、有没有在错包丢包</b>。
+      ★ 填了「口名或编号」才是点名，那一次的判定才说得出「断了还是被关着」；
+      不填只列表 —— 整张表里有口 down 不是故障（空口本来就该 down），所以列表一律给「读到了」。</p>
+    ${snmpFormHTML('sp')}
+    <div class="row" style="margin-top:10px">
+      <div><label>口名或编号（留空 = 整张表）</label>
+        <input id="spwho" placeholder="GE1/0/5、Gi1/0/5、Vlanif100，或者备注里的字（如「配线架12」）"></div>
+      <div style="flex:0 0 130px"><label>ifIndex</label><input id="spidx" placeholder="点名一个口时填"></div>
+      <div style="flex:0 0 130px"><label>只看</label><select id="spstate">
+        <option value="">都列</option><option value="up">在转发的</option><option value="down">没起来的</option>
+      </select></div>
+      <div style="flex:0 0 150px"><label>读两遍之间等几秒</label><input id="spwatch" placeholder="0 = 只读一遍"></div>
+    </div>
+    <details style="margin-top:10px"><summary class="dim">最多列几个口 / 只问状态（一般不用动）</summary>
+      <div class="row" style="margin-top:8px">
+        <div style="flex:0 0 150px"><label>最多列几个口</label><input id="splimit" placeholder="512"></div>
+        <div style="flex:0 0 auto;min-width:0;padding-top:18px">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400">
+            <input type="checkbox" id="spnoc" style="width:auto"> 只问状态，不问流量计数器</label></div>
+      </div>
+      <p class="hint">★ 筛状态是在<b>读回来之后</b>筛，不减读的量；「一共几个口」记的是筛掉之前有几个。
+        几百口的设备上「只问状态」能省掉大半报文，代价是没有速率和错包那几栏。
+        撞上限量的那一次不会给「其余口都还好」这种结论。</p>
+    </details>
+    <p class="hint" style="margin-top:8px">「读两遍之间等几秒」填了才给速率和这段时间内的错包增量。
+      ★ 千兆口上 32 位计数器 <b>34 秒</b>就绕一圈（万兆 3.4 秒），间隔越长绕圈的概率越大；
+      绕了不止一圈时界面上是「不给读 / 算不准」，不会给一个看着合理的假速率。</p>
+    <div style="margin-top:12px"><button class="btn primary" id="spgo">读端口表</button></div>
+    <div id="spout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#spout');
+  const top = card.querySelector('#spstat');
+  card.querySelector('#spgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = readSnmpArgs(card, 'sp');
+    const who = card.querySelector('#spwho').value.trim();
+    const idx = Number(card.querySelector('#spidx').value);
+    const watch = Number(card.querySelector('#spwatch').value);
+    const limit = Number(card.querySelector('#splimit').value);
+    const state = card.querySelector('#spstate').value;
+    if (who) args.name = who;
+    if (idx > 0) args.ifIndex = idx;
+    if (watch > 0) args.watchSeconds = watch;
+    if (limit > 0) args.limit = limit;
+    if (state) args.state = state;
+    args.noCounters = card.querySelector('#spnoc').checked;
+    out.innerHTML = `<div class="empty">正在问…${watch > 0
+      ? `（读了两遍，中间等了 ${esc(watch)} 秒）`
+      : '表大时要等一会儿'}</div>`;
+    const r = await call('net.snmp.ports', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const ports = [].concat(v.ports || []);
+    const base = SNMP_PORTS_CODE[r.verdict] || SNMP_CODE[r.verdict] || [r.verdict, '', ''];
+    // 后端把「oper 不是 up」全归到 snmp-port-down 一个码，可这三种的下一步和查线相反。
+    // ★ 顶上一格必须跟着 oper 走，否则界面上一颗红「链路没起来」把后端那句
+    //   「这两种别去查线」推翻了一遍。
+    const [text, cls, advice] = r.verdict === 'snmp-port-down'
+      ? (PORT_DOWN_HINT[ports[0] && ports[0].oper] || base) : base;
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const extra = [v.detail,
+      // ★ 三种「没有计数器」分开说：没问、这台不给读、压根没口可读。
+      //   合成一句「这台不给读」会让人白换团体名。
+      //   counterBits 是短板口径（有一向只有 32 位就报 32），所以这句说的是「最窄的那一档」，
+      //   不能写成「计数器 32 位」——满表 64 位的值会被这一句盖掉。
+      v.counterBits === 64 ? '字节数两向都是 64 位（不会绕回）'
+        : v.counterBits === 32 ? '有向只给到 32 位计数器，千兆口 34 秒就绕一圈（表里那几格已标出）'
+          : (args.noCounters ? '这一趟只问了状态，没问流量计数器'
+            : (ports.length ? '字节数那一栏这台不给读' : '')),
+      // 重启这件事表上面已经有一整段在讲了（连后端那句 rateUnsure 一起），
+      // 这里再写一遍只会让人以为除了重启还有另一桩病。
+      v.rateUnsure && !v.rebooted ? `速率：${v.rateUnsure}` : '',
+      v.sampleAborted ? v.sampleAborted : '',
+      v.truncated ? `撞上限量 ${v.readLimit}，这张表没读全` : ''].filter(Boolean).join('；');
+    // ★ 列表空着、可表其实读了回来：这一格必须自己说话。不写的话界面只剩一颗
+    //   「读到了」加一张空表，看着像「这台一个口都没有」——那是另一种结论。
+    //   （没点状态筛而列表空的只有「按名字没找着」那一种，后端那条判定已经说清了。）
+    const emptyLine = (ports.length || !v.read || !v.stateFilter) ? '' : `
+      <p class="hint">★ 一个口都没列出来，但这不是「这台没有口」：按「${
+        esc(v.stateFilter === 'up' ? '在转发的' : '没起来的')}」筛之前，这一趟读了 ${
+        esc(v.read)} 个口，没有一个在这个状态上。被筛掉不等于没有。</p>`;
+    // ★ 读回来几口 / 筛完剩几口要看得见：只看下面那张表的人会把
+    //   「筛过剩下 3 个」读成「这台只有 3 个口」。
+    const statsRow = v.read === undefined ? '' : `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:10px">
+        <div><label>读了多少</label><div><b>${esc(v.read)}</b> 个口
+          ${v.count !== undefined && v.count !== v.read
+            ? `<span class="dim">筛完列出 <b>${esc(v.count)}</b> 个</span>` : ''}
+          ${v.truncated ? `<span class="pill warn">撞上限量 ${esc(v.readLimit)}</span>` : ''}</div></div>
+        ${v.up !== undefined ? `<div><label>在转发 / 没链路 / 被关着</label>
+          <div><b>${esc(v.up)}</b> / <b>${esc(v.down)}</b> / <b>${esc(v.adminDown)}</b></div></div>` : ''}
+        ${v.sampleSeconds !== undefined ? `<div><label>测了多久</label><div>${esc(v.sampleSeconds)} 秒</div></div>` : ''}
+      </div>`;
+    out.innerHTML = `
+      ${snmpHead(v)}
+      ${statsRow}
+      ${v.rebooted ? `<p class="hint">★ 这台设备在两次读之间重启过（sysUpTime 倒退），
+        所以这一趟<b>没有速率和增量</b> —— 计数器全被清零过，相减得到的是「开机到现在」，
+        不是「这一秒跑了多少」。上面的累计值是第二次读到的那一份。</p>` : ''}
+      ${emptyLine}
+      ${portRowsHTML(v.ports)}
+      ${(v.errorPorts && v.errorPorts.length) ? `<p class="hint" style="margin:8px 0 0">
+        这一段在错包的口：${esc([].concat(v.errorPorts).join('、'))}</p>` : ''}
+      ${(v.recentlyChanged && v.recentlyChanged.length) ? `<p class="hint" style="margin:6px 0 0">
+        五分钟内换过状态的口：${esc([].concat(v.recentlyChanged).join('、'))}
+        <span class="dim">—— 「偶尔断一下」先看这几个</span></p>` : ''}
+      <div style="margin-top:12px">${snmpAdviceBox(cls, advice, extra)}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
 async function renderSwitch(root) {
   root.appendChild(snmpProbeCard());
   root.appendChild(snmpMacCard());
+  root.appendChild(snmpPortsCard());
 }
 
 async function renderScan(root) {
