@@ -2260,13 +2260,15 @@ const CMP_TEXT = {
 /*
  * ── 扫描与发现 ──
  *
- * ★ 这一页把「这个网段上都有谁」的三样东西放在一起：主动扫一段（net.subnet.scan）、
+ * ★ 这一页把「这个网段上都有谁」的四样东西放在一起：主动扫一段（net.subnet.scan）、
+ *   问设备自己是谁（net.device.identify）、
  *   听 v6 的应答顺便看谁还没配网（net.discover，原来只有 API 没有按钮，不合 [OTS-4.5]）、
  *   以及纯读本机缓存的邻居表（net.neighbors，同样原来没按钮）。
  *
- * ★★ 三张卡的可信度不是一回事，界面必须把这层差别留在脸上：
+ * ★★ 四张卡的可信度不是一回事，界面必须把这层差别留在脸上：
  *   邻居表是**缓存**（里面没有 ≠ 它不在，而且旧记录可能早就溜了）；
  *   扫网段是**当场问过**（每台都带着凭什么判定它在线）；
+ *   设备识别只放**设备自己说过的话**（没说的一定留空，不猜）；
  *   发现只听得见应 v6 的那些。混成一张「设备清单」就会让人拿着一个漏了一半的表去现场。
  */
 
@@ -2285,6 +2287,39 @@ const EVIDENCE = {
   arp: ['应了 ARP，没应 ping', 'ok'],
   'arp-cache': ['本机缓存里的旧记录', 'warn'],
   tcp: ['端口有应答（连上或被拒）', 'ok'],
+};
+
+/*
+ * ── 设备识别（net.device.identify）的判定话术 ──
+ *
+ * ★★ 这一张与上面「扫一个网段」的分工必须在脸上就分得开：扫网段答的是
+ *   「这个地址上有没有人」，这一张答的是「它是哪一台」。
+ *   所以这里最要紧的一句话是 heard-anonymous —— 有东西应了但没说身份，
+ *   它既不是「发现了设备」也不是「没有设备」，混进任何一边都会把人支到错的地方去。
+ */
+const DEVICE_CODE = {
+  'devices-found': ['认出了是谁', 'ok',
+    '下面每一台写的都是<b>它自己说过的话</b>（名字、类型、管理地址）。'
+    + '★ 空着的那一格意思是「这台没说」，不是「没有」——这一栏宁可留空也不按 MAC 前缀猜厂商：'
+    + '猜对九次、错一次，人就顺着错的那一次去机房。'],
+  'heard-anonymous': ['有人应，但一句身份都没说', 'warn',
+    '这些地址上有东西在答话，可它没说过自己是谁 —— 这<b>不等于没有设备</b>，'
+    + '也不等于坏了。最常见的是固件里把发现服务关掉的摄像头，和不开 UPnP 的路由/交换机。'
+    + '下一步：拿其中一个地址去「连通性」页扫端口，看它开了什么（554 是 RTSP、80/443 是管理页）。'],
+  'no-device-answered': ['问过的口径没人应答', 'warn',
+    '★ 这一条<b>不能</b>读成「这个网段里没有设备」：设备不喊这几种话、中间隔着一层路由、'
+    + '交换机做了组播抑制，三种病在这里长一个样。先在「问几轮」填 3 再问一次'
+    + '（UDP 会丢，问两轮的命中率明显高于把一轮拉长），再用上面「扫一个网段」确认地址上到底有没有人。'],
+  'no-interface': ['一块能问的网卡都没有', 'bad',
+    '一个都没问出去，所以这份结果里没有任何一栏可以说设备的事。'
+    + '先看网线插没插、这块网卡禁没禁用、有没有拿到 IPv4 地址（在「本机网络」那页）。'],
+  'no-multicast-route': ['组播发不出去', 'bad',
+    '本机或路上某台设备把组播挡了 —— 容器里跑、VPN 只给了一个 /32、系统禁了组播，都会卡在这里。'
+    + '换一块有 IPv4 的网卡，或者在「点名问哪些地址」里直接填那个 IP：'
+    + '★ 点名时我们发的是<b>单播</b>，不靠组播出去，隔着路由也能问到。'],
+  'stopped': ['还没问到东西就停了', 'warn',
+    '这份只覆盖停之前那一段，<b>不能</b>当成整个网段的答案：'
+    + '慢的设备（老摄像头、走 802.11 的笔记本）第二轮才答话是常态。'],
 };
 
 const DISCOVER_CODE = {
@@ -3521,6 +3556,7 @@ async function renderSwitch(root) {
 
 async function renderScan(root) {
   root.appendChild(subnetScanCard());
+  root.appendChild(deviceIdentifyCard());
   root.appendChild(discoverCard());
   root.appendChild(neighborsCard());
 }
@@ -3591,6 +3627,154 @@ function subnetScanCard() {
       ${v.alive ? `<p class="dim" style="margin-top:10px">「没信号」的那些<b>不是</b>「不在线」的证据 ——
         它们只是没在这轮里吭声。要确认某一台，去「连通性」页单独 ping 它。</p>` : ''}
       <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/*
+ * ── 设备识别这一张 ──
+ *
+ * ★ 默认版面只给「问哪块网卡、等多久、点名问哪个地址」，协议与服务类型的挑选收在高级里：
+ *   四种全问是默认，平时那一排勾选不该占地方。
+ * ★★ 结果一行要同时答完「它是谁 / 它是什么 / 管理地址 / MAC / 是谁说的 / 从哪块网卡看到的」，
+ *   因为抄这一行的人下一步就是拿这些去登录那台设备。
+ *   「这台没说」必须显式写出来 —— 空一格和一格「没有」在人眼里是同一件事，
+ *   在结论上不是：设备没说，不等于这台不重要。
+ */
+function deviceIdentifyCard() {
+  const PROTOS = [
+    ['ssdp', 'SSDP / UPnP', '媒体服务器、智能设备、多数网络摄像头'],
+    ['mdns', 'mDNS / DNS-SD', 'NAS、打印机、Mac、AirPlay 与投屏'],
+    ['ws-discovery', 'WS-Discovery', '监控设备（ONVIF）、Windows 的网络发现'],
+    ['netbios', 'NetBIOS', '老 Windows 与打印机。★ 只有这一路给得出 MAC，它要点名问'],
+  ];
+  const card = $(`<div class="card">
+    <h2>问一遍：这些地址是哪台设备 <span id="xv"></span></h2>
+    <p class="hint">上面「扫一个网段」答的是<b>有没有人</b>，这一张答<b>它是哪一台</b>：
+      把设备自己喊出来的话摊开 —— 名字、类型、管理地址、MAC。
+      ★ 只放设备自己说过的话，没说的留空并写明「这台没说」，一律不按 MAC 前缀猜厂商。</p>
+    <div class="row">
+      <div style="flex:0 0 190px"><label>只问哪块网卡</label><input id="xi" placeholder="留空 = 插着线的都问"></div>
+      <div style="flex:0 0 110px"><label>每轮等几秒</label><input id="xs" placeholder="3"></div>
+      <div style="flex:0 0 90px"><label>问几轮</label><input id="xr" placeholder="2"></div>
+      <div><label>点名问哪些地址（留空 = 对着网段喊）</label>
+        <input id="xa" placeholder="10.0.12.77，或 10.0.12.0/24；空格或逗号分开"></div>
+      <div style="flex:0 0 100px;align-self:flex-end"><button class="btn primary" id="xgo">问一遍</button></div>
+    </div>
+    <details style="margin-top:8px"><summary class="dim">高级：只问某几种自报 / 额外问哪些服务 / 顺带取描述文件</summary>
+      <p class="dim" style="margin:10px 0 4px">只勾怀疑的那几种，问得更快、也少打扰别人：</p>
+      <div id="xproto" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:4px 12px"></div>
+      <div class="row" style="margin-top:10px">
+        <div><label>额外问哪些 DNS-SD 服务类型</label>
+          <input id="xsvc" placeholder="留空即可；如 _raop._tcp.local、_googlecast._tcp.local"></div>
+      </div>
+      <label style="display:flex;gap:6px;align-items:center;margin-top:8px">
+        <input type="checkbox" id="xdesc" style="width:auto">
+        顺着 SSDP 给的管理地址再取一份描述文件（能多问出型号、序列号）</label>
+      <p class="hint" style="margin:6px 0 0">★ 这一条是往<b>设备上</b>发一个 HTTP GET：只读，
+        但会在那台的访问日志里多一条 —— 有些老设备（门禁、编码器）日志一满就重启，所以默认不取。
+        最多取 12 份，只认 http/https。</p>
+    </details>
+    <div id="xout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#xout');
+  const top = card.querySelector('#xv');
+  card.querySelector('#xproto').innerHTML = PROTOS.map(([k, name, note]) =>
+    `<label style="display:flex;gap:6px;align-items:center;font-size:13px">
+      <input type="checkbox" class="x-proto" value="${k}" style="width:auto"> ${esc(name)}
+      <span class="dim">${esc(note)}</span></label>`).join('');
+  card.querySelector('#xgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = {};
+    const iface = card.querySelector('#xi').value.trim();
+    if (iface) args.iface = iface;
+    const secs = Number(card.querySelector('#xs').value);
+    const rounds = Number(card.querySelector('#xr').value);
+    if (secs > 0) args.seconds = secs;
+    if (rounds > 0) args.rounds = rounds;
+    const list = (s) => s.split(/[\s,，、]+/).filter(Boolean);
+    const addrs = list(card.querySelector('#xa').value);
+    if (addrs.length) args.addrs = addrs;
+    const svc = list(card.querySelector('#xsvc').value);
+    if (svc.length) args.services = svc;
+    const picked = [...card.querySelectorAll('.x-proto')].filter((c) => c.checked).map((c) => c.value);
+    // 一个都不勾 = 用后端的默认（四种全问）。★ 不许把「没勾」当成「都别问」。
+    if (picked.length && picked.length < PROTOS.length) args.protocols = picked;
+    if (card.querySelector('#xdesc').checked) args.describe = true;
+
+    out.innerHTML = '<div class="empty">正在问…（先把查询发出去，再在窗口里等各方答话。'
+      + '走无线的那块网卡常常慢一拍）</div>';
+    const r = await call('net.device.identify', args);
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">问不了：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values;
+    const [text, cls, advice] = DEVICE_CODE[r.verdict] || [r.verdict, '', ''];
+    const stopPill = v.stopped
+      ? `<span class="pill warn">中途停了：只问了 ${esc(v.roundsDone)}/${esc(v.rounds)} 轮</span>` : '';
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span> ${stopPill}`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+
+    // 四路各自那一本账：一路没应不代表设备不在，只代表它不说这一种话。
+    const tally = (v.protocols || []).map((p) => {
+      const askedCell = p.asked
+        ? `<span class="dim">${p.protocol === 'netbios'
+          ? '点名问过 ' + esc(p.targets) + ' 个地址' : '在 ' + esc(p.targets) + ' 块网卡上问过'}</span>`
+        : '<span class="pill">这一路没问</span>';
+      return `<tr><td>${esc(p.protocol)}</td><td>${askedCell}</td>
+        <td${p.asked && !p.reports ? ' class="dim"' : ''}>${esc(p.reports)} 条</td>
+        <td>${esc(p.hosts)} 个地址</td></tr>`;
+    }).join('');
+    const rows = (v.devices || []).map((d) => {
+      const inst = (d.instances || []).filter((s) => s && s !== d.name).slice(0, 3);
+      const types = (d.types || []).filter((s) => s && s !== d.kind).slice(0, 3);
+      return `<tr${d.identified ? '' : ' style="opacity:.72"'}>
+        <td><code>${esc(d.addr)}</code>${d.port ? `<span class="dim">:${esc(d.port)}</span>` : ''}</td>
+        <td>${d.name ? `<b>${esc(d.name)}</b>` : '<span class="dim">没说名字</span>'}
+          ${inst.length ? `<div class="dim" style="font-size:12px">还报了 ${esc(inst.join('、'))}`
+            + `${(d.instances || []).length > 3 ? ' 等' : ''}</div>` : ''}</td>
+        <td>${d.kind ? esc(d.kind) : '<span class="dim">没说类型</span>'}
+          ${types.length ? `<div class="dim" style="font-size:12px">${esc(types.join('、'))}</div>` : ''}
+          ${(d.detail || []).length ? `<div class="dim" style="font-size:12px">${esc(d.detail.join('；'))}</div>` : ''}</td>
+        <td>${d.url ? `<code class="dim" style="font-size:12px">${esc(d.url)}</code>`
+          : '<span class="dim">没给</span>'}</td>
+        <td><code class="dim">${esc(d.mac || '—')}</code></td>
+        <td class="dim">${esc((d.protocols || []).join('、'))}</td>
+        <td class="dim">${esc(d.iface || '—')}</td></tr>`;
+    }).join('');
+
+    // 「一次都没问出去」的那几个判定（没网卡、组播发不出去）没有这几栏可填。
+    // ★ 摆一排空统计比不摆更坏：人会读成「问到 0 个」，而实际是「没问」。
+    const ran = v.count !== undefined;
+    out.innerHTML = `
+      ${ran ? `<div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>应了的地址</label><div><b>${esc(v.count)}</b> 个</div></div>
+        <div><label>其中报了身份的</label><div><b>${esc(v.identified || 0)}</b> 个</div></div>
+        <div><label>收到自报</label><div>${esc(v.reports)} 条</div></div>
+        <div><label>问过的网卡</label><div>${esc((v.interfaces || []).join('、')) || '—'}</div></div>
+        <div><label>问了几轮</label><div>${esc(v.roundsDone)}/${esc(v.rounds)}</div></div>
+        ${v.targets ? `<div><label>点名</label><div>${esc((v.targets || []).length)} 个地址</div></div>` : ''}
+      </div>` : ''}
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${advice}${v.reason ? `<div class="dim" style="margin-top:6px">本机报出来的原因：
+          <code>${esc(v.reason)}</code> <span class="dim">（这一句是本机自己说的，不是设备上看到的）</span></div>` : ''}</div>
+      ${v.count ? `<table style="margin-top:14px"><tr><th>地址</th><th>它是谁</th><th>它是什么</th>
+        <th>管理地址（它自己给的）</th><th>MAC</th><th>谁说的</th><th>哪块网卡</th></tr>${rows}</table>
+        <p class="dim" style="margin-top:10px">管理地址这一栏是<b>设备自己写的</b>，所以不做成链接：
+          抄下来自己核对一眼再打开。「谁说的」那几路里，NetBIOS 是唯一给得出 MAC 的，
+          空着就是那台不理 NetBIOS（不是它没 MAC）。</p>` : ''}
+      ${tally ? `<h2 style="margin-top:16px">四路各自问到什么</h2>
+      <table><tr><th>自报口径</th><th>问的情况</th><th>收到几条</th><th>几个地址答的</th></tr>${tally}</table>` : ''}
+      ${v.notAsked ? `<p class="hint" style="margin:10px 0 0">另有 ${esc((v.notAsked || []).length)} 个地址
+        <b>一个包都没发出去</b>：<code>${esc([].concat(v.notAsked).join(' '))}</code>
+        <span class="dim">—— 问都没问过，不是问了没人答。</span></p>` : ''}
+      ${v.skipped ? `<p class="dim" style="margin:10px 0 0">这些没去问：
+        ${[].concat(v.skipped).map((s) => esc(s)).join('<br>')}</p>` : ''}
+      <p class="dim" style="margin:10px 0 0;white-space:pre-line">${esc(r.note)}</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };

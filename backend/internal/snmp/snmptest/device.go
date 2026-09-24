@@ -13,6 +13,7 @@ package snmptest
 //   底座那侧另外有 interop 测试，拿系统自带的 Net-SNMP 客户端做互测。
 
 import (
+	"errors"
 	"net"
 	"sort"
 	"strconv"
@@ -161,11 +162,22 @@ func (d *Device) IDs() []int32 {
 
 func (d *Device) serve() {
 	buf := make([]byte, 2000)
-	for {
+	// ★ 只有「这台被关掉了」才退出。macOS/BSD 上，一个 UDP 套接字会因为**别人**收不到
+	//   回包而产生的 ICMP 端口不可达，在自己下一次读的时候把错误抛回来（ECONNREFUSED 最常见），
+	//   而客户端超时后先关自己的口是常态。一有错就 return 的写法，症状是「假设备明明在，
+	//   测试却连问三次说没人应」，且只在整包并发跑时出现 —— 单跑永远复现不了。
+	for misses := 0; ; {
 		n, peer, err := d.pc.ReadFromUDP(buf)
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if misses++; misses > 100 {
+				return // 一直是坏的就别空转烧 CPU
+			}
+			continue
 		}
+		misses = 0
 		d.handle(buf[:n], peer)
 	}
 }
