@@ -2290,8 +2290,134 @@ function snmpProbeCard() {
   return card;
 }
 
+// MAC 表这一张独有的判定。共用的那些（no-reply / error / 只认另一档）退回 SNMP_CODE 那一份，
+// ★ 不在两处各写一遍 —— 写两遍就会有一遍过期。
+const SNMP_MAC_CODE = {
+  'snmp-ok': ['读到了', 'ok',
+    '转发表读回来了。「在哪一个口」这句话的分量，取决于上面写的读了多少、有没有截断。'],
+  'snmp-mac-not-found': ['表里没有这个 MAC', 'warn',
+    '表读全了，里面确实没有它。★ 这不等于「它不在这台设备上」：这张表只记最近发过帧的源地址，'
+    + '终端静默着就不在里面；其次是它可能挂在另一台设备或另一个 VLAN 上。'],
+  'snmp-not-walked': ['表没读完，下不了结论', 'warn',
+    '读满限量就停了，后面还有什么谁都不知道 —— 这一条给的是下一步，不是结论。'
+    + '把「最多读几条」提到能盖住整张表再问一次（留空就是按整张表读）。'],
+  'snmp-no-data': ['这台没给出转发表', 'warn',
+    '设备答了话（团体名是对的），只是两张转发表都不给内容。要么它不做二层交换'
+    + '（三层设备、透明转发），要么链路上确实没流量，要么这张表按 VLAN 分给了别的团体名。'],
+};
+
+const FDB_STATUS = {
+  dynamic: ['动态学到', 'ok'],
+  static: ['手工配死', 'warn'],
+  self: ['本机地址', ''],
+};
+
+// 一张转发表该有哪些行。★ 端口名问不到的行只写「桥端口 N」，不猜口名 ——
+//   猜错的那一次是人照着这句话去机房拔线，拔了别人的链路。
+function fdbRowsHTML(es) {
+  if (!es || !es.length) return '';
+  const withVlan = es.some((e) => e.vlan !== undefined);
+  const where = (e) => (e.port
+    ? `<code>${esc(e.port)}</code>${e.ifIndex !== undefined ? ` <span class="dim">ifIndex ${esc(e.ifIndex)}</span>` : ''}`
+    : `<span class="dim">桥端口 ${esc(e.basePort)}（口名没读到）</span>`);
+  const st = (e) => {
+    const s = FDB_STATUS[e.status];
+    if (!s) return '<span class="dim">设备没给</span>';
+    return `<span class="pill ${s[1]}">${esc(s[0])}</span>`;
+  };
+  return `<table>
+    <tr><th>MAC</th>${withVlan ? '<th style="width:80px">VLAN</th>' : ''}
+      <th>在哪个口</th><th style="width:110px">怎么进表的</th></tr>
+    ${es.map((e) => `<tr><td><code>${esc(e.mac)}</code></td>
+      ${withVlan ? `<td>${e.vlan === undefined ? '<span class="dim">—</span>' : esc(e.vlan)}</td>` : ''}
+      <td>${where(e)}</td><td>${st(e)}</td></tr>`).join('')}
+  </table>`;
+}
+
+function snmpMacCard() {
+  const card = $(`<div class="card">
+    <h2>谁插在哪个口（MAC 地址表） <span id="skstat"></span></h2>
+    <p class="hint">读一台设备的转发表。<b>填 MAC 就是反查</b>「这台终端插在交换机的哪个口上」，
+      不填读整张表。★ 反查默认把整张表读全（三万条的表要等一会儿）：
+      读到一半就说「表里没有」，会让人去查一条本来好好的链路。</p>
+    ${snmpFormHTML('sk')}
+    <div class="row" style="margin-top:10px">
+      <div><label>反查这个 MAC（留空 = 整张表）</label>
+        <input id="skmac" placeholder="aa:bb:cc:dd:ee:ff / aa-bb-… / aabb.ccdd.eeff"></div>
+      <div style="flex:0 0 110px"><label>只看 VLAN</label><input id="skvlan" placeholder="100"></div>
+    </div>
+    <details style="margin-top:10px"><summary class="dim">读哪张表、最多读几条（一般不用动）</summary>
+      <div class="row" style="margin-top:8px">
+        <div style="flex:0 0 220px"><label>读哪张表</label><select id="sktable">
+          <option value="">两张都试（默认）</option>
+          <option value="qbridge">Q-BRIDGE（带 VLAN）</option>
+          <option value="bridge">BRIDGE-MIB（老设备，不带 VLAN）</option>
+        </select></div>
+        <div style="flex:0 0 150px"><label>最多读几条</label><input id="sklimit" placeholder="整张表"></div>
+      </div>
+      <p class="hint">交换机有两张转发表：新的是 Q-BRIDGE（带 VLAN），老的是 BRIDGE-MIB（不带 VLAN）。
+        默认先读新的、读不到再退老的。点名只读一张，是用来处理
+        「这台设备的表结构被厂商改过、读出来是乱的」这种现场。
+        ★ 按 VLAN 筛是在<b>读回来之后</b>筛，不减读的量。</p>
+    </details>
+    <div style="margin-top:12px"><button class="btn primary" id="skgo">读这张表</button></div>
+    <div id="skout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#skout');
+  const top = card.querySelector('#skstat');
+  card.querySelector('#skgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = readSnmpArgs(card, 'sk');
+    const mac = card.querySelector('#skmac').value.trim();
+    const vlan = Number(card.querySelector('#skvlan').value);
+    const limit = Number(card.querySelector('#sklimit').value);
+    const table = card.querySelector('#sktable').value;
+    if (mac) args.mac = mac;
+    if (vlan > 0) args.vlan = vlan;
+    if (limit > 0) args.limit = limit;
+    if (table) args.table = table;
+    out.innerHTML = `<div class="empty">正在问…${mac
+      ? '反查一条 MAC 会把整张表读全，核心交换机上这一步要等几十秒'
+      : '表大时要等一会儿'}</div>`;
+    const r = await call('net.snmp.mac', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = SNMP_MAC_CODE[r.verdict] || SNMP_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const extra = [v.detail,
+      v.lookedUp === 'index' ? '这一条是按索引直取的，没读整张表' : '',
+      v.portNames === 'unavailable' ? '端口名那一栏问不到（只给了桥端口号）' : '',
+      v.unresolved ? `${v.unresolved} 行配不出口名` : '',
+      v.skipped ? `${v.skipped} 行索引写法对不上，被跳过` : ''].filter(Boolean).join('；');
+    const readOut = v.lookedUp === 'index' ? '<span class="pill ok">按索引直取</span>'
+      : `读了 <b>${esc(v.read)}</b> 条`
+        + (v.truncated ? ` <span class="pill warn">撞上限量 ${esc(v.readLimit)}，没读完</span>` : ' <span class="pill ok">读全了</span>');
+    // ★ 表没读回来（团体名不对、设备不给读）时这三格整排不出现：
+    //   留三格空的「读了 条 / 剩下 条」，看着像读回来是 0 条 —— 那是另一种结论。
+    const statsRow = v.read === undefined ? '' : `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:10px">
+        <div><label>读的表</label><div><code>${esc(v.fdbTable || '')}</code>
+          <span class="dim">（试过 ${esc([].concat(v.tablesTried || []).join('、'))}）</span></div></div>
+        <div><label>读了多少</label><div>${readOut}</div></div>
+        <div><label>筛完剩下</label><div><b>${esc(v.count)}</b> 条
+          ${v.vlanFilter ? `<span class="dim">按 VLAN ${esc(v.vlanFilter)} 筛过</span>` : ''}
+          ${v.queriedMac ? `<span class="dim">反查 ${esc(v.queriedMac)}</span>` : ''}</div></div>
+      </div>`;
+    out.innerHTML = `
+      ${snmpHead(v)}
+      ${statsRow}
+      ${fdbRowsHTML(v.entries)}
+      <div style="margin-top:12px">${snmpAdviceBox(cls, advice, extra)}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
 async function renderSwitch(root) {
   root.appendChild(snmpProbeCard());
+  root.appendChild(snmpMacCard());
 }
 
 async function renderScan(root) {

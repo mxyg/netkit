@@ -422,39 +422,51 @@ func (c *Client) GetNext(ctx context.Context, oids ...string) ([]VarBind, error)
 //	症状是「walk 到某一张表就没反应」，而人只会以为那张表是空的。
 const MaxRepetitions = 25
 
-// Walk 沿着一棵子树把每一栏读回来。
+// Walk 沿着一棵子树把每一栏读回来（读到底）。
 //
-// 走的是 GETBULK（v1 没有，自动退回 GETNEXT 一步一步走）。
-// ★ 收口条件是「回来的 OID 不在这棵子树里了」，不是「读到 endOfMibView」：
-//
-//	一批实现根本不发那个异常值，它们直接把下一条别的子树的 OID 给你 ——
-//	只认异常值的话，walk 会顺着树外一路读到整张 MIB 去。
+// 表大到只关心前若干行时用 WalkLimit：一次完整的 MAC 表可能是几万行，
+// 那会让「看一眼」变成几分钟的请求。
 func (c *Client) Walk(ctx context.Context, prefix string) ([]VarBind, error) {
+	out, _, err := c.walk(ctx, prefix, 0)
+	return out, err
+}
+
+// WalkLimit 读到 want 栏就收口（want <= 0 = 不限量），第二个返回值表示**确实还有剩下的没读**。
+//
+// ★ 到了量之后要多问一次 GETNEXT 才敢报「被截断」：
+//
+//	刚好停在表末尾时说「后面还有」是谎话，而调用方会照着这句话去查一台没毛病的管理进程。
+//	这一条请求只在撞上限时才发，正常路径不多花时间。
+func (c *Client) WalkLimit(ctx context.Context, prefix string, want int) ([]VarBind, bool, error) {
+	return c.walk(ctx, prefix, want)
+}
+
+func (c *Client) walk(ctx context.Context, prefix string, want int) ([]VarBind, bool, error) {
 	prefix = strings.TrimPrefix(strings.TrimSpace(prefix), ".")
 	if prefix == "" {
-		return nil, fmt.Errorf("snmp: walk 要给一个子树前缀")
+		return nil, false, fmt.Errorf("snmp: walk 要给一个子树前缀")
 	}
 	if c.version() == Version1 {
-		return c.walkNext(ctx, prefix)
+		return c.walkNext(ctx, prefix, want)
 	}
 	var out []VarBind
 	cur := prefix
 	for {
 		if err := ctx.Err(); err != nil {
-			return out, err
+			return out, false, err
 		}
 		p, err := NewBulk(c.Community, 0, MaxRepetitions, cur)
 		if err != nil {
-			return out, err
+			return out, false, err
 		}
 		r, err := c.Do(ctx, p)
 		if err != nil {
 			// 设备不认 GETBULK（回 tooBig 或者干脆没辙）时退回 GETNEXT，
 			// 而不是让整个 walk 失败：树还是要走完。
 			if isTooBig(err) {
-				return c.walkNext(ctx, prefix)
+				return c.walkNext(ctx, prefix, want)
 			}
-			return out, err
+			return out, false, err
 		}
 		if len(r.VarBinds) == 0 {
 			break
@@ -462,26 +474,40 @@ func (c *Client) Walk(ctx context.Context, prefix string) ([]VarBind, error) {
 		progressed := false
 		for _, v := range r.VarBinds {
 			if v.EndOfMib() {
-				return out, nil
+				return out, false, nil
 			}
 			// ★ 先看有没有往前走，再看还在不在树里：
 			//   「原地不动」和「走到树外面」都是收口，但只有前者是设备的毛病，
 			//   当成正常结束的话 walk 会安静地少一整张表，而界面上是「这台设备没有端口」。
 			if CmpOID(v.OID, cur) <= 0 {
-				return out, fmt.Errorf("snmp: 设备在 %s 处没有往前走（下一栏它给的是 %s），walk 停在这里", cur, v.OID)
+				return out, false, fmt.Errorf("snmp: 设备在 %s 处没有往前走（下一栏它给的是 %s），walk 停在这里", cur, v.OID)
 			}
 			if !OIDUnder(v.OID, prefix) {
-				return out, nil
+				return out, false, nil
 			}
 			out = append(out, v)
 			cur = v.OID
 			progressed = true
+			if want > 0 && len(out) >= want {
+				trunc, err := c.hasMore(ctx, prefix, cur)
+				return out, trunc, err
+			}
 		}
 		if !progressed {
-			return c.walkNext(ctx, prefix)
+			return c.walkNext(ctx, prefix, want)
 		}
 	}
-	return out, nil
+	return out, false, nil
+}
+
+// hasMore 问一栏「cur 后面树里还有东西吗」。问不动就算没探到，
+// 宁可少报一次截断，也不拿一个查不出原因的失败让整个 walk 作废。
+func (c *Client) hasMore(ctx context.Context, prefix, cur string) (bool, error) {
+	vs, err := c.GetNext(ctx, cur)
+	if err != nil || len(vs) == 0 {
+		return false, nil
+	}
+	return OIDUnder(vs[0].OID, prefix) && !vs[0].EndOfMib(), nil
 }
 
 func isTooBig(err error) bool {
@@ -490,12 +516,12 @@ func isTooBig(err error) bool {
 }
 
 // walkNext 用 GETNEXT 一步一步走：v1 设备和不肯配合 GETBULK 的设备走这条。
-func (c *Client) walkNext(ctx context.Context, prefix string) ([]VarBind, error) {
+func (c *Client) walkNext(ctx context.Context, prefix string, want int) ([]VarBind, bool, error) {
 	var out []VarBind
 	cur := prefix
 	for {
 		if err := ctx.Err(); err != nil {
-			return out, err
+			return out, false, err
 		}
 		vs, err := c.GetNext(ctx, cur)
 		if err != nil {
@@ -503,25 +529,29 @@ func (c *Client) walkNext(ctx context.Context, prefix string) ([]VarBind, error)
 			// 这一条要当收口，不能当失败 —— 否则每张表末尾都白报一次错。
 			var e *Error
 			if errors.As(err, &e) && e.Status == 2 && len(out) > 0 {
-				return out, nil
+				return out, false, nil
 			}
-			return out, err
+			return out, false, err
 		}
 		if len(vs) == 0 {
-			return out, nil
+			return out, false, nil
 		}
 		v := vs[0]
 		if v.EndOfMib() {
-			return out, nil
+			return out, false, nil
 		}
 		// 和 GETBULK 那条同样的顺序：先确认它往前走了，再判断还在不在树里。
 		if CmpOID(v.OID, cur) <= 0 {
-			return out, fmt.Errorf("snmp: 设备在 %s 处没有往前走（下一栏它给的是 %s），walk 停在这里", cur, v.OID)
+			return out, false, fmt.Errorf("snmp: 设备在 %s 处没有往前走（下一栏它给的是 %s），walk 停在这里", cur, v.OID)
 		}
 		if !OIDUnder(v.OID, prefix) {
-			return out, nil
+			return out, false, nil
 		}
 		out = append(out, v)
 		cur = v.OID
+		if want > 0 && len(out) >= want {
+			trunc, err := c.hasMore(ctx, prefix, cur)
+			return out, trunc, err
+		}
 	}
 }

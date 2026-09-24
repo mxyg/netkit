@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -30,6 +31,75 @@ func sysEntries() map[string]snmptest.Value {
 		"1.3.6.1.2.1.1.5.0": snmptest.Str("core-sw-01"),
 		"1.3.6.1.2.1.1.7.0": snmptest.Int(72),
 	}
+}
+
+// bridgeEntries 是同一台假设备的桥接组：一张 Q-BRIDGE 的 MAC 表、端口映射表，外加 ifTable 那几栏。
+//
+// ★ 三处刻意照着真设备的毛病来填：
+//   - VLAN 1000 在索引里占**两节**（3,232），VLAN 100 占一节 —— 只按「索引固定 7 节」解析的话，
+//     整段 VLAN 1000 会被安静丢掉，界面上就成了「这些地址没学到」。
+//   - 有一行只给了端口、没给状态 —— 状态栏缺项是真设备的常态，不能因此把整行丢掉。
+//   - dot1dBasePort 和 ifIndex 对不上（端口 1 是 ifIndex 5）。按「它们相等」猜的设备
+//     会把 GE1/0/1 报成 GE1/0/5，而人照着这个结论去拔线就出事。
+func bridgeEntries() map[string]snmptest.Value {
+	q := "1.3.6.1.2.1.17.7.1.2.2.1"
+	d := "1.3.6.1.2.1.17.4.3.1"
+	e := map[string]snmptest.Value{}
+	put := func(base, idx string, mac []byte, port int64, status int64) {
+		e[base+".2."+idx] = snmptest.Int(port)
+		if status > 0 {
+			e[base+".3."+idx] = snmptest.Int(status)
+		}
+	}
+	// VLAN 100（一节）：两台在端口 1，一台在端口 2
+	put(q, "100."+macIdx("aabbccddeeff"), mustMAC("aabbccddeeff"), 1, 3)
+	put(q, "100."+macIdx("aabbccddee01"), mustMAC("aabbccddee01"), 2, 3)
+	put(q, "100."+macIdx("aabbccddee02"), mustMAC("aabbccddee02"), 1, 3)
+	// VLAN 1000（两节：3,232 —— BER 整数按最少字节发，1000 = 0x03E8）
+	put(q, "3.232."+macIdx("001122334455"), mustMAC("001122334455"), 2, 3)
+	// 手工配死的一条
+	put(q, "100."+macIdx("998877665544"), mustMAC("998877665544"), 2, 5)
+	// 端口有、状态没给
+	e[q+".2.100."+macIdx("112233445566")] = snmptest.Int(2)
+	// BRIDGE-MIB 那张（不带 VLAN），同一台设备上也给一份
+	put(d, macIdx("aabbccddeeff"), mustMAC("aabbccddeeff"), 1, 3)
+
+	// 桥端口号 → ifIndex：★ 故意和端口号不相等
+	e["1.3.6.1.2.1.17.1.4.1.2.1"] = snmptest.Int(5)
+	e["1.3.6.1.2.1.17.1.4.1.2.2"] = snmptest.Int(6)
+	// ifTable / ifXTable：5 只有 ifName，6 两栏都有（老设备只有 ifDescr，这里反过来给）
+	e["1.3.6.1.2.1.31.1.1.1.1.5"] = snmptest.Str("GE1/0/1")
+	e["1.3.6.1.2.1.2.2.1.2.5"] = snmptest.Str("GigabitEthernet1/0/1")
+	e["1.3.6.1.2.1.31.1.1.1.1.6"] = snmptest.Str("GE1/0/2")
+	e["1.3.6.1.2.1.2.2.1.2.6"] = snmptest.Str("GigabitEthernet1/0/2")
+	return e
+}
+
+// macIdx 把 MAC 写成 OID 索引里那六节十进制（测试拼键用，和工具层同一套写法）。
+func macIdx(hex string) string {
+	b := mustMAC(hex)
+	parts := make([]string, len(b))
+	for i, x := range b {
+		parts[i] = strconv.FormatUint(uint64(x), 10)
+	}
+	return strings.Join(parts, ".")
+}
+
+func mustMAC(hex string) []byte {
+	b, err := hexBytes(hex)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// probeEntries 是「一台正常的现场交换机」：系统组 + 桥接组。
+func probeEntries() map[string]snmptest.Value {
+	e := sysEntries()
+	for k, v := range bridgeEntries() {
+		e[k] = v
+	}
+	return e
 }
 
 func snmpProbeRun(t *testing.T, args map[string]any) ots.Verdict {

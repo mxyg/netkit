@@ -24,7 +24,7 @@ import (
 func Register(r *ots.Registry) {
 	r.MustRegister(interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, neighborsTool, discoverTool,
 		dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
-		fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool)
+		fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool)
 	RegisterAddress(r)
 	RegisterDHCP(r)
 	RegisterRemote(r)
