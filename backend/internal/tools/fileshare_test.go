@@ -40,6 +40,34 @@ func fixShareRoutes(rs []netif.DefaultRoute, err error) func() {
 	return func() { fileshareRoutes = old }
 }
 
+// bindableAddr 本机此刻真实有的一个非回环 IPv4。
+//
+// ★ 只有「网卡列表」这一层能换，bind 是本机做的事：换成一个别处的地址，
+//
+//	规划那一步过了、到 bind 就 EADDRNOTAVAIL —— 测试于是跟着现场的 IP 走，
+//	换台机器、换个网段、甚至换个 wifi 都会红（红成「共享起不来」，看不出是测试的问题）。
+//	所以要现取一个本机地址；一台都没有的那台机器上这条跳过，而不是假装通过。
+func bindableAddr(t *testing.T) string {
+	t.Helper()
+	as, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("读不到本机地址：%v", err)
+	}
+	for _, a := range as {
+		p, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := p.IP.To4()
+		if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+			continue
+		}
+		return ip4.String()
+	}
+	t.Skip("这台机器上没有非回环的 IPv4 地址，这一块网卡无从绑起")
+	return ""
+}
+
 // upNIC 插着线、带这些地址的一块网卡。
 func upNIC(t *testing.T, name string, cidrs ...string) netif.NIC {
 	t.Helper()
@@ -980,7 +1008,9 @@ func Test状态刷新不丢开共享时那几行(t *testing.T) {
 	//   已经说不清这个口是默认路由那块还是别的，也就想不起要停。
 	shareReset(t)
 	shareJournal(t)
-	defer fixShareNICs([]netif.NIC{upNIC(t, "en0", "192.168.0.101/24")}, nil)()
+	// ★ 网卡列表能换，bind 换不掉：这里填的地址必须本机真有，
+	//   否则这条就跟着现场的 IP 走，换个网段红成「共享起不来」。
+	defer fixShareNICs([]netif.NIC{upNIC(t, "en0", bindableAddr(t)+"/24")}, nil)()
 	defer fixShareRoutes(nil, nil)()
 	dir := shareDir(t, map[string]string{"fw.bin": "abc", "id_rsa": "private"})
 
