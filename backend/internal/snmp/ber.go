@@ -86,11 +86,11 @@ func appendTLV(dst []byte, tag byte, content []byte) []byte {
 //
 // ★ 最少字节不是省流量：多写一个 0x00 前缀，个别实现比长度就比不过去。
 func appendInt(dst []byte, tag byte, v int64) []byte {
-	return appendTLV(dst, tag, intContent(v))
+	return appendTLV(dst, tag, IntContent(v))
 }
 
-// intContent 把一个有符号整数缩成最少字节的补码。
-func intContent(v int64) []byte {
+// IntContent 把一个有符号整数缩成最少字节的补码。
+func IntContent(v int64) []byte {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(v))
 	i := 0
@@ -106,13 +106,13 @@ func intContent(v int64) []byte {
 	return append([]byte(nil), buf[i:]...)
 }
 
-// uintContent 把一个无符号数写成最少字节。
+// UintContent 把一个无符号数写成最少字节。
 //
 // ★ 最高位是 1 时要补一个前导 0x00：Counter32 / Gauge32 / Counter64 / TimeTicks
 //
 //	在 BER 里仍按 INTEGER 编码，不补的话一个 42 亿字节的计数器会被读成负数 ——
 //	现场表现是「流量统计是负的」。
-func uintContent(v uint64) []byte {
+func UintContent(v uint64) []byte {
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], v)
 	i := 0

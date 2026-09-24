@@ -1,10 +1,16 @@
-package snmp
+package snmptest
 
-// 一个只用来做测试的"假交换机"：它按 MIB 的规矩答 GET/GETNEXT/GETBULK，
-// 并且故意留了几处真实设备的毛病（见下面每一条注释）。
+// 一台只用来做测试的假交换机：按 MIB 的规矩答 GET/GETNEXT/GETBULK，
+// 并且故意留了几处真实设备的毛病（每一个开关旁边都写了为什么留）。
+//
+// ★ 为什么单独成一个包，而不是留在 snmp 的 _test.go 里：
+//   tools 那一层要拿它当「现场那台交换机」，测的是 SNMP 之上的语义
+//   （MAC 表怎么拼、端口状态怎么判），而 _test.go 里的东西外面用不了。
+//   搬到这里之后，底座自己的测试和 tools 的测试共用同一台假设备 ——
+//   两台各写一遍，最容易错的那半正好测不出来。
 //
 // ★ 为什么不用第三方库测自己：那样两边错到一处就永远测不出来。
-//   这里除了自己写，另外在 interop_test.go 里拿系统自带的 Net-SNMP 客户端做互测。
+//   底座那侧另外有 interop 测试，拿系统自带的 Net-SNMP 客户端做互测。
 
 import (
 	"net"
@@ -12,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"net.yuhox.com/netkit/internal/snmp"
 )
 
 type fakeEntry struct {
@@ -20,8 +28,8 @@ type fakeEntry struct {
 	val []byte
 }
 
-// FakeDevice 是一台会答话的设备。
-type FakeDevice struct {
+// Device 是一台会答话的设备。
+type Device struct {
 	pc        *net.UDPConn
 	community string
 
@@ -37,22 +45,23 @@ type FakeDevice struct {
 	stuck        bool // GETNEXT 永远回同一个 OID（走不动的那种设备）
 	trapOnly     bool // 答非所问：回一条设备主动推的 trap
 
-	gotReqs int
-	seenIDs []int32
+	gotReqs   int
+	seenIDs   []int32
+	seenPorts []int // 这些请求是从本机哪几个源端口来的 —— 一条连接复用的证据
 }
 
-// StartFake 起一台假设备，返回它和地址（port 由系统挑）。
-func StartFake(t *testing.T, community string, entries map[string]Value) *FakeDevice {
+// Start 起一台假设备，返回它和地址（port 由系统挑）。
+func Start(t *testing.T, community string, entries map[string]Value) *Device {
 	t.Helper()
 	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &FakeDevice{pc: pc, community: community}
+	d := &Device{pc: pc, community: community}
 	for oid, v := range entries {
 		d.entries = append(d.entries, fakeEntry{oid: strings.TrimPrefix(oid, "."), tag: v.Tag, val: v.raw()})
 	}
-	sort.Slice(d.entries, func(i, j int) bool { return CmpOID(d.entries[i].oid, d.entries[j].oid) < 0 })
+	sort.Slice(d.entries, func(i, j int) bool { return snmp.CmpOID(d.entries[i].oid, d.entries[j].oid) < 0 })
 	go d.serve()
 	t.Cleanup(func() { _ = pc.Close() })
 	return d
@@ -71,24 +80,24 @@ type Value struct {
 
 // raw 编成报文里那串内容字节。
 //
-// ★ 走的是 intContent / uintContent —— 和真客户端拼请求同一份代码。
+// ★ 走的是 snmp.IntContent / snmp.UintContent —— 和真客户端拼请求同一份代码。
 //
 //	这里另写一遍 trim 逻辑的话，「两边各自错到一处」正好测不出来。
 func (v Value) raw() []byte {
 	switch v.Tag {
-	case TagOctetString, TagOpaque:
+	case snmp.TagOctetString, snmp.TagOpaque:
 		return []byte(v.S)
-	case TagInteger:
-		return intContent(v.N)
-	case TagCounter64, TagGauge32, TagCounter32, TagTimeTicks:
-		return uintContent(v.U)
-	case TagOID:
-		c, err := OIDContent(v.OID)
+	case snmp.TagInteger:
+		return snmp.IntContent(v.N)
+	case snmp.TagCounter64, snmp.TagGauge32, snmp.TagCounter32, snmp.TagTimeTicks:
+		return snmp.UintContent(v.U)
+	case snmp.TagOID:
+		c, err := snmp.OIDContent(v.OID)
 		if err != nil {
 			panic(err)
 		}
 		return c
-	case TagIPAddress:
+	case snmp.TagIPAddress:
 		ip := v.IP.To4()
 		if ip == nil {
 			panic("假设备只能填 IPv4 地址")
@@ -98,21 +107,21 @@ func (v Value) raw() []byte {
 	return append([]byte(nil), v.B...)
 }
 
-func Str(s string) Value      { return Value{Tag: TagOctetString, S: s} }
-func Int(n int64) Value       { return Value{Tag: TagInteger, N: n} }
-func Count(v uint64) Value    { return Value{Tag: TagCounter32, U: v} }
-func Count64(v uint64) Value  { return Value{Tag: TagCounter64, U: v} }
-func Gauge(v uint64) Value    { return Value{Tag: TagGauge32, U: v} }
-func Ticks(v uint64) Value    { return Value{Tag: TagTimeTicks, U: v} }
-func MAC(b []byte) Value      { return Value{Tag: TagOctetString, B: b} }
-func Addr(ip net.IP) Value    { return Value{Tag: TagIPAddress, IP: ip} }
-func Object(oid string) Value { return Value{Tag: TagOID, OID: oid} }
+func Str(s string) Value      { return Value{Tag: snmp.TagOctetString, S: s} }
+func Int(n int64) Value       { return Value{Tag: snmp.TagInteger, N: n} }
+func Count(v uint64) Value    { return Value{Tag: snmp.TagCounter32, U: v} }
+func Count64(v uint64) Value  { return Value{Tag: snmp.TagCounter64, U: v} }
+func Gauge(v uint64) Value    { return Value{Tag: snmp.TagGauge32, U: v} }
+func Ticks(v uint64) Value    { return Value{Tag: snmp.TagTimeTicks, U: v} }
+func MAC(b []byte) Value      { return Value{Tag: snmp.TagOctetString, B: b} }
+func Addr(ip net.IP) Value    { return Value{Tag: snmp.TagIPAddress, IP: ip} }
+func Object(oid string) Value { return Value{Tag: snmp.TagOID, OID: oid} }
 
-func (d *FakeDevice) Addr() string { return d.pc.LocalAddr().String() }
+func (d *Device) Addr() string { return d.pc.LocalAddr().String() }
 
-func (d *FakeDevice) Port() int { return d.pc.LocalAddr().(*net.UDPAddr).Port }
+func (d *Device) Port() int { return d.pc.LocalAddr().(*net.UDPAddr).Port }
 
-func (d *FakeDevice) Reqs() int {
+func (d *Device) Reqs() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.gotReqs
@@ -124,13 +133,13 @@ func (d *FakeDevice) Reqs() int {
 //
 //	最高位给了 1，设备按补码读回是负数，跟我们记的对不上，
 //	表现成「每次请求都超时」，是这一层最难查的一种。
-func (d *FakeDevice) IDs() []int32 {
+func (d *Device) IDs() []int32 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return append([]int32(nil), d.seenIDs...)
 }
 
-func (d *FakeDevice) serve() {
+func (d *Device) serve() {
 	buf := make([]byte, 2000)
 	for {
 		n, peer, err := d.pc.ReadFromUDP(buf)
@@ -141,14 +150,25 @@ func (d *FakeDevice) serve() {
 	}
 }
 
-func (d *FakeDevice) handle(b []byte, peer *net.UDPAddr) {
-	req, err := Parse(b)
+func (d *Device) handle(b []byte, peer *net.UDPAddr) {
+	req, err := snmp.Parse(b)
 	if err != nil {
 		return
 	}
 	d.mu.Lock()
 	d.gotReqs++
 	d.seenIDs = append(d.seenIDs, req.ID)
+	if peer.Port != 0 {
+		seen := false
+		for _, p := range d.seenPorts {
+			if p == peer.Port {
+				seen = true
+			}
+		}
+		if !seen {
+			d.seenPorts = append(d.seenPorts, peer.Port)
+		}
+	}
 	drop := d.dropReqs > 0
 	if drop {
 		d.dropReqs--
@@ -160,19 +180,19 @@ func (d *FakeDevice) handle(b []byte, peer *net.UDPAddr) {
 
 	// ★ 团体名不对时**不答**，不是答一句「不许读」：v2c 的常见实现就是这么装的，
 	//   而这条决定了界面上那句「没回话」要同时怀疑防火墙和团体名。
-	if drop || !communityOK || (v1Only && req.Version != Version1) {
+	if drop || !communityOK || (v1Only && req.Version != snmp.Version1) {
 		return
 	}
-	resp := Packet{
+	resp := snmp.Packet{
 		Version:   req.Version,
 		Community: d.community,
-		PDU:       PDUGetResponse,
+		PDU:       snmp.PDUGetResponse,
 		ID:        req.ID,
 	}
 	if trapOnly {
 		// ★ 答非所问：设备上配了往我们这台推 trap，于是我们问一句它回一条告警。
 		//   这不是回话，但它是「设备活着、SNMP 开着」的证据 —— 两件事要分开说。
-		resp.PDU = PDUTrapV2
+		resp.PDU = snmp.PDUTrapV2
 	}
 	if wrongID {
 		// ★ 真毛病：回包标识对不上。客户端认了它，就是把别人的答案当成这次的。
@@ -180,11 +200,11 @@ func (d *FakeDevice) handle(b []byte, peer *net.UDPAddr) {
 		resp.ID = req.ID ^ int32(0x4000)
 	}
 	switch req.PDU {
-	case PDUGetRequest:
+	case snmp.PDUGetRequest:
 		resp.VarBinds, resp.ErrStatus, resp.ErrIndex = d.getBy(req.VarBinds, req.Version)
-	case PDUGetNextRequest:
+	case snmp.PDUGetNextRequest:
 		resp.VarBinds, resp.ErrStatus, resp.ErrIndex = d.getNext(req.VarBinds, req.Version, stuck)
-	case PDUGetBulkRequest:
+	case snmp.PDUGetBulkRequest:
 		if noBulk {
 			resp.ErrStatus = 1 // tooBig
 			resp.VarBinds = req.VarBinds
@@ -204,22 +224,22 @@ func (d *FakeDevice) handle(b []byte, peer *net.UDPAddr) {
 	_, _ = d.pc.WriteTo(out, peer)
 }
 
-func (d *FakeDevice) lookup(oid string) (fakeEntry, bool) {
+func (d *Device) lookup(oid string) (fakeEntry, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, e := range d.entries {
-		if CmpOID(e.oid, oid) == 0 {
+		if snmp.CmpOID(e.oid, oid) == 0 {
 			return e, true
 		}
 	}
 	return fakeEntry{}, false
 }
 
-func (d *FakeDevice) next(oid string) (fakeEntry, bool) {
+func (d *Device) next(oid string) (fakeEntry, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, e := range d.entries {
-		if CmpOID(e.oid, oid) > 0 {
+		if snmp.CmpOID(e.oid, oid) > 0 {
 			return e, true
 		}
 	}
@@ -229,51 +249,51 @@ func (d *FakeDevice) next(oid string) (fakeEntry, bool) {
 // getBy 精确取值：v2c 对「没有的这一栏」回 noSuchInstance，
 // v1 是整个报文作废 —— error-status=noSuchName，error-index 指出第几栏。
 // 两种写法都得留着，因为界面上「这台设备没有这一栏」和「这台只认 v1」是两件事。
-func (d *FakeDevice) getBy(binds []VarBind, version int) ([]VarBind, int, int) {
-	out := make([]VarBind, 0, len(binds))
+func (d *Device) getBy(binds []snmp.VarBind, version int) ([]snmp.VarBind, int, int) {
+	out := make([]snmp.VarBind, 0, len(binds))
 	for i, b := range binds {
 		if e, ok := d.lookup(b.OID); ok {
-			out = append(out, VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
+			out = append(out, snmp.VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
 			continue
 		}
-		if version == Version1 {
-			return append([]VarBind(nil), binds...), 2, i + 1
+		if version == snmp.Version1 {
+			return append([]snmp.VarBind(nil), binds...), 2, i + 1
 		}
-		out = append(out, VarBind{OID: b.OID, Tag: TagNoSuchInstance})
+		out = append(out, snmp.VarBind{OID: b.OID, Tag: snmp.TagNoSuchInstance})
 	}
 	return out, 0, 0
 }
 
-func (d *FakeDevice) getNext(binds []VarBind, version int, stuck bool) ([]VarBind, int, int) {
-	out := make([]VarBind, 0, len(binds))
+func (d *Device) getNext(binds []snmp.VarBind, version int, stuck bool) ([]snmp.VarBind, int, int) {
+	out := make([]snmp.VarBind, 0, len(binds))
 	for i, b := range binds {
 		if stuck {
 			// ★ 真毛病：回的还是问的那一栏。不查这一条的话 walk 就是一个死循环，
 			//   而现场看到的是「程序卡住」，不是「这台设备走不动」。
-			out = append(out, VarBind{OID: b.OID, Tag: TagInteger, Val: intContent(1)})
+			out = append(out, snmp.VarBind{OID: b.OID, Tag: snmp.TagInteger, Val: snmp.IntContent(1)})
 			continue
 		}
 		e, ok := d.next(b.OID)
 		if !ok {
-			if version == Version1 {
-				return append([]VarBind(nil), binds...), 2, i + 1
+			if version == snmp.Version1 {
+				return append([]snmp.VarBind(nil), binds...), 2, i + 1
 			}
 			if d.leaky() {
 				// ★ 真实毛病：有的实现走到树末尾时不给异常值，直接把 .0 那一栏之外的
 				//   下一棵子树递过来。只认 endOfMibView 的 walk 会一路读到整张 MIB。
-				out = append(out, VarBind{OID: "1.3.6.1.2.1.99.1", Tag: TagInteger, Val: intContent(1)})
+				out = append(out, snmp.VarBind{OID: "1.3.6.1.2.1.99.1", Tag: snmp.TagInteger, Val: snmp.IntContent(1)})
 				continue
 			}
-			out = append(out, VarBind{OID: b.OID, Tag: TagEndOfMibView})
+			out = append(out, snmp.VarBind{OID: b.OID, Tag: snmp.TagEndOfMibView})
 			continue
 		}
-		out = append(out, VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
+		out = append(out, snmp.VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
 	}
 	return out, 0, 0
 }
 
 // getBulk 按 non-repeaters / max-repetitions 展开。
-func (d *FakeDevice) getBulk(req Packet, stuck bool) []VarBind {
+func (d *Device) getBulk(req snmp.Packet, stuck bool) []snmp.VarBind {
 	nr, mr := req.ErrStatus, req.ErrIndex
 	if nr > len(req.VarBinds) {
 		nr = len(req.VarBinds)
@@ -285,36 +305,36 @@ func (d *FakeDevice) getBulk(req Packet, stuck bool) []VarBind {
 		mr = 100
 	}
 	if stuck {
-		var out []VarBind
+		var out []snmp.VarBind
 		for _, b := range req.VarBinds {
-			out = append(out, VarBind{OID: b.OID, Tag: TagInteger, Val: intContent(1)})
+			out = append(out, snmp.VarBind{OID: b.OID, Tag: snmp.TagInteger, Val: snmp.IntContent(1)})
 		}
 		return out
 	}
-	var out []VarBind
+	var out []snmp.VarBind
 	for _, b := range req.VarBinds[:nr] {
 		if e, ok := d.next(b.OID); ok {
-			out = append(out, VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
+			out = append(out, snmp.VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
 		} else {
-			out = append(out, VarBind{OID: b.OID, Tag: TagEndOfMibView})
+			out = append(out, snmp.VarBind{OID: b.OID, Tag: snmp.TagEndOfMibView})
 		}
 	}
 	cols := req.VarBinds[nr:]
 	if len(cols) == 0 {
 		return out
 	}
-	cur := append([]VarBind(nil), cols...)
+	cur := append([]snmp.VarBind(nil), cols...)
 	for i := 0; i < mr; i++ {
 		done := true
-		var nxt []VarBind
+		var nxt []snmp.VarBind
 		for _, c := range cur {
 			e, ok := d.next(c.OID)
 			if !ok {
-				nxt = append(nxt, VarBind{OID: c.OID, Tag: TagEndOfMibView})
+				nxt = append(nxt, snmp.VarBind{OID: c.OID, Tag: snmp.TagEndOfMibView})
 				continue
 			}
 			done = false
-			nxt = append(nxt, VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
+			nxt = append(nxt, snmp.VarBind{OID: e.oid, Tag: e.tag, Val: e.val})
 		}
 		out = append(out, nxt...)
 		cur = nxt
@@ -325,56 +345,68 @@ func (d *FakeDevice) getBulk(req Packet, stuck bool) []VarBind {
 	return out
 }
 
-func (d *FakeDevice) leaky() bool {
+func (d *Device) leaky() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.ignorePrefix
 }
 
+// Ports 返回这台设备见过的源端口，按第一次出现的顺序。
+//
+// ★ 一个客户端问了好几次，这里就只能有一个号：
+//
+//	每次重新拨号的话源端口会变，设备的会话表会把我们登记成一堆新管理器。
+//	这一条从外面看（测试里读不到私有字段），所以在这里记下来。
+func (d *Device) Ports() []int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]int(nil), d.seenPorts...)
+}
+
 // SetDropNext 让后面 N 个请求不答（测重传）。
-func (d *FakeDevice) SetDropNext(n int) {
+func (d *Device) SetDropNext(n int) {
 	d.mu.Lock()
 	d.dropReqs = n
 	d.mu.Unlock()
 }
 
 // SetNoBulk 让这台设备对 GETBULK 回 tooBig（测 walk 退回 GETNEXT）。
-func (d *FakeDevice) SetNoBulk(v bool) {
+func (d *Device) SetNoBulk(v bool) {
 	d.mu.Lock()
 	d.noBulk = v
 	d.mu.Unlock()
 }
 
 // SetLeaky 让这台设备走到树末尾时把别的子树递过来（测 walk 的收口条件）。
-func (d *FakeDevice) SetLeaky(v bool) {
+func (d *Device) SetLeaky(v bool) {
 	d.mu.Lock()
 	d.ignorePrefix = v
 	d.mu.Unlock()
 }
 
 // SetV1Only 让这台设备只答 v1（测版本那条）。
-func (d *FakeDevice) SetV1Only(v bool) {
+func (d *Device) SetV1Only(v bool) {
 	d.mu.Lock()
 	d.v1Only = v
 	d.mu.Unlock()
 }
 
 // SetWrongID 让这台设备回话时把请求标识写错（测「认了别人的答案」）。
-func (d *FakeDevice) SetWrongID(v bool) {
+func (d *Device) SetWrongID(v bool) {
 	d.mu.Lock()
 	d.replyWrongID = v
 	d.mu.Unlock()
 }
 
 // SetStuck 让这台设备对 GETNEXT/GETBULK 永远回同一栏（测 walk 的死循环兜底）。
-func (d *FakeDevice) SetStuck(v bool) {
+func (d *Device) SetStuck(v bool) {
 	d.mu.Lock()
 	d.stuck = v
 	d.mu.Unlock()
 }
 
 // SetTrapOnly 让这台设备问一句回一条 trap（测「有回包但不是答案」那句话）。
-func (d *FakeDevice) SetTrapOnly(v bool) {
+func (d *Device) SetTrapOnly(v bool) {
 	d.mu.Lock()
 	d.trapOnly = v
 	d.mu.Unlock()

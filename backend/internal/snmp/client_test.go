@@ -1,9 +1,11 @@
-package snmp
+package snmp_test
 
 import (
 	"context"
 	"errors"
 	"net"
+	"net.yuhox.com/netkit/internal/snmp"
+	"net.yuhox.com/netkit/internal/snmp/snmptest"
 	"strings"
 	"testing"
 	"time"
@@ -14,30 +16,30 @@ import (
 // ★ 填的是真 MIB 的 OID，不是随手编号 —— 这一层的意义就在于
 //
 //	「按编号顺序走树」，编号编错了测不出 walk 的毛病。
-func testMIB() map[string]Value {
-	return map[string]Value{
-		"1.3.6.1.2.1.1.1.0":        Str("H3C S5560-28C-EI, Release 2432"),
-		"1.3.6.1.2.1.1.3.0":        Ticks(98765432),
-		"1.3.6.1.2.1.1.5.0":        Str("core-switch-01"),
-		"1.3.6.1.2.1.2.1.0":        Int(3),
-		"1.3.6.1.2.1.2.2.1.1.1":    Int(1),
-		"1.3.6.1.2.1.2.2.1.1.2":    Int(2),
-		"1.3.6.1.2.1.2.2.1.2.1":    Str("GigabitEthernet1/0/1"),
-		"1.3.6.1.2.1.2.2.1.2.2":    Str("GigabitEthernet1/0/2"),
-		"1.3.6.1.2.1.2.2.1.8.1":    Int(1), // up
-		"1.3.6.1.2.1.2.2.1.8.2":    Int(2), // down
-		"1.3.6.1.2.1.31.1.1.1.6.1": Count64(1234567890123),
-		"1.3.6.1.2.1.15.3.1.2.1":   Addr(net.IPv4(192, 168, 1, 10)),
+func testMIB() map[string]snmptest.Value {
+	return map[string]snmptest.Value{
+		"1.3.6.1.2.1.1.1.0":        snmptest.Str("H3C S5560-28C-EI, Release 2432"),
+		"1.3.6.1.2.1.1.3.0":        snmptest.Ticks(98765432),
+		"1.3.6.1.2.1.1.5.0":        snmptest.Str("core-switch-01"),
+		"1.3.6.1.2.1.2.1.0":        snmptest.Int(3),
+		"1.3.6.1.2.1.2.2.1.1.1":    snmptest.Int(1),
+		"1.3.6.1.2.1.2.2.1.1.2":    snmptest.Int(2),
+		"1.3.6.1.2.1.2.2.1.2.1":    snmptest.Str("GigabitEthernet1/0/1"),
+		"1.3.6.1.2.1.2.2.1.2.2":    snmptest.Str("GigabitEthernet1/0/2"),
+		"1.3.6.1.2.1.2.2.1.8.1":    snmptest.Int(1), // up
+		"1.3.6.1.2.1.2.2.1.8.2":    snmptest.Int(2), // down
+		"1.3.6.1.2.1.31.1.1.1.6.1": snmptest.Count64(1234567890123),
+		"1.3.6.1.2.1.15.3.1.2.1":   snmptest.Addr(net.IPv4(192, 168, 1, 10)),
 	}
 }
 
-func testDevice(t *testing.T) *FakeDevice {
+func testDevice(t *testing.T) *snmptest.Device {
 	t.Helper()
-	return StartFake(t, "public", testMIB())
+	return snmptest.Start(t, "public", testMIB())
 }
 
-func clientTo(d *FakeDevice) *Client {
-	return &Client{
+func clientTo(d *snmptest.Device) *snmp.Client {
+	return &snmp.Client{
 		Addr:      d.Addr(),
 		Community: "public",
 		Timeout:   150 * time.Millisecond,
@@ -45,7 +47,7 @@ func clientTo(d *FakeDevice) *Client {
 	}
 }
 
-func opened(t *testing.T, d *FakeDevice) *Client {
+func opened(t *testing.T, d *snmptest.Device) *snmp.Client {
 	t.Helper()
 	c := clientTo(d)
 	t.Cleanup(func() { _ = c.Close() })
@@ -135,12 +137,12 @@ func Test没有这一栏时v1和v2c的说法分开处理(t *testing.T) {
 	d := testDevice(t)
 	d.SetV1Only(true)
 	v1 := clientTo(d)
-	v1.Version = V1
+	v1.Version = snmp.V1
 	defer v1.Close()
 	if _, err := v1.GetOne(ctx(t), missing); err == nil {
 		t.Error("v1 问一栏没有的却没报错（设备是整个报文作废的）")
 	} else {
-		var e *Error
+		var e *snmp.Error
 		if !errors.As(err, &e) || e.Status != 2 {
 			t.Errorf("v1 报的不是 noSuchName：%v", err)
 		} else if !strings.Contains(e.Error(), "不给读") {
@@ -174,7 +176,7 @@ func Test标识对不上时不许把别人的答案当自己的(t *testing.T) {
 	d := testDevice(t)
 	d.SetWrongID(true)
 	_, err := opened(t, d).GetOne(ctx(t), "1.3.6.1.2.1.1.5.0")
-	if !errors.Is(err, ErrNoReply) {
+	if !errors.Is(err, snmp.ErrNoReply) {
 		t.Fatalf("认了对不上号的回包：%v", err)
 	}
 	// ★ 但也不能光说「没回话」：这台设备其实是**答了**的。
@@ -190,7 +192,7 @@ func Test设备回trap时不能算成没开SNMP(t *testing.T) {
 	d := testDevice(t)
 	d.SetTrapOnly(true)
 	_, err := opened(t, d).GetOne(ctx(t), "1.3.6.1.2.1.1.5.0")
-	if !errors.Is(err, ErrNoReply) {
+	if !errors.Is(err, snmp.ErrNoReply) {
 		t.Fatalf("trap 被当成答案了：%v", err)
 	}
 	if !strings.Contains(err.Error(), "不是响应报文") {
@@ -221,14 +223,14 @@ func Test回包不是那台设备答的一律不算(t *testing.T) {
 		if err != nil {
 			return
 		}
-		req, err := Parse(buf[:n])
+		req, err := snmp.Parse(buf[:n])
 		if err != nil {
 			return
 		}
 		close(replied)
-		resp := Packet{
-			Version: Version2c, Community: "public", PDU: PDUGetResponse, ID: req.ID,
-			VarBinds: []VarBind{{OID: "1.3.6.1.2.1.1.5.0", Tag: TagOctetString, Val: []byte("冒充的")}},
+		resp := snmp.Packet{
+			Version: snmp.Version2c, Community: "public", PDU: snmp.PDUGetResponse, ID: req.ID,
+			VarBinds: []snmp.VarBind{{OID: "1.3.6.1.2.1.1.5.0", Tag: snmp.TagOctetString, Val: []byte("冒充的")}},
 		}
 		out, err := resp.Marshal()
 		if err == nil {
@@ -236,11 +238,11 @@ func Test回包不是那台设备答的一律不算(t *testing.T) {
 		}
 	}()
 
-	c := &Client{Addr: target.LocalAddr().String(), Community: "public",
+	c := &snmp.Client{Addr: target.LocalAddr().String(), Community: "public",
 		Timeout: 150 * time.Millisecond, Retries: 0}
 	defer c.Close()
 	_, err = c.GetOne(ctx(t), "1.3.6.1.2.1.1.5.0")
-	if !errors.Is(err, ErrNoReply) {
+	if !errors.Is(err, snmp.ErrNoReply) {
 		t.Fatalf("冒充的回包被认下了：%v", err)
 	}
 	if strings.Contains(err.Error(), "冒充") {
@@ -336,7 +338,7 @@ func Test设备把树外的子树递过来时walk要收口(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, v := range vs {
-		if !OIDUnder(v.OID, "1.3.6.1.2.1.2.2.1") {
+		if !snmp.OIDUnder(v.OID, "1.3.6.1.2.1.2.2.1") {
 			t.Errorf("树外的一栏被收了进来：%s", v.OID)
 		}
 	}
@@ -371,7 +373,7 @@ func Test只认v1的设备也能把表走完(t *testing.T) {
 	d := testDevice(t)
 	d.SetV1Only(true)
 	c := clientTo(d)
-	c.Version = V1
+	c.Version = snmp.V1
 	defer c.Close()
 	vs, err := c.Walk(ctx(t), "1.3.6.1.2.1.2.2.1")
 	if err != nil {
@@ -410,11 +412,11 @@ func Test前缀给空时不许去读整张MIB(t *testing.T) {
 func Test没写端口时按161发并且把地址报全(t *testing.T) {
 	// 设备的 SNMP 很多写死 161，界面上只让填 IP。
 	// 报错时必须把「实际发去了 161」写出来，否则人以为端口是别的地方配错了。
-	c := &Client{Addr: "127.0.0.1", Community: "public",
+	c := &snmp.Client{Addr: "127.0.0.1", Community: "public",
 		Timeout: 60 * time.Millisecond, Retries: 0}
 	defer c.Close()
 	_, err := c.GetOne(ctx(t), "1.3.6.1.2.1.1.5.0")
-	if !errors.Is(err, ErrNoReply) {
+	if !errors.Is(err, snmp.ErrNoReply) {
 		t.Fatalf("没人应答时报的是：%v", err)
 	}
 	if !strings.Contains(err.Error(), "127.0.0.1:161") {
@@ -521,12 +523,15 @@ func Test一个客户端连着问不同形状的表(t *testing.T) {
 	if _, err := c.Get(ctx(t), "1.3.6.1.2.1.2.2.1.8.1", "1.3.6.1.2.1.2.2.1.8.2"); err != nil {
 		t.Fatal(err)
 	}
-	if c.conn == nil {
-		t.Error("每次问话都重拨了一条连接")
+	// ★ 这里问的是「设备那边看到的源端口有几个」，不是私有字段。
+	//   读 c.conn 只能证明「它存了一条连接」，证明不了没在每次问话时重拨 ——
+	//   而现场在意的正是源端口变没变。
+	if got := len(d.Ports()); got != 1 {
+		t.Errorf("设备看到了 %d 个源端口，要 1（每次问话都重拨了一条连接）", got)
 	}
 }
 
-func oidsOf(vs []VarBind) []string {
+func oidsOf(vs []snmp.VarBind) []string {
 	out := make([]string, 0, len(vs))
 	for _, v := range vs {
 		out = append(out, v.OID)

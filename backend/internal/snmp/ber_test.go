@@ -35,7 +35,7 @@ func Test整数按最少字节的补码编(t *testing.T) {
 		{math.MinInt64, "8000000000000000"},
 	}
 	for _, c := range cases {
-		got := intContent(c.v)
+		got := IntContent(c.v)
 		if hex.EncodeToString(got) != c.want {
 			t.Errorf("%d 编成了 %s，要 %s", c.v, hex.EncodeToString(got), c.want)
 		}
@@ -68,7 +68,7 @@ func Test无符号域高位置一时补前导零(t *testing.T) {
 		{18446744073709551615, "00ffffffffffffffff"},
 	}
 	for _, c := range cases {
-		got := uintContent(c.v)
+		got := UintContent(c.v)
 		if hex.EncodeToString(got) != c.want {
 			t.Errorf("%d 编成了 %s，要 %s", c.v, hex.EncodeToString(got), c.want)
 		}
@@ -82,7 +82,7 @@ func Test无符号域高位置一时补前导零(t *testing.T) {
 		}
 	}
 	// 补零这件事只针对无符号：有符号那边同一个号是 -1，不许被补成 00ff。
-	if hex.EncodeToString(intContent(-1)) != "ff" {
+	if hex.EncodeToString(IntContent(-1)) != "ff" {
 		t.Error("有符号的 -1 被动过了")
 	}
 }

@@ -1,7 +1,8 @@
-package snmp
+package snmp_test
 
 import (
 	"net"
+	"net.yuhox.com/netkit/internal/snmp/snmptest"
 	"os/exec"
 	"strings"
 	"testing"
@@ -39,12 +40,12 @@ func TestNetSNMP肯认我们拼的回包(t *testing.T) {
 	// 一台设备的 sysDescr / 计数器 / IP 地址 / 运行时长，四种类型各一栏。
 	// 对面按类型读出来的值必须和填进去的一模一样 —— 类型标签或补零错一位，
 	// 这里就会读到 "Wrong Type" 或者一个差了符号的数。
-	d := StartFake(t, "public", map[string]Value{
-		"1.3.6.1.2.1.1.1.0":        Str("H3C S5560-28C-EI, Release 2432"),
-		"1.3.6.1.2.1.1.3.0":        Ticks(98765432),
-		"1.3.6.1.2.1.15.3.1.2.1":   Addr(net.ParseIP("192.168.1.10")),
-		"1.3.6.1.2.1.31.1.1.1.6.1": Count64(1234567890123),
-		"1.3.6.1.2.1.2.2.1.8.1":    Int(1),
+	d := snmptest.Start(t, "public", map[string]snmptest.Value{
+		"1.3.6.1.2.1.1.1.0":        snmptest.Str("H3C S5560-28C-EI, Release 2432"),
+		"1.3.6.1.2.1.1.3.0":        snmptest.Ticks(98765432),
+		"1.3.6.1.2.1.15.3.1.2.1":   snmptest.Addr(net.ParseIP("192.168.1.10")),
+		"1.3.6.1.2.1.31.1.1.1.6.1": snmptest.Count64(1234567890123),
+		"1.3.6.1.2.1.2.2.1.8.1":    snmptest.Int(1),
 	})
 	bin := snmpTool(t, "snmpget")
 	target := d.Addr()
@@ -69,9 +70,9 @@ func TestNetSNMP肯认我们拼的回包(t *testing.T) {
 func TestNetSNMP用v1也能读到我们(t *testing.T) {
 	// 老交换机只认 v1，这一档的回包格式又不完全一样（没有 noSuchInstance 那些）。
 	// 这一条只验「对面认我们的包」，异常值那套留在客户端侧测。
-	d := StartFake(t, "public", map[string]Value{
-		"1.3.6.1.2.1.1.1.0": Str("old-catalyst 2950"),
-		"1.3.6.1.2.1.1.3.0": Ticks(1000),
+	d := snmptest.Start(t, "public", map[string]snmptest.Value{
+		"1.3.6.1.2.1.1.1.0": snmptest.Str("old-catalyst 2950"),
+		"1.3.6.1.2.1.1.3.0": snmptest.Ticks(1000),
 	})
 	got := runSNMP(t, snmpTool(t, "snmpget"), "1", d.Addr(), ".1.3.6.1.2.1.1.1.0")
 	if !strings.Contains(got, "STRING: old-catalyst 2950") {
@@ -105,7 +106,7 @@ func TestNetSNMP走我们的树能收口(t *testing.T) {
 func Test团体名不对时NetSNMP也拿不到东西(t *testing.T) {
 	// 这一条是对「团体名错了不答」那个设计的旁证：真设备就是这么干的，
 	// 所以界面上「没回话」必须同时怀疑团体名，而不是只怀疑防火墙。
-	d := StartFake(t, "secret", map[string]Value{"1.3.6.1.2.1.1.1.0": Str("not-for-you")})
+	d := snmptest.Start(t, "secret", map[string]snmptest.Value{"1.3.6.1.2.1.1.1.0": snmptest.Str("not-for-you")})
 	bin := snmpTool(t, "snmpget")
 	cmd := exec.Command(bin, "-v", "2c", "-On", "-c", "public", "-t", "1", "-r", "0",
 		d.Addr(), ".1.3.6.1.2.1.1.1.0")
@@ -121,7 +122,7 @@ func Test团体名不对时NetSNMP也拿不到东西(t *testing.T) {
 func Test正确的团体名读得到(t *testing.T) {
 	// 上一条的对照：同一台设备、换一个团体名就读得到 —— 证明失败是因为团体名，
 	// 不是因为测试本身跑不通。
-	d := StartFake(t, "secret", map[string]Value{"1.3.6.1.2.1.1.1.0": Str("got-it")})
+	d := snmptest.Start(t, "secret", map[string]snmptest.Value{"1.3.6.1.2.1.1.1.0": snmptest.Str("got-it")})
 	bin := snmpTool(t, "snmpget")
 	out, err := exec.Command(bin, "-v", "2c", "-c", "secret", "-On", "-t", "2", "-r", "1",
 		d.Addr(), ".1.3.6.1.2.1.1.1.0").CombinedOutput()

@@ -142,12 +142,12 @@ func Test响应里的每一种值都按自己的类型读(t *testing.T) {
 		Version: Version2c, Community: "public", PDU: PDUGetResponse, ID: 7,
 		VarBinds: []VarBind{
 			{OID: "1.3.6.1.2.1.1.1.0", Tag: TagOctetString, Val: []byte("H3C S5560")},
-			{OID: "1.3.6.1.2.1.1.3.0", Tag: TagTimeTicks, Val: uintContent(123456)},
+			{OID: "1.3.6.1.2.1.1.3.0", Tag: TagTimeTicks, Val: UintContent(123456)},
 			{OID: "1.3.6.1.2.1.2.2.1.6.1", Tag: TagOctetString, Val: []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}},
 			{OID: "1.3.6.1.2.1.4.20.1.1", Tag: TagIPAddress, Val: []byte{192, 168, 1, 10}},
 			{OID: "1.3.6.1.2.1.1.2.0", Tag: TagOID, Val: mustContent(t, "1.3.6.1.4.1.25506.1.516")},
-			{OID: "1.3.6.1.2.1.2.2.1.8.1", Tag: TagInteger, Val: intContent(1)},
-			{OID: "1.3.6.1.2.1.31.1.1.1.6.1", Tag: TagCounter64, Val: uintContent(9999999999)},
+			{OID: "1.3.6.1.2.1.2.2.1.8.1", Tag: TagInteger, Val: IntContent(1)},
+			{OID: "1.3.6.1.2.1.31.1.1.1.6.1", Tag: TagCounter64, Val: UintContent(9999999999)},
 		},
 	}
 	b, err := resp.Marshal()
