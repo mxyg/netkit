@@ -2729,10 +2729,370 @@ function snmpPortsCard() {
   return card;
 }
 
+/*
+ * ── PoE 供电（net.snmp.poe）──
+ *
+ * ★★ 这一张卡买的是「到底谁不给电」。RFC 3621 把供电分成三层：整台的电源池、
+ *   这个口允不允许（adminEnable）、这个口现在在不在供（detectionStatus）。
+ *   三层的下一步完全相反（查电源模块 / 去设备上开回来 / 查线和对端设备），
+ *   所以这里三样分开摆，绝不合成一栏「供电正常/不正常」。
+ * ★ 这一棵树给不出「某个口用了几瓦」—— 只有整台的实测值。不许在界面上造一个每口功率。
+ * ★ 判定文案只写「这一格该看什么」，下一步的整句话是后端 note 的事，这里不再拼一遍。
+ */
+const SNMP_POE_CODE = {
+  'snmp-ok': ['读到了', 'ok',
+    '电源池和口的状态都读回来了。★ 整张表里有口「在检测」不是故障清单：没插受电设备的空口本来就该在检测。'
+    + '要判断某一个口，把组号口号（或 ifIndex）填进去点名再问一次。'],
+  'snmp-poe-pse-fault': ['整台的 PoE 电源报故障', 'bad',
+    '电源池自己报了 faulty —— 这是电源模块、整机供电的事，不是哪一根线、也不是哪个口的配置。'
+    + '★ 这一条压过下面每一行的状态：池子塌了的时候口那一栏写什么都不是那个口的事。'],
+  'snmp-poe-off': ['这台的 PoE 电源总开关是关着的', 'bad',
+    '整台的电源池 oper=off —— 逐个口去看「有没有供电」是白跑，每一个都只会是「没在供」。'
+    + '先确认这是不是有人有意关掉的（本工具只读，不会开回来）。'],
+  'snmp-poe-budget': ['PoE 余量紧了', 'warn',
+    '这一档说的是「下一个插上来的设备可能被拒绝」，不是「现在哪个口坏了」。'
+    + '两条路：按优先级把不重要的口排开（预算不够时设备先断优先级低的那几个），或者减掉一些负载。'],
+  'snmp-poe-disabled': ['这个口没在供电', 'warn',
+    '★ 先看上面「允不允许」那一格：被人关着的和这台自己不供，下一步完全不一样。'],
+  'snmp-poe-searching': ['在检测、没供上电', 'warn',
+    '检测状态卡在 searching：没插东西、插上来的东西签名不合规、或者它要的电超了这台给的档。'
+    + '★ 把「读两遍之间等几秒」填上再问一次，看「签名不合规」「要电被拒」这两个计数器涨不涨 —— 涨着的那一种才要动手。'],
+  'snmp-poe-fault': ['这个口自己报故障', 'bad',
+    '口的 detectionStatus 报 fault / otherFault —— 是这一个口（或它下面那根线、那个设备）的事，'
+    + '不是电源池的事。先把这个口的线和对端换一次试试，再看「过载」「短路」两个计数器。'],
+  'snmp-poe-not-found': ['没有点名的那一行', 'warn',
+    '★ 先分清是哪一种：按「组号 + 口号」直取时只问了那一行，本结果没走整张表；'
+    + '走表筛过、而且表读全了，才是这台真没有这一行。'
+    + '堆叠设备上每一箱都有自己的 5 号口 —— 不填组号时它跟面板上的第 5 口不是一回事。'],
+  'snmp-not-walked': ['PoE 表没读全，下不了结论', 'warn',
+    '读到「最多列几个」那一档就停了，后面还有什么谁都不知道 —— 此刻「没有这一行」和'
+    + '「其余口都还好」这两句都不成立。把限量提到能盖住整张表再问一次。'],
+  'snmp-no-data': ['这台没给出 PoE 表', 'warn',
+    '设备答了话（团体名是对的），只是 PoE 那棵子树没给出认行用的那一栏。三种下一步相反：'
+    + '它不是供电端（不支持 PoE 的交换机、以及受电设备本来就没有这棵树）、这一棵被藏进了别的视图、'
+    + '或者它只给了别的栏 —— 下面那句会写明它给了哪几栏。'],
+};
+
+// 整张表里报错 ≠ 点名的那一个口报错：顶上一格说错了范围，人就照着去查一个口。
+const POE_FAULT_LISTING = ['表里有口在报故障', 'bad',
+  '口这一栏报 fault / otherFault —— 是那几个口（或它们下面的线、对端设备）的事，不是电源池的事。'
+  + '★ 逐个口把线重做一遍，再看「过载」「短路」两个计数器是不是在涨；整张表读回来了才有这一句。'];
+
+const POE_STATUS = {
+  disabled: ['没在供', 'warn'],
+  searching: ['在检测', 'warn'],
+  deliveringPower: ['在供电', 'ok'],
+  fault: ['报故障', 'bad'],
+  test: ['测试中', 'warn'],
+  otherFault: ['报故障', 'bad'],
+};
+
+// 「没在供」这一颗顶栏必须跟着 admin 那一格走：后端把「有人关了」和「这台自己不供」
+// 归到同一个码里，可前者的下一步是去设备上开回来、后者是去看电源池预算。
+const POE_DISABLED_HINT = {
+  disabled: ['这个口的供电被人关着', 'warn',
+    'adminEnable=false —— 有人在设备上把这个口的 PoE 关掉了，不是故障，照着「查线」跑一趟是白跑。'],
+  enabled: ['允许供电，可这台自己不供', 'warn',
+    'admin 是开着的 —— 这不是有人关的：多半它本来就不是 PoE 口，或者电源池不够、设备把它排除了。'
+    + '★ 去看上面那一栏的余量，别去问是谁关的。'],
+  missing: ['分不清是谁关的', 'warn',
+    '使能那一栏这台没给，所以「人关的」和「设备自己排除的」分不开 —— 这两种下一步不一样，'
+    + '先确认这一栏在设备的 SNMP 视图里能不能读。'],
+};
+
+const PSE_OPER = {
+  on: ['开着', 'ok'],
+  off: ['关着', 'bad'],
+  faulty: ['报故障', 'bad'],
+};
+
+const PSE_BUDGET = {
+  ok: ['还够', 'ok'],
+  tight: ['紧了', 'warn'],
+  unknown: ['算不出来', 'warn'],
+};
+
+// 五个计数器：格子里给短标签，整句话在下面的图例里对回去。
+// ★ 它们是「从开机攒到现在」的次数，不带这一句，「3 次」看着像「刚才 3 次」。
+const POE_COUNTER = {
+  mpsAbsent: ['掉电', '供着供着掉回去（检测不到受电设备的维持签名）'],
+  invalidSignature: ['签名不合规', '插上来的东西签名不对（不是标准 PD，或者线不行）'],
+  powerDenied: ['要电被拒', '插上来要电、被这台拒绝了（多半是余量不够）'],
+  overLoad: ['过载', '过载保护跳过'],
+  shortCircuit: ['短路', '短路保护跳过'],
+};
+
+const POE_PRIORITY = { critical: '关键', high: '高', low: '低' };
+
+const POE_MATCHED = {
+  'portIndex-equals-ifIndex': '按编号猜的',
+  'pethPsePortType-names-the-port': '设备对的口名',
+  'both-mappings': '两条都对上',
+};
+
+// 电源池那一张小表：整台的额定 / 实测 / 还剩 / 阈值。
+// ★ 它排在口的上面，因为池子级的问题（关着、故障、余量紧）压过每一个口的结论。
+function pseRowsHTML(es) {
+  if (!es || !es.length) return '';
+  const dash = '<span class="dim">—</span>';
+  const w = (n) => (n === undefined ? dash : `${esc(n)}<span class="dim">W</span>`);
+  return `<table>
+    <tr><th style="width:70px">电源池</th><th style="width:150px">总开关</th>
+      <th style="width:60px">额定</th><th style="width:80px">实测在耗</th>
+      <th style="width:56px">已用</th><th style="width:60px">还剩</th>
+      <th style="width:52px">阈值</th><th>余量</th></tr>
+    ${es.map((e) => {
+    const o = PSE_OPER[e.oper];
+    const b = PSE_BUDGET[e.budget] || [e.budget, 'warn'];
+    // ★ 每一句解释挂在它讲的那一栏下面：operMeaning 讲的是总开关，
+    //   挂到「余量」那一格就等于把「电源开着」说成了对余量的结论。
+    const why = e.pseInconsistent || e.budgetWhy || e.budgetBasis || '';
+    const clip = (s) => (s.length > 34 ? `${s.slice(0, 34)}…` : s);
+    return `<tr>
+        <td><code>第 ${esc(e.group)} 组</code></td>
+        <td>${o ? `<span class="pill ${o[1]}">${esc(o[0])}</span>` : '<span class="dim" title="这一栏这台没给">不给读</span>'}
+          ${e.operMeaning && e.oper !== 'on' ? `<div class="dim" title="${esc(e.operMeaning)}">${esc(clip(e.operMeaning))}</div>` : ''}</td>
+        <td>${w(e.powerW)}</td>
+        <td>${w(e.consumptionW)}</td>
+        <td>${e.usedPct === undefined ? dash : `${esc(e.usedPct)}%`}</td>
+        <td>${w(e.remainingW)}</td>
+        <td>${e.thresholdPct === undefined ? dash : `${esc(e.thresholdPct)}%`}</td>
+        <td><span class="pill ${b[1]}">${esc(b[0])}</span>${why
+      ? `<div class="dim" title="${esc(why)}">${esc(clip(why))}</div>` : ''}</td>
+      </tr>`;
+  }).join('')}
+  </table>
+    <p class="hint" style="margin:6px 0 0">★ 额定和实测这两栏的口径是设备自己定的（RFC 里单位是瓦，可有些设备报的不是瓦）。
+      「还剩」是这两个数相减，不是「还能再插几台设备」。</p>`;
+}
+
+// PoE 口表：允不允许 / 现在在不在供 / 等级与优先级 / 五个计数器。
+// ★ 只列有意义的列：这台没给「线对」就不开那一栏，免得整栏空着像读错了。
+function poeRowsHTML(es) {
+  if (!es || !es.length) return '';
+  const keys = Object.keys(POE_COUNTER);
+  const has = (...ks) => es.some((e) => ks.some((k) => e[k] !== undefined));
+  const withPairs = has('pairs', 'pairsControllable');
+  const withGrade = has('class', 'classUnknown', 'classSkipped', 'priority');
+  const withCnt = has(...keys.flatMap((k) => [k, `${k}Delta`]));
+  const dash = '<span class="dim">—</span>';
+
+  const who = (e) => `
+    <div><code>${esc(e.group)} 组 ${esc(e.port)} 号</code></div>
+    ${e.pdType ? `<div class="dim">${esc(e.pdType)}</div>` : ''}
+    ${e.matchedBy ? `<div class="dim" title="${esc(e.matchedByWhy)}">${esc(POE_MATCHED[e.matchedBy] || e.matchedBy)}</div>` : ''}`;
+
+  // ★ 允不允许 / 现在怎样 是两栏，不能并成一栏：admin 开着但设备不供、
+  //   和 admin 被人关了，界面上看着一样就会有人去查线。
+  const allow = (e) => {
+    if (e.admin === undefined) return '<span class="dim" title="使能这一栏这台没给">不给读</span>';
+    if (e.admin === 'disabled') {
+      return `<span class="pill warn" title="${esc(e.adminWhy)}">被关着</span>`;
+    }
+    return '<span class="pill">允许</span>';
+  };
+  const now = (e) => {
+    if (e.status === undefined) {
+      return `<span class="pill warn" title="${esc(e.statusMissing)}">说不清</span>`;
+    }
+    const s = POE_STATUS[e.status] || [e.status, 'warn'];
+    let m = e.statusMeaning || '';
+    // ★ 后端那句解释开头常常就是这一格已经写过的词（「在供电 / 正在供电」）：
+    //   重复的那截切掉，只留补充的半句，否则一格两行说的是同一句话。
+    if (m === s[0] || (m.includes(s[0]) && m.length <= s[0].length + 2)) m = '';
+    else if (m.startsWith(s[0])) m = m.slice(s[0].length).replace(/^[，、：]/, '');
+    return `<span class="pill ${s[1]}">${esc(s[0])}</span>`
+      + (m ? `<div class="dim">${esc(m)}</div>` : '');
+  };
+  const grade = (e) => {
+    const bits = [];
+    if (e.class) bits.push(`<div title="${esc(e.classNote)}">等级 ${esc(e.class)}</div>`);
+    else if (e.classUnknown !== undefined) {
+      bits.push(`<div class="dim" title="${esc(e.classNote)}">等级 ${esc(e.classUnknown)}（不换算成瓦）</div>`);
+    } else if (e.classSkipped) {
+      bits.push(`<div class="dim" title="${esc(e.classSkipped)}">等级不报</div>`);
+    }
+    if (e.priority) {
+      bits.push(`<div class="dim" title="${esc(e.priorityNote)}">优先级 ${esc(POE_PRIORITY[e.priority] || e.priority)}</div>`);
+    }
+    return bits.join('') || dash;
+  };
+  const pairs = (e) => {
+    if (e.pairs === undefined) {
+      return e.pairsControllable === false
+        ? '<span class="dim" title="这台不能切线对">固定</span>' : dash;
+    }
+    // 设备原文（signal/spare）放进悬停：格子里只留一个中文词，别中英各写一遍。
+    return `<div class="dim" title="${esc(e.pairs)} · ${esc(e.pairsNote)}">${
+      e.pairs === 'signal' ? '信号线对' : '备用线对'}</div>`;
+  };
+  const cnt = (e) => {
+    const bits = [];
+    for (const k of keys) {
+      const total = e[k];
+      const delta = e[`${k}Delta`];
+      if (total === undefined && delta === undefined) continue;
+      if (!total && !delta) continue;
+      bits.push(`<div>${esc(POE_COUNTER[k][0])} ${total === undefined ? '?' : esc(total)}`
+        + (delta ? `<span class="pill bad">+${esc(delta)}</span>` : '') + '</div>');
+    }
+    if (!bits.length) {
+      return keys.some((k) => e[k] !== undefined) ? '<span class="dim">都是 0</span>' : dash;
+    }
+    if (e.countersUnreliable) {
+      bits.push(`<div class="dim" title="${esc(e.countersUnreliable)}">增量算不准</div>`);
+    }
+    return bits.join('');
+  };
+
+  const legend = new Set();
+  for (const e of es) for (const k of keys) if (e[k] || e[`${k}Delta`]) legend.add(POE_COUNTER[k][1]);
+
+  return `<table>
+    <tr><th style="width:120px">PoE 口</th><th style="width:80px">允不允许</th>
+      <th style="width:150px">现在</th>
+      ${withGrade ? '<th style="width:118px">等级 / 优先级</th>' : ''}
+      ${withPairs ? '<th style="width:80px">线对</th>' : ''}
+      ${withCnt ? '<th style="width:150px">这一段 / 累计</th>' : ''}</tr>
+    ${es.map((e) => `<tr>
+      <td>${who(e)}</td>
+      <td>${allow(e)}</td>
+      <td>${now(e)}</td>
+      ${withGrade ? `<td>${grade(e)}</td>` : ''}
+      ${withPairs ? `<td>${pairs(e)}</td>` : ''}
+      ${withCnt ? `<td>${cnt(e)}</td>` : ''}
+    </tr>`).join('')}
+  </table>${legend.size ? `<p class="hint" style="margin:6px 0 0">计数器：${[...legend].join('；')}。`
+    + '<span class="dim">（红角标是这次读的两遍之间涨的，那才是要动手的）</span></p>' : ''}`;
+}
+
+function snmpPoeCard() {
+  const card = $(`<div class="card">
+    <h2>这个口给不给电（PoE） <span id="postat"></span></h2>
+    <p class="hint">读一台设备的 PoE 供电：<b>整台的电源池够不够、这个口允不允许供电、现在在不在供、
+      检测卡在哪一步、掉电/被拒/过载/短路各攒了几次</b>。
+      ★ 这一栏<b>给不出「某个口用了几瓦」</b> —— RFC 3621 只有整台的实测值，谁在这里编一个每口功率谁就是在编。
+      先跑最上面那张「SNMP 通不通」。</p>
+    ${snmpFormHTML('po')}
+    <div class="row" style="margin-top:10px">
+      <div style="flex:0 0 110px"><label>组号</label><input id="pogroup" placeholder="1，堆叠才有"></div>
+      <div style="flex:0 0 110px"><label>口号</label><input id="poport" placeholder="PoE 表里的编号"></div>
+      <div style="flex:0 0 110px"><label>ifIndex</label><input id="poidx" placeholder="按接口号问"></div>
+      <div><label>或者在备注里找这几个字</label><input id="polabel" placeholder="AP-3F、NVR-12…（很多设备上这栏是空的）"></div>
+      <div style="flex:0 0 130px"><label>只看</label><select id="postate">
+        <option value="">都列</option><option value="on">在供电的</option><option value="off">没在供电的</option>
+      </select></div>
+      <div style="flex:0 0 150px"><label>读两遍之间等几秒</label><input id="powatch" placeholder="0 = 只读一遍"></div>
+    </div>
+    <details style="margin-top:10px"><summary class="dim">最多列几个口 / 只问状态（一般不用动）</summary>
+      <div class="row" style="margin-top:8px">
+        <div style="flex:0 0 150px"><label>最多列几个口</label><input id="polimit" placeholder="512"></div>
+        <div style="flex:0 0 auto;min-width:0;padding-top:18px">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400">
+            <input type="checkbox" id="ponoc" style="width:auto"> 只问状态，不问那几个计数器</label></div>
+      </div>
+      <p class="hint">★ 筛状态是在<b>读回来之后</b>筛，不减读的量；「读了多少」记的是筛掉之前有几个。
+        撞上限量的那一次不会给「其余口都还好」这种结论。</p>
+    </details>
+    <p class="hint" style="margin-top:8px">★ 「口号」既不是面板上的第几口、也不等于 ifIndex：
+      堆叠设备里每一箱都有自己的 5 号口，不填组号会把每一组的 5 号都列出来。
+      填 ifIndex 时这一条是<b>猜的映射</b>（RFC 3621 没规定两者的关系），结果里每一行都会写明是怎么对上的 ——
+      只有设备自己把口名写在 pethPsePortType 那一栏里，那条才算设备给的。</p>
+    <div style="margin-top:12px"><button class="btn primary" id="pogo">读 PoE 供电情况</button></div>
+    <div id="poout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#poout');
+  const top = card.querySelector('#postat');
+  card.querySelector('#pogo').onclick = async () => {
+    top.innerHTML = '';
+    const args = readSnmpArgs(card, 'po');
+    const num = (id) => Number(card.querySelector(id).value);
+    const group = num('#pogroup');
+    const port = num('#poport');
+    const idx = num('#poidx');
+    const label = card.querySelector('#polabel').value.trim();
+    const watch = num('#powatch');
+    const limit = num('#polimit');
+    const state = card.querySelector('#postate').value;
+    if (group > 0) args.groupIndex = group;
+    if (port > 0) args.portIndex = port;
+    if (idx > 0) args.ifIndex = idx;
+    if (label) args.name = label;
+    if (watch > 0) args.watchSeconds = watch;
+    if (limit > 0) args.limit = limit;
+    if (state) args.state = state;
+    args.noCounters = card.querySelector('#ponoc').checked;
+    out.innerHTML = `<div class="empty">正在问…${watch > 0
+      ? `（读了两遍，中间等了 ${esc(watch)} 秒）`
+      : '整台加整张 PoE 表，口多时要等一会儿'}</div>`;
+    const r = await call('net.snmp.poe', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const ports = [].concat(v.poePorts || []);
+    const base = SNMP_POE_CODE[r.verdict] || SNMP_CODE[r.verdict] || [r.verdict, '', ''];
+    // 「这个口没在供电」要跟着 admin 那一格走，否则界面把后端那句
+    // 「这两种下一步不一样」推翻成一颗统一的黄灯。
+    const ad = ports[0] && ports[0].admin;
+    // 整张表那一趟（poeSummary）也会给 snmp-poe-fault，那颗灯不能说「这个口」：
+    // ★ v.powering 只有收口那一条会写，点名一个口时没有 —— 用它分范围。
+    const listed = r.verdict === 'snmp-poe-fault' && v.powering !== undefined;
+    const [text, cls, advice] = listed ? POE_FAULT_LISTING
+      : r.verdict === 'snmp-poe-disabled'
+        ? (POE_DISABLED_HINT[ad === 'disabled' || ad === 'enabled' ? ad : 'missing'] || base) : base;
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const extra = [v.detail,
+      v.countersSince,
+      v.labelEmpty,
+      v.sampleUnsure,
+      v.truncated ? `撞上限量 ${v.readLimit}，这张表没读全` : ''].filter(Boolean).join('；');
+    const statsRow = v.read === undefined ? '' : `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:10px">
+        <div><label>读了多少</label><div><b>${esc(v.read)}</b> 个 PoE 口
+          ${v.count !== undefined && v.count !== v.read
+            ? `<span class="dim">筛完列出 <b>${esc(v.count)}</b> 个</span>` : ''}
+          ${v.truncated ? `<span class="pill warn">撞上限量 ${esc(v.readLimit)}</span>` : ''}
+          ${v.truncated ? '<span class="dim">（读到这一档就停了，一共有几个口没说）</span>'
+            : v.countTotal === undefined ? '<span class="dim">（这一条没走整张表，一共有几个口没说）</span>'
+              : `<span class="dim">表里一共 ${esc(v.countTotal)} 行</span>`}</div></div>
+        ${v.powering === undefined ? '' : `<div><label>在供电 / 在检测 / 没在供 / 报错</label>
+          <div><b>${esc(v.powering)}</b> / <b>${esc(v.searching)}</b> / <b>${esc(v.disabled)}</b> / <b>${esc(v.faulty)}</b>
+          ${v.adminOff !== undefined ? `<span class="dim">其中 ${esc(v.adminOff)} 个是被关着的</span>` : ''}
+          ${v.statusUnknown ? `<span class="dim">另有 ${esc(v.statusUnknown)} 行说不清</span>` : ''}</div></div>`}
+        ${v.sampleSeconds !== undefined ? `<div><label>测了多久</label><div>${esc(v.sampleSeconds)} 秒</div></div>` : ''}
+      </div>`;
+    // ★ 表空的、可其实读回来过：这一格必须自己说话，不然只剩一颗「读到了」加一张空表，
+    //   看着像「这台一个 PoE 口都没有」。
+    const emptyLine = (ports.length || !v.read || !v.stateFilter) ? '' : `
+      <p class="hint">★ 一个口都没列出来，但这不是「这台没有 PoE 口」：按「${
+        esc(v.stateFilter === 'on' ? '在供电的' : '没在供电的')}」筛之前读了 ${
+        esc(v.read)} 行，没有一行在这个状态上。被筛掉不等于没有。</p>`;
+    out.innerHTML = `
+      ${snmpHead(v)}
+      ${statsRow}
+      ${v.rebooted ? `<p class="hint">★ 这台设备在两次读之间重启过（sysUpTime 倒退），计数器被清零了，
+        所以这一趟<b>没有增量</b> —— 表里那几个数是累计值，不是「这一会儿涨的」。</p>` : ''}
+      ${pseRowsHTML(v.pse)}
+      <h2 style="margin-top:16px">口的供电</h2>
+      ${emptyLine}
+      ${poeRowsHTML(v.poePorts)}
+      ${(v.faultPorts && v.faultPorts.length) ? `<p class="hint" style="margin:8px 0 0">
+        报故障的口：${esc([].concat(v.faultPorts).join('、'))}</p>` : ''}
+      ${(v.powerDeniedPorts && v.powerDeniedPorts.length) ? `<p class="hint" style="margin:6px 0 0">
+        攒下「要电被拒」的口：${esc([].concat(v.powerDeniedPorts).join('、'))}
+        <span class="dim">—— 插得上、要不到电，先看上面那栏余量</span></p>` : ''}
+      <div style="margin-top:12px">${snmpAdviceBox(cls, advice, extra)}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
 async function renderSwitch(root) {
   root.appendChild(snmpProbeCard());
   root.appendChild(snmpMacCard());
   root.appendChild(snmpPortsCard());
+  root.appendChild(snmpPoeCard());
 }
 
 async function renderScan(root) {
