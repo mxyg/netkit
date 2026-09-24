@@ -397,3 +397,31 @@ func assertNoCommunity(t *testing.T, v ots.Verdict) {
 		t.Errorf("结果里漏出了团体名：%s", blob)
 	}
 }
+
+// TestSnmpFailWalkStuck 设备走不动时不许落成 unknown + 空 note：
+// unknown 的下一步是「回来重试一次」，这里的下一步是去核视图 —— 两句完全不同，
+// 而且 note 是界面上唯一能抄进工单的那一行。
+func TestSnmpFailWalkStuck(t *testing.T) {
+	v, done := snmpFail(&snmp.WalkStuckError{
+		Prefix: "1.0.8802.1.1.2.1.4.1.1", At: "1.0.8802.1.1.2.1.4.1.1",
+		Given: "1.3.6.1.2.1.1.1.0", Read: 12,
+	}, map[string]any{})
+	if !done {
+		t.Fatal("设备走不动是失败，snmpFail 说这一条不算")
+	}
+	if v.Code != snmpNotWalked {
+		t.Fatalf("判定 = %s：%s", v.Code, v.Note)
+	}
+	if v.Values["answered"] != true {
+		t.Error("它在答话，只是走不动 —— 这一条不能算「没回话」")
+	}
+	if v.Values["walkRead"] != 12 || v.Values["walkStoppedAt"] == nil {
+		t.Errorf("读回几栏、卡在哪儿都没带回来：%v", v.Values)
+	}
+	for _, want := range []string{"不能当「没有」", "视图"} {
+		if !strings.Contains(v.Note, want) {
+			t.Errorf("note = %q，少了「%s」", v.Note, want)
+		}
+	}
+	assertNoCommunity(t, v)
+}

@@ -51,6 +51,19 @@ func portsOf(t *testing.T, v ots.Verdict) []map[string]any {
 	return ps
 }
 
+// portRowBy 从表里按 ifIndex 挑一行（表按 ifIndex 升序，但 fixture 一加行，
+// 写死下标的断言就得跟着挪；测试要的是「这一口的某一栏」）。
+func portRowBy(t *testing.T, v ots.Verdict, idx int) map[string]any {
+	t.Helper()
+	for _, e := range portsOf(t, v) {
+		if e["ifIndex"] == idx {
+			return e
+		}
+	}
+	t.Fatalf("表里没有 %d 号口", idx)
+	return nil
+}
+
 // portDeviceEntries 是一台 13 个口的交换机。
 //
 // ★ sysUpTime = 900000（1/100 秒）= 开了 9000 秒。
@@ -169,6 +182,12 @@ func TestSnmpPortsTable(t *testing.T) {
 	}
 	if !strings.Contains(v.Note, "没链路") {
 		t.Errorf("note = %q：有 down 就得提醒「这里面含空口，不是故障清单」", v.Note)
+	}
+	// ★ 物理地址那一栏是二进制 OCTET STRING：假设备早先只把字符串填进报文，
+	// 含 0x00 的 MAC 编出来是空的，于是这一栏在测试里永远是 nil ——
+	// 看着像上层解析错了，其实是夹具不会编。留一条断言把它钉住。
+	if got := portRowBy(t, v, 5)["mac"]; got != "aa:bb:cc:dd:ee:ff" {
+		t.Errorf("5 号口的 mac = %v，要 aa:bb:cc:dd:ee:ff（二进制栏要原样翻回来）", got)
 	}
 }
 

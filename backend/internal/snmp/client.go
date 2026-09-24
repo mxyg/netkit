@@ -55,6 +55,26 @@ func (e *NoReplyError) Error() string {
 
 func (e *NoReplyError) Unwrap() error { return ErrNoReply }
 
+// WalkStuckError 是「走表走到一半，设备不往前走了」。
+//
+// ★★ 为什么不返回一个普通 error 就完了：这一条是**读回来一部分**的失败。
+//
+//	调用方手里那些栏是真的，只是不能当整张表用 —— 少的那几行既可能是设备真没有，
+//	也可能是它没答，两者在界面上必须写成一句「不能当没有」的话。
+//	没有这个类型的话上层只能把它塞进 general unknown，那句话就丢了。
+//
+// At 是当时问的位置，Given 是设备回的那一栏（它可能原地不动，也可能跳到别处）。
+type WalkStuckError struct {
+	Prefix string
+	At     string
+	Given  string
+	Read   int // 卡住之前读回来几栏
+}
+
+func (e *WalkStuckError) Error() string {
+	return fmt.Sprintf("snmp: 设备在 %s 处没有往前走（下一栏它给的是 %s），walk 停在这里", e.At, e.Given)
+}
+
 // ClientVersion 是客户端这一侧的版本选择。
 //
 // ★★ 这里的编号和报文里的**不一样**，是故意反过来的：
@@ -480,7 +500,7 @@ func (c *Client) walk(ctx context.Context, prefix string, want int) ([]VarBind, 
 			//   「原地不动」和「走到树外面」都是收口，但只有前者是设备的毛病，
 			//   当成正常结束的话 walk 会安静地少一整张表，而界面上是「这台设备没有端口」。
 			if CmpOID(v.OID, cur) <= 0 {
-				return out, false, fmt.Errorf("snmp: 设备在 %s 处没有往前走（下一栏它给的是 %s），walk 停在这里", cur, v.OID)
+				return out, false, &WalkStuckError{Prefix: prefix, At: cur, Given: v.OID, Read: len(out)}
 			}
 			if !OIDUnder(v.OID, prefix) {
 				return out, false, nil
@@ -542,7 +562,7 @@ func (c *Client) walkNext(ctx context.Context, prefix string, want int) ([]VarBi
 		}
 		// 和 GETBULK 那条同样的顺序：先确认它往前走了，再判断还在不在树里。
 		if CmpOID(v.OID, cur) <= 0 {
-			return out, false, fmt.Errorf("snmp: 设备在 %s 处没有往前走（下一栏它给的是 %s），walk 停在这里", cur, v.OID)
+			return out, false, &WalkStuckError{Prefix: prefix, At: cur, Given: v.OID, Read: len(out)}
 		}
 		if !OIDUnder(v.OID, prefix) {
 			return out, false, nil

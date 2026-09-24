@@ -364,6 +364,16 @@ func Test设备走不动时walk要停下来报错(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "没有往前走") {
 			t.Errorf("GETNEXT 路径：%v", err)
 		}
+
+		// ★ 要拿得到类型：上层那句「读回来几栏、卡在哪儿」靠的是这几个字段，
+		//   只有一串错误文本的话，界面上就写不出「少的那几行不能当没有」。
+		var stuck *snmp.WalkStuckError
+		if !errors.As(err, &stuck) {
+			t.Fatalf("错误类型 = %T，要 *snmp.WalkStuckError", err)
+		}
+		if stuck.Prefix != prefix || stuck.At == "" || stuck.Given == "" {
+			t.Errorf("卡在哪儿没带回来：%+v", stuck)
+		}
 	}
 }
 

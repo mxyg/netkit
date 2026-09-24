@@ -3088,11 +3088,286 @@ function snmpPoeCard() {
   return card;
 }
 
+const SNMP_LLDP_CODE = {
+  'snmp-lldp-unsupported': ['这台没有 LLDP 这一棵', 'warn',
+    '设备答了话（团体名是对的），可 LLDP-MIB 那棵子树整个读不到。三种下一步完全相反：'
+    + '这台不是网管设备/没开 LLDP、这一棵被藏进了别的视图、或者它只做 CDP 不做 LLDP'
+    + '（★ 只发 CDP 的设备在这里就是不存在，读不到邻居不等于对端不存在 —— 那要换 CDP 那一侧去问）。'],
+  'snmp-lldp-tx-only': ['这个口的 LLDP 是「只发不收」', 'warn',
+    'lldpPortConfigAdminStatus=txOnly：这一档按标准只把自己发出去、不存对端发来的东西，'
+    + '所以它的邻居表本来就该是空的。★ 这不是对端没发，是这台自己不存 —— 要互相看得见，'
+    + '去设备上把这个口改成收发（本工具只读，不改配置）。'],
+  'snmp-lldp-port-off': ['这个口的 LLDP 关着', 'warn',
+    'lldpPortConfigAdminStatus=disabled：不发也不存，这个口上永远不会有邻居。'
+    + '先去设备上确认这是不是有意关的（本工具只读）。'],
+  'snmp-lldp-no-neighbor': ['没有邻居', 'warn',
+    '这台有 LLDP 那棵树、这个口也在收，可邻居表里一条都没有。剩下两种病：对端根本没发 LLDP'
+    + '（老设备、打印机、IPC 常常只发 CDP 或不发），或者对端发的被中间的东西吞了。'
+    + '★ 这一条不是「这根线上没东西」，是「没有东西在向它说 LLDP」—— 线下插着什么还得看 MAC 表那一栏。'],
+  'snmp-lldp-not-found': ['点名的那个口没有邻居行', 'warn',
+    '★ 别的口有邻居，只有这一个口没有 —— 这一条比「整台没邻居」有用得多。'
+    + '先看这一口的 LLDP 开关是不是「只发不收」或关着；是收发、可就是没有，再去查对端发不发。'],
+  'snmp-lldp-multi': ['一个口上听见了好几个邻居', 'warn',
+    '★ 这不是故障，是拓扑：这个口下面接了台非网管交换机、hub 或者分光器。'
+    + '设备不会主动把这件事说出来，要理拓扑就顺着这几个口去现场看一眼。'],
+  'snmp-lldp-aging': ['邻居在老化（它会消失）', 'bad',
+    '刚才那一段里，某个口上的邻居老化计数涨了：对端停发 LLDP、或者它给的存活时间比自己的发包间隔短、'
+    + '或者这条链路在抖。★ 这一条不是「没有邻居」，是「邻居会消失」—— 查对端为什么停发，别查这台没配。'],
+  'snmp-not-walked': ['邻居表没读全，下不了结论', 'warn',
+    '这张表读到一半停住了（撞上限量，或者设备走着走着不往前走了）。'
+    + '★ 这时候「这个口没有邻居」和「其余口都还好」两句都不成立 —— 少读的那几行里'
+    + '就可能正好有你要找的那一台。把「最多列几条」提到能盖住整张表再问一次。'],
+  'snmp-no-data': ['这台没给出 LLDP 的内容', 'warn',
+    '设备答了话（团体名是对的），可 LLDP 那几组一栏都没给。要么这台的 LLDP 服务没开'
+    + '（不少设备上不开服务时这棵树就不存在），要么整棵被放进了别的视图 —— 换团体名再问一次 net.snmp.probe。'],
+};
+
+const LLDP_ADMIN = {
+  txOnly: ['只发不收', 'warn'],
+  rxOnly: ['只听不发', 'warn'],
+  txAndRx: ['收发', 'ok'],
+  disabled: ['关着', 'bad'],
+};
+
+const LLDP_ADMIN_LABEL = {
+  txAndRx: '收发', txOnly: '只发不收', rxOnly: '只听不发', disabled: '关着', other: '别的值',
+};
+
+const LLDP_MATCHED = {
+  'dot1dBasePortIfIndex': '设备对的映射',
+  'lldpLocPort-names-it': '设备对的口名',
+  'portNum-equals-ifIndex': '按编号猜的',
+  'both-mappings': '两条都对上',
+};
+
+// 邻居表：一个口一行（一个口上几行邻居就几行）。
+// ★ 只开有内容的栏 —— 这台没给管理地址就不开那一栏，整栏空着像读错了。
+function lldpRowsHTML(es) {
+  if (!es || !es.length) return '';
+  const has = (...ks) => es.some((e) => e[ks[0]] !== undefined
+    || ks.slice(1).some((k) => e[k] !== undefined));
+  const withMgmt = has('mgmtAddresses');
+  const withAge = has('lastUpdate', 'lastUpdateWhy', 'ageoutsTotal', 'ageoutsDelta');
+  const dash = '<span class="dim">—</span>';
+
+  const local = (e) => {
+    const a = LLDP_ADMIN[e.localLldpAdmin];
+    return `<div><code>口号 ${esc(e.portNum)}</code>${e.remIndex > 1 ? `<span class="dim"> 第 ${esc(e.remIndex)} 行</span>` : ''}</div>
+      ${e.localPortName ? `<div><b>${esc(e.localPortName)}</b></div>` : ''}
+      ${e.portMatchedBy ? `<div class="dim" title="${esc(e.portMatchWhy)}">${esc(LLDP_MATCHED[e.portMatchedBy] || e.portMatchedBy)}</div>` : ''}
+      ${a ? `<span class="pill ${a[1]}" title="${esc(e.localLldpAdminMeaning || '')}">${esc(a[0])}</span>` : ''}`;
+  };
+  // 「对端是谁」这一格是复制进工单的那一行：名字 + 标识 + 标识按什么翻的。
+  const who = (e) => {
+    const bits = [];
+    if (e.sysName) bits.push(`<div><b>${esc(e.sysName)}</b></div>`);
+    if (e.chassisId) {
+      bits.push(`<div><code title="${esc(e.chassisIdWhy || '')}">${esc(e.chassisId)}</code></div>`);
+    }
+    if (e.chassisIdType) bits.push(`<div class="dim">${esc(e.chassisIdType)}</div>`);
+    if (!e.sysName && !e.chassisId) bits.push(dash);
+    if (e.gone) bits.push('<span class="pill bad">第二遍不见了</span>');
+    if (e.newNeighbor) bits.push('<span class="pill warn">这一趟新出现的</span>');
+    if (e.missingColumns) {
+      // 整句掐到 24 个字会切成「lldpRemPortId / …」这种半截话 —— 按「、」一条一条数，
+      // 只展示第一条 + 一共缺几栏，全文留给鼠标提示。
+      const list = (e.missingColumns.split('：')[1] || '').split(' —— ')[0];
+      const cols = list ? list.split('、').filter(Boolean) : [];
+      bits.push(cols.length
+        ? `<div class="dim" title="${esc(e.missingColumns)}">缺栏：${esc(cols[0])}${cols.length > 1 ? ` 等 ${cols.length} 栏` : ''}</div>`
+        : `<div class="dim" title="${esc(e.missingColumns)}">缺栏：${esc(list || '这一行的栏没列出来')}</div>`);
+    }
+    return bits.join('');
+  };
+  const rport = (e) => {
+    const bits = [];
+    if (e.remotePortId) bits.push(`<div><code title="${esc(e.remotePortIdWhy || '')}">${esc(e.remotePortId)}</code></div>`);
+    if (e.remotePortIdType) bits.push(`<div class="dim">${esc(e.remotePortIdType)}</div>`);
+    if (e.remotePortDesc) bits.push(`<div class="dim" title="${esc(e.remotePortDesc)}">${esc(e.remotePortDesc)}</div>`);
+    return bits.join('') || dash;
+  };
+  const caps = (e) => {
+    const bits = [];
+    if (e.capabilities) bits.push(`<div>${esc([].concat(e.capabilities).join('、'))}</div>`);
+    if (e.capabilitiesEnabled) {
+      bits.push(`<div class="dim" title="enabled 是另一张位图，界面上「对端是什么」按这一张认">已启用：${esc([].concat(e.capabilitiesEnabled).join('、'))}</div>`);
+    } else if (e.capabilities) {
+      bits.push('<div class="dim">enabled 没给，只按 supported 说</div>');
+    }
+    if (e.capabilityNote) bits.push(`<div class="dim" title="${esc(e.capabilityNote)}">${esc(e.capabilityNote.replace(/^★\s*/, ''))}</div>`);
+    return bits.join('') || dash;
+  };
+  const fresh = (e) => {
+    const bits = [];
+    if (e.lastUpdate) {
+      const old = e.lastUpdateSeconds > 600;
+      bits.push(old
+        ? `<span class="pill warn" title="比 LLDP 一般的存活时间老得多：这台只是把第一次听到的东西留着没清">${esc(e.lastUpdate)}前刷新</span>`
+        : `<div>${esc(e.lastUpdate)}前刷新</div>`);
+    } else if (e.lastUpdateWhy) {
+      bits.push(`<div class="dim" title="${esc(e.lastUpdateWhy)}">算不出多久以前</div>`);
+    }
+    if (e.ageoutsDelta) bits.push(`<span class="pill bad">这一段老化 ${esc(e.ageoutsDelta)} 次</span>`);
+    else if (e.ageoutsTotal !== undefined) bits.push(`<div class="dim" title="从开机攒到现在的次数，单看一个数说明不了任何事">累计老化 ${esc(e.ageoutsTotal)}</div>`);
+    return bits.join('') || dash;
+  };
+
+  return `<table>
+    <tr><th style="width:150px">这台这个口</th><th style="width:200px">对端是谁</th>
+      <th style="width:160px">对端的口</th><th style="width:150px">它自称</th>
+      ${withMgmt ? '<th style="width:150px">它留的管理地址</th>' : ''}
+      ${withAge ? '<th style="width:130px">多久没刷新 / 老化</th>' : ''}</tr>
+    ${es.map((e) => `<tr>
+      <td>${local(e)}</td>
+      <td>${who(e)}</td>
+      <td>${rport(e)}</td>
+      <td>${caps(e)}</td>
+      ${withMgmt ? `<td>${e.mgmtAddresses
+        ? [].concat(e.mgmtAddresses).map((a) => `<div><code>${esc(a)}</code></div>`).join('') : dash}</td>` : ''}
+      ${withAge ? `<td>${fresh(e)}</td>` : ''}</tr>`).join('')}
+  </table>`;
+}
+
+function lldpStatsHTML(s) {
+  if (!s) return '';
+  if (s.note && !s.tableInserts && !s.tableDeletes && !s.tableDrops && !s.tableAgeouts
+    && !s.ageoutPorts && !s.rxErrorPorts) {
+    return `<p class="hint">${esc(s.note)}</p>`;
+  }
+  const item = (label, v, why) => (v === undefined ? ''
+    : `<div><label>${esc(label)}</label><div><b>${esc(v)}</b>${
+      why ? `<span class="dim">（${esc(why)}）</span>` : ''}</div></div>`);
+  return `<div class="row" style="align-items:flex-end;gap:18px">
+    ${item('插入过几条', s.tableInserts)}
+    ${item('被清掉几条', s.tableDeletes)}
+    ${item('表满丢掉几条', s.tableDrops)}
+    ${item('自然老化几条', s.tableAgeouts)}
+    ${item('老过化的口', s.ageoutPorts && [].concat(s.ageoutPorts).join('、'))}
+    ${item('收包出错的口', s.rxErrorPorts && [].concat(s.rxErrorPorts).join('、'))}
+  </div><p class="hint" style="margin:6px 0 0">★ 这几个数是从设备<b>开机攒到现在</b>的，
+    单看一个数说明不了任何事 —— 要看「这一段涨没涨」，把上面「读两遍之间等几秒」填一个数再问一次。</p>`;
+}
+
+function snmpLldpCard() {
+  const card = $(`<div class="card">
+    <h2>这根线另一头是谁（LLDP 邻居） <span id="llstat"></span></h2>
+    <p class="hint">读一台设备的 LLDP 邻居：<b>哪一个口上听见了对端哪台设备、它在对端的哪个口、
+      对端自称是什么、它留下的管理地址</b>，外加每个口的 LLDP 开关和邻居老化次数。
+      ★ 这一棵树里<b>没有 CDP</b>：只发 CDP 的老设备、打印机、摄像头在这里就是不存在，
+      「读不到邻居」不等于「线上没东西」。先跑最上面那张「SNMP 通不通」。</p>
+    ${snmpFormHTML('ll')}
+    <div class="row" style="margin-top:10px">
+      <div style="flex:0 0 120px"><label>LLDP 口号</label><input id="llport" placeholder="lldpRemLocalPortNum"></div>
+      <div style="flex:0 0 120px"><label>ifIndex</label><input id="lridx" placeholder="按接口号问"></div>
+      <div><label>或者在口名里找这几个字</label><input id="llname" placeholder="Gi1/0/5、GE1/0/5…"></div>
+      <div style="flex:0 0 150px"><label>读两遍之间等几秒</label><input id="llwatch" placeholder="0 = 只读一遍"></div>
+    </div>
+    <details style="margin-top:10px"><summary class="dim">最多列几行 / 不读统计计数器（一般不用动）</summary>
+      <div class="row" style="margin-top:8px">
+        <div style="flex:0 0 150px"><label>最多列几行</label><input id="lllimit" placeholder="512"></div>
+        <div style="flex:0 0 auto;min-width:0;padding-top:18px">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400">
+            <input type="checkbox" id="llnostats" style="width:auto"> 不读那几个统计计数器</label></div>
+      </div>
+      <p class="hint">★ 不读计数器就看不出「邻居在老化」这一条（邻居本身照读）。
+        撞到限量的那一次不会给「其余口都还好」这种结论。</p>
+    </details>
+    <p class="hint" style="margin-top:8px">★ <b>LLDP 口号既不是面板上的第几口、也不等于 ifIndex</b>：
+      MIB 规定桥设备按 dot1dBasePort 编号。填 ifIndex 时结果里每一行都会写明这一条是怎么对上的
+      —— 设备的映射（可以当准）、还是「编号正好相等」猜的（要核）；几条路指着不同口号时全列出来，不挑一个。</p>
+    <div style="margin-top:12px"><button class="btn primary" id="llgo">读 LLDP 邻居</button></div>
+    <div id="llout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#llout');
+  const top = card.querySelector('#llstat');
+  card.querySelector('#llgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = readSnmpArgs(card, 'll');
+    const num = (id) => Number(card.querySelector(id).value);
+    const port = num('#llport');
+    const idx = num('#lridx');
+    const name = card.querySelector('#llname').value.trim();
+    const watch = num('#llwatch');
+    const limit = num('#lllimit');
+    if (port > 0) args.portNum = port;
+    if (idx > 0) args.ifIndex = idx;
+    if (name) args.name = name;
+    if (watch > 0) args.watchSeconds = watch;
+    if (limit > 0) args.limit = limit;
+    args.noStats = card.querySelector('#llnostats').checked;
+    out.innerHTML = `<div class="empty">正在问…${watch > 0
+      ? `（读了两遍，中间等了 ${esc(watch)} 秒）`
+      : '整棵邻居子树都要走一遍，口多时要等一会儿'}</div>`;
+    const r = await call('net.snmp.lldp', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const rows = [].concat(v.neighbors || []);
+    const base = SNMP_LLDP_CODE[r.verdict] || SNMP_CODE[r.verdict] || [r.verdict, '', ''];
+    const [text, cls, advice] = base;
+    // 共用那句「下面几栏都可以问了」是设备体检那张卡的口径；在这张卡上邻居已经列出来了，
+    // 再说一遍等于走错了门，所以这一条换成说眼前这张表。
+    const say = r.verdict === 'snmp-ok'
+      ? '这台设备认这个团体名，路也是通的。上面这些邻居行就是它直接答的。' : advice;
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const extra = [v.detail, v.answeredEarlier, v.portMapping, v.name,
+      v.queriedPorts ? `别的口上有邻居：口号 ${[].concat(v.queriedPorts).join('、')}` : '',
+      v.sampleUnsure, v.sampleAborted,
+      v.truncated ? `撞上限量 ${v.readLimit}，这张表没读全` : ''].filter(Boolean).join('；');
+    const local = v.local || {};
+    const localLine = Object.keys(local).length ? `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+        <div><label>这台自称</label><div><b>${esc(local.sysName || '')}</b>
+          ${local.chassisId ? `<span class="dim" title="${esc(local.chassisIdType || '')}"><code>${esc(local.chassisId)}</code></span>` : ''}</div></div>
+        ${local.capabilities ? `<div><label>它说自己会这些</label><div>${esc([].concat(local.capabilities).join('、'))}
+          ${local.capabilitiesEnabled ? `<span class="dim">已启用：${esc([].concat(local.capabilitiesEnabled).join('、'))}</span>` : ''}</div></div>` : ''}
+        ${local.sysDesc ? `<div><label>设备说明</label><div class="dim" title="${esc(local.sysDesc)}">${esc(String(local.sysDesc).slice(0, 60))}${String(local.sysDesc).length > 60 ? '…' : ''}</div></div>` : ''}
+      </div>${local.capabilityNote ? `<p class="hint">${esc(local.capabilityNote)}</p>` : ''}` : '';
+    const counts = v.portAdminCounts
+      ? `<div><label>这台的 LLDP 开关</label><div>${Object.entries(v.portAdminCounts)
+        .map(([k, n]) => `${esc(LLDP_ADMIN_LABEL[k] || k)} <b>${esc(n)}</b>`)
+        .join(' · ')}<span class="dim">（按口数的，只发了一遍开关表）</span></div></div>` : '';
+    const statsRow = v.read === undefined ? '' : `
+      <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:10px">
+        <div><label>读回几条</label><div><b>${esc(v.read)}</b> 行邻居
+          ${v.count !== undefined && v.count !== v.read
+            ? `<span class="dim">这一趟列出 <b>${esc(v.count)}</b> 行</span>` : ''}
+          ${v.truncated ? `<span class="pill warn">撞上限量 ${esc(v.readLimit)}</span>` : ''}
+          ${v.countTotal === undefined ? '' : `<span class="dim">表里一共 ${esc(v.countTotal)} 行</span>`}</div></div>
+        ${v.ports === undefined ? '' : `<div><label>涉及几个口</label><div><b>${esc(v.ports)}</b>
+          ${v.multiNeighborPorts ? `<span class="pill warn">${esc(v.multiNeighborPorts)} 个口上不止一个邻居</span>` : ''}</div></div>`}
+        ${counts}
+        ${v.uptimeSeconds !== undefined ? `<div><label>这台开了</label><div class="dim">${esc(v.uptime || v.uptimeSeconds + ' 秒')}</div></div>` : ''}
+        ${v.sampleSeconds !== undefined ? `<div><label>测了多久</label><div>${esc(v.sampleSeconds)} 秒</div></div>` : ''}
+      </div>`;
+    out.innerHTML = `
+      ${snmpHead(v)}
+      ${localLine}
+      ${statsRow}
+      ${v.portMappingAmbiguous ? `<p class="hint">★ 这一条是靠猜对上的：两条路指着不同的口号，候选的口都问了 —— 别把它们当成同一根线。</p>` : ''}
+      ${v.rebooted ? `<p class="hint">★ 这台设备在两次读之间重启过（sysUpTime 倒退），计数器被清零了，
+        所以这一趟<b>没有增量</b> —— 只按两遍的行数比了邻居。</p>` : ''}
+      ${v.newNeighborRows ? `<p class="hint">★ 这一趟之间多出 ${esc(v.newNeighborRows)} 行邻居（只有第二遍才读到）——
+        下面标着「这一趟新出现的」那几行就是它。</p>` : ''}
+      <h2 style="margin-top:16px">邻居</h2>
+      ${rows.length ? lldpRowsHTML(rows) : `<div class="empty">这一趟一条邻居都没列出来。
+        ${v.queriedPorts ? `但别的口上有：口号 ${esc([].concat(v.queriedPorts).join('、'))}` : ''}</div>`}
+      ${v.agingPorts ? `<p class="hint" style="margin:8px 0 0">老过化的口：${esc([].concat(v.agingPorts).join('、'))}
+        <span class="dim">—— 这一条说的是「邻居会消失」，不是「没有邻居」</span></p>` : ''}
+      ${v.stats ? `<div style="margin-top:14px"><h2>邻居表统计</h2>${lldpStatsHTML(v.stats)}</div>` : ''}
+      <div style="margin-top:12px">${snmpAdviceBox(cls, say, extra)}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
 async function renderSwitch(root) {
   root.appendChild(snmpProbeCard());
   root.appendChild(snmpMacCard());
   root.appendChild(snmpPortsCard());
   root.appendChild(snmpPoeCard());
+  root.appendChild(snmpLldpCard());
 }
 
 async function renderScan(root) {

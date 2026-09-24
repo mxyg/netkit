@@ -87,6 +87,13 @@ type Value struct {
 func (v Value) raw() []byte {
 	switch v.Tag {
 	case snmp.TagOctetString, snmp.TagOpaque:
+		// ★ 二进制内容走 B：MAC、LLDP 的 chassisId、capability bitmap 都是 OCTET STRING，
+		//   里面必然有 0x00 和不可打印字节。只认 S 的话，编出来是一串空内容 ——
+		//   测试里看到的现象是「这一栏设备明明给了，读回来是 nil」，
+		//   而人会以为是上层解析错了。
+		if v.B != nil {
+			return append([]byte(nil), v.B...)
+		}
 		return []byte(v.S)
 	case snmp.TagInteger:
 		return snmp.IntContent(v.N)

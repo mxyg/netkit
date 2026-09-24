@@ -324,6 +324,23 @@ func snmpFail(err error, values map[string]any) (ots.Verdict, bool) {
 				"只是这一栏不给读或读不了 —— 这种要去看设备的视图/权限配置，不是网络不通",
 				err.Error())}, true
 	}
+	var stuck *snmp.WalkStuckError
+	if errors.As(err, &stuck) {
+		// ★ 设备在答话，只是走表走到一半不往前走了 —— 这既不是「没回话」也不是
+		//   「这棵树没有」：读回来的那几栏是真的，少的可能还有。判成没数据，
+		//   现场就会拿着一张缺了尾巴的表去下「这台没有几个口」的结论。
+		values["answered"] = true
+		values["walkStoppedAt"] = stuck.At
+		values["walkGiven"] = stuck.Given
+		values["walkRead"] = stuck.Read
+		return ots.Verdict{Code: snmpNotWalked, Values: values,
+			Note: fmt.Sprintf("有回话，但这张表只读到一半：%s 这棵树读到 %s 时设备不再往前走"+
+				"（它给回来的是 %s），卡住前读回 %d 栏。"+
+				"★ 上面这些是真的，但少的那几行不能当「没有」 —— 这是设备的毛病（walk 实现有缺陷、"+
+				"或这一棵被视图切断了），不是这台设备真的没有。下一步：把已经读到的拿去用，"+
+				"缺的部分换成点名问（按口、按端口号一栏一栏 GET），或者换 v1 走 GETNEXT 再试一次。",
+				stuck.Prefix, stuck.At, stuck.Given, stuck.Read)}, true
+	}
 	// 剩下的是「这一趟观测根本没做成」：地址解不开、本地起不了端口、被取消。
 	values["detail"] = err.Error()
 	return ots.Unknown(values), true
