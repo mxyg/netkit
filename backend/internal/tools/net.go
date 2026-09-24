@@ -24,11 +24,28 @@ import (
 func Register(r *ots.Registry) {
 	r.MustRegister(interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, neighborsTool, discoverTool,
 		dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
-		fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool)
+		fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
+		diagBundleTool)
 	RegisterAddress(r)
 	RegisterDHCP(r)
 	RegisterRemote(r)
 }
+
+// version 是本机跑的产品版本，由 main 在启动时装进来（编译台注入，本地构建是 dev）。
+//
+// ★ 诊断包里必须写它：远程的人第一句一定问「那台是什么版本」，
+//
+//	而现场没有人会主动报版本号 —— 他连界面上的「关于」在哪都要找。
+var version = "dev"
+
+// SetVersion 装进产品版本。
+func SetVersion(v string) {
+	if v != "" {
+		version = v
+	}
+}
+
+func netkitVersion() string { return version }
 
 // ── net.interfaces ──
 

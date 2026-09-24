@@ -401,6 +401,7 @@ function startPolling(root) {
 
 async function renderProbe(root) {
   root.appendChild(checkupCard());
+  root.appendChild(diagBundleCard());
   root.appendChild(dualStackCard());
   root.appendChild(traceCard());
   root.appendChild(mtrCard());
@@ -784,6 +785,154 @@ function checkupCard() {
       </table>
       <p class="hint" style="margin-top:10px">★ 只有 v4/v6 分开给的两项（到网关、出外网）才算得清「有一族出得去一半」——
         那种机器不会断网，但每次连接都慢半拍。</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+/*
+ * ── 诊断包导出 ──
+ *
+ * ★★ 这一栏治的是「截图发群里，对方追问两天」：截图里没有「网关是哪台」「这块卡是
+ *   USB 转的还是板载的」「这台被谁改过配置」，于是来回两天。包里给的是每一项读到的
+ *   原文，读不到的也带着「为什么读不到」—— 所以界面只把后端给的逐项判定摊开成一行行，
+ *   不在这儿替它写结论。
+ *
+ * ★ 默认只占一行：这是一个「要发给别人才用得上」的动作，不是常看的表。
+ */
+const DB_TOP = {
+  'bundle-written': ['包已写好', 'ok',
+    '整个附件发给对方就行。★ 发之前过一眼：包里有内网地址、机器名、网卡名、进程名，'
+    + '发出去就等于把这些给了对方。口令、团体名、令牌、私钥在落盘前已经抹掉、键名留着，'
+    + '所以「配了但没给你看」和「没配」在包里分得开。'],
+  'bundle-partial': ['包写好了，但有几项没读出来', 'warn',
+    '缺的那几项也在包里，各自写明为什么读不到 —— 对方不会把「没权限读」看成「这台没配」。'
+    + '★ 这一档八成是没给管理员权限：邻居表、本机端口占用、hosts 在非管理员下读不全。'
+    + '用管理员权限再导一次才补得齐；只想补那几项，就在高级里单独勾它们。'],
+  'bundle-not-written': ['这台写不出来', 'bad',
+    '一个文件都没写出来，别去目录里找半截的包。★ 先看用户配置目录还能不能写'
+    + '（磁盘满、目录被别的用户占有、路径太深都会这样），或者在高级里只勾几项再导一次。'],
+};
+const DB_SEC = {
+  'section-read': ['在包里', 'ok'],
+  // ★ 包没写成时不许说「在包里」：内容确实读到了，但那一页此刻不存在于任何文件里。
+  //   说成「在包里」，对方会去解一个根本不存在的 zip。
+  'section-read-nopack': ['读到了（没进包）', 'warn'],
+  'section-unreadable': ['没读出来', 'bad'],
+  'section-skipped': ['按你的要求跳过', 'warn'],
+};
+// ★ 空壳那一档要单独说：判定码仍然只有 written / partial / not-written 三种，
+//   「缺几项」和「一项都没缺出来」是两个说法，但不是两个判定 —— 后者由后端的
+//   nothingRead 给（界面不自己数行：数错了就把「有六页内容」的包喊成空壳，反之也一样）。
+const DB_ALLBAD = '★ 这一趟一项都没读出来 —— 这个包里全是「为什么读不到」，没有内容。'
+  + '别把它当「这台机器干净」发出去：先按上面说的解决权限，再重导一次。';
+// 与后端 sectionLabel / sectionOrder 一一对应：勾选项的顺序就是包里的顺序。
+const DB_ITEMS = [
+  ['system', '系统与时间'], ['nic', '网卡与地址'], ['routes', '路由表'],
+  ['neighbors', '邻居表（ARP 与 NDP）'], ['dns', 'DNS 服务器'], ['hosts', 'hosts 文件'],
+  ['proxy', '代理设置'], ['ports', '本机端口占用'], ['journal', 'NetKit 改过什么'],
+  ['checkup', '连通性体检'],
+];
+
+function dbRow(it, packed) {
+  const code = it.code === 'section-read' && !packed ? 'section-read-nopack' : it.code;
+  const [text, tone] = DB_SEC[code] || [it.code || '—', ''];
+  // ★ 判定这一栏只回答「这一页在不在包里」，页名那一栏回答「在哪一页」：
+  //   没读出来的那一项，包里那一页写的是为什么读不到 —— 对方指着那一页问时，得能对上名字。
+  const file = packed ? esc(it.file || '') : '—';
+  // ★ 「为什么」只在没读出来那一档给人看：reason 在别的档里放的是机器码（体检那一项放它自己的顶层判定），
+  //   直接把机器码印到这一栏，界面就变成「degraded」这种没人看得懂的字。
+  const note = it.code === 'section-unreadable'
+    ? `<span class="dim">${esc((it.reason || '').split('\n')[0])}</span>`
+    : `<span class="dim">${it.lines || 0} 行</span>`;
+  return `<tr><td>${esc(it.label || it.item)}</td>
+    <td><span class="pill ${tone}">${esc(text)}</span></td>
+    <td><code class="dim">${file}</code></td>
+    <td>${note}</td></tr>`;
+}
+
+function diagBundleCard() {
+  const card = $(`<div class="card">
+    <h2>导出诊断包 <span id="db-top"></span></h2>
+    <p class="hint">把这台机器的网络现状打成一个 zip：网卡与地址、路由表、邻居表、DNS、hosts、代理、
+      本机端口占用、NetKit 改过什么，外加一项按排查顺序跑的连通性体检。★ 每一项都带<b>读到的原文</b>，
+      读不到的那一项也留在包里写明为什么 —— 对方不必再回来问「网关是哪台」。
+      落盘前统一脱敏（口令 / 团体名 / 令牌 / 私钥抹成 <code>***</code>，键名留着），包内文件名一律 UTF-8。
+      只在自己的输出目录里新建这一个文件，不改任何东西。</p>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:1 1 240px"><label>包名上的现场标签（建议填现场名，可留空）</label>
+        <input id="db-label" placeholder="如 金宇建安-盒1"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn" id="db-go">导出诊断包</button></div>
+    </div>
+    <details style="margin-top:8px"><summary class="dim">高级：只要其中几项 / 不跑要发包的那一项 / 换体检域名</summary>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:1 1 240px"><label>体检用哪个域名测 DNS 与出口</label>
+          <input id="db-domain" placeholder="默认 www.cloudflare.com；内网填内网一定解析得到的名字"></div>
+      </div>
+      <label style="display:flex;gap:6px;align-items:center;margin-top:8px">
+        <input type="checkbox" id="db-nolive" style="width:auto"> 不跑要发探测包的那一项（只留配置快照）</label>
+      <p class="dim" style="margin:10px 0 4px">只要下面勾的这几项（一个都不勾 = 全给）。★ 对方只问了某件事时
+        别把不相干的配置一起发出去：</p>
+      <div id="db-only" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:4px 12px"></div>
+    </details>
+    <div id="db-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#db-out');
+  const top = card.querySelector('#db-top');
+  card.querySelector('#db-only').innerHTML = DB_ITEMS.map(([k, name]) =>
+    `<label style="display:flex;gap:6px;align-items:center;font-size:13px">
+      <input type="checkbox" class="db-item" value="${k}" style="width:auto"> ${esc(name)}</label>`).join('');
+  card.querySelector('#db-go').onclick = async () => {
+    const args = {};
+    const label = card.querySelector('#db-label').value.trim();
+    const domain = card.querySelector('#db-domain').value.trim();
+    const only = [...card.querySelectorAll('.db-item')].filter((c) => c.checked).map((c) => c.value);
+    if (label) args.label = label;
+    if (domain) args.domain = domain;
+    if (only.length) args.only = only;
+    if (card.querySelector('#db-nolive').checked) args.skipLive = true;
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">正在一项项读…（体检那一项要发少量探测包，约 3 秒）</div>';
+    const r = await call('net.diag.bundle', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">导不出来：${esc(r.message || r.error)}</div>`; return; }
+    const v = r.values;
+    let [title, cls, advice] = DB_TOP[r.verdict] || [r.verdict || '没给判定', '', ''];
+    if (v.nothingRead === true) { // 「有几项没读出来」在这一档说轻了
+      title = '包写好了，但这一趟什么都没读出来';
+      cls = 'bad';
+      // ★ 不整段换掉：下面那句「八成是没给管理员权限」正是这一档的下一步，仍然要说。
+      advice += '\n' + DB_ALLBAD;
+    }
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const items = v.sections || [];
+    // 体检那一项自己的顶层判定：包旁边要能直接说出「这一台断在第几步」，
+    // 而这套词与上面那张体检卡完全一致（CK_TOP），不许在包里换一套说法。
+    const cu = v.checkup && v.checkup.top;
+    const [cuName, cuTone] = cu ? (CK_TOP[cu] || [cu, 'warn']) : [];
+    const cuPill = cu ? `<span class="pill ${cuTone}">体检：${esc(cuName)}</span>` : '';
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(advice).replace(/\n/g, '<br>')}</div>
+      ${v.path ? `<p style="margin:12px 0 0">包：<code>${esc(v.path)}</code><br>
+        <span class="dim">${esc(fsSize(v.bytes))} · ${v.entries || 0} 个文件 · 用时 ${ms(v.tookMs)}</span>
+        ${cuPill ? '　' + cuPill : ''}
+        </p>` : ''}
+      ${v.reason ? `<p style="margin:12px 0 0">原因：${esc(v.reason)}${
+        v.dir ? `<br><span class="dim">输出目录：<code>${esc(v.dir)}</code></span>` : ''}</p>` : ''}
+      ${items.length ? `<table style="margin-top:12px">
+        <tr><th>${v.path ? '包里的项' : '读到的项'}</th><th>判定</th><th>哪一页</th><th>行数 / 为什么没读出来</th></tr>
+        ${items.map((it) => dbRow(it, !!v.path)).join('')}
+      </table>` : ''}
+      ${v.redactedHow ? `<p class="dim" style="margin:10px 0 0">脱敏：${esc(v.redactedHow)}</p>` : ''}
+      ${(v.truncated || []).length ? `<p class="dim" style="margin:4px 0 0">被截断的页：${
+        esc((v.truncated || []).join('、'))} —— 原文太长，要看全文用对应的工具单独再查一次。</p>` : ''}
+      <p class="hint" style="margin-top:10px">★ 每一项都带读到的原文：解开后那几页是给别人<b>接着查</b>的，
+        不是截图那种「看着像结论」的东西。时钟准不准、v6 出不出得去，都在「02 连通性」那一页里。</p>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };

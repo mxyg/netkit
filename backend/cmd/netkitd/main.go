@@ -43,6 +43,7 @@ func main() {
 	flag.Parse()
 
 	reg := ots.NewRegistry(*mutations)
+	tools.SetVersion(Version) // 诊断包里要写「那台是什么版本」
 
 	// ★ 改系统的功能必须先有账本（先登记后执行、崩了能还原）。
 	//   账本开不了就**不启用** mutate —— 而不是"没账本也照改"。
