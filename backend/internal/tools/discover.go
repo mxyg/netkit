@@ -273,12 +273,16 @@ func sweepLinkLocal(ctx context.Context, ifname string, rounds int, wait time.Du
 	dst := &net.UDPAddr{IP: net.IP(mcast.IP.AsSlice()), Zone: ifname}
 	seen := map[string]found{}
 
+	// ★ 序号同样从随机点起（见 seqBase）：这一路是「一发多收」，收的时候只能按 Seq 认，
+	//   如果本机同时还有别的 ICMP 探测在跑（体检、连续 ping），两边都从 1 开始编号，
+	//   对方的回包就会被当成「这条链路上有人应答」。
+	base := seqBase()
 	for r := 1; r <= rounds; r++ {
 		if err := ctx.Err(); err != nil {
 			break
 		}
 		msg := icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Code: 0,
-			Body: &icmp.Echo{Seq: r, Data: []byte("yuhox-netkit-discover")}}
+			Body: &icmp.Echo{Seq: base + r, Data: []byte("yuhox-netkit-discover")}}
 		b, err := msg.Marshal(nil)
 		if err != nil {
 			return nil, ots.Errf(ots.ErrInternal, "组包失败：%s", err)
@@ -303,8 +307,13 @@ func sweepLinkLocal(ctx context.Context, ifname string, rounds int, wait time.Du
 				continue
 			}
 			// ★ 非特权 ICMP 下内核会改写 ID，只能认 Seq（同 ping.go 里那条注释）。
+			//   顺手把类型也钉成回显应答：这一路是用来「发现设备」的，
+			//   把别的东西当成有人应答，界面上就会多出一台不存在的机器。
+			if rm.Type != ipv6.ICMPTypeEchoReply {
+				continue
+			}
 			echo, ok := rm.Body.(*icmp.Echo)
-			if !ok || echo.Seq != r {
+			if !ok || echo.Seq != base+r {
 				continue
 			}
 			ll := peerLinkLocal(peer, ifname)

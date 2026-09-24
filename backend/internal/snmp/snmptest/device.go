@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"net.yuhox.com/netkit/internal/snmp"
 )
@@ -166,18 +167,21 @@ func (d *Device) serve() {
 	//   回包而产生的 ICMP 端口不可达，在自己下一次读的时候把错误抛回来（ECONNREFUSED 最常见），
 	//   而客户端超时后先关自己的口是常态。一有错就 return 的写法，症状是「假设备明明在，
 	//   测试却连问三次说没人应」，且只在整包并发跑时出现 —— 单跑永远复现不了。
-	for misses := 0; ; {
+	//
+	// ★ 这里也不许「错够 N 次就自己不干了」：那些错误全来自**上一轮**发给已关闭端口的回包，
+	//   和本轮该不该答话无关，而它来得是一串（一次 ICMP 不可达一个）。以前有个次数上限，
+	//   整包并发跑到后面就会撞破，假设备在测试还在问的时候安静下来 ——
+	//   表现成 snmp-no-reply，而根因在我们自己写的这台设备里。
+	//   现在只在错误之间让出一小会儿，防止真坏了空转烧 CPU，永远不因此退出。
+	for {
 		n, peer, err := d.pc.ReadFromUDP(buf)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			if misses++; misses > 100 {
-				return // 一直是坏的就别空转烧 CPU
-			}
+			time.Sleep(time.Millisecond)
 			continue
 		}
-		misses = 0
 		d.handle(buf[:n], peer)
 	}
 }

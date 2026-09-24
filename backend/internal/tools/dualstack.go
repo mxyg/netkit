@@ -384,7 +384,8 @@ func probeGateway(ctx context.Context, f *familyResult, timeout time.Duration) {
 			dst.Zone = itoa(addr.ZoneID)
 		}
 	}
-	rtt, kind, perr := pingOnce(conn, addr, dst, 0x4e45, 1, timeout)
+	// ★ 序号随机：这一发和体检里到网关那一轮可能同时在跑，两边都从 1 开始会互摘回包（见 seqBase）。
+	rtt, kind, perr := pingOnce(conn, addr, dst, 0x4e45, seqBase(), timeout)
 	if perr != nil && kind == "" {
 		kind = egressSkipped // 发都发不出去（路由都没有），不硬给一个 no-reply
 	}

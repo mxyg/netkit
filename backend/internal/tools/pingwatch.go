@@ -389,6 +389,7 @@ type icmpWatcher struct {
 	addr    netaddr.Addr
 	dst     net.Addr
 	id      int
+	base    int // 线上序号起点，见 seqBase
 	timeout time.Duration
 }
 
@@ -403,7 +404,7 @@ func newICMPWatcher(a netaddr.Addr, timeout time.Duration) (*icmpWatcher, error)
 	}
 	return &icmpWatcher{
 		conn: conn, addr: a, dst: dst,
-		id: os.Getpid() & 0xffff, timeout: timeout,
+		id: os.Getpid() & 0xffff, base: seqBase(), timeout: timeout,
 	}, nil
 }
 
@@ -420,9 +421,13 @@ func (w *icmpWatcher) runN(ctx context.Context, interval time.Duration, n int) (
 }
 
 // probe 把「发一发」包成一个动作。
+//
+// ★ 交给样本的序号还是 1..n（人看的是第几发），只有线上的序号带起点 ——
+//
+//	对照组和主探测同时跑时，两边都从第 1 发数起，才不会把对方的回包认成自己的。
 func (w *icmpWatcher) probe() watchProbe {
 	return func(seq int) (time.Duration, string, error) {
-		return pingOnce(w.conn, w.addr, w.dst, w.id, seq, w.timeout)
+		return pingOnce(w.conn, w.addr, w.dst, w.id, w.base+seq, w.timeout)
 	}
 }
 

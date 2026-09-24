@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"net"
 	"os"
 	"runtime"
@@ -108,6 +110,8 @@ func doPing(ctx context.Context, raw json.RawMessage) (any, error) {
 	}
 
 	id := os.Getpid() & 0xffff
+	// ★ 序号从随机点起，不从 1 开始，原因见 seqBase。
+	base := seqBase()
 	var rtts []time.Duration
 	var gotUnreachable bool
 	sent, recv := 0, 0
@@ -116,7 +120,7 @@ func doPing(ctx context.Context, raw json.RawMessage) (any, error) {
 		if err := ctx.Err(); err != nil {
 			break
 		}
-		rtt, kind, err := pingOnce(conn, addr, dst, id, seq, timeout)
+		rtt, kind, err := pingOnce(conn, addr, dst, id, base+seq, timeout)
 		sent++
 		switch {
 		case err != nil:
@@ -235,8 +239,12 @@ func echoDst(a netaddr.Addr) (net.Addr, error) {
 
 func pingOnce(conn icmpConn, a netaddr.Addr, dst net.Addr, id, seq int, timeout time.Duration) (time.Duration, string, error) {
 	typ := icmp.Type(ipv4.ICMPTypeEcho)
+	errTyp := icmp.Type(ipv4.ICMPTypeDestinationUnreachable)
+	proto := 1 // ICMPv4
 	if a.Is6() {
 		typ = ipv6.ICMPTypeEchoRequest
+		errTyp = ipv6.ICMPTypeDestinationUnreachable
+		proto = 58
 	}
 	msg := icmp.Message{Type: typ, Code: 0,
 		Body: &icmp.Echo{ID: id, Seq: seq, Data: []byte("yuhox-netkit")}}
@@ -259,10 +267,6 @@ func pingOnce(conn icmpConn, a netaddr.Addr, dst net.Addr, id, seq int, timeout 
 		if err != nil {
 			return 0, verdictNoReply, nil // 超时或读失败：当没回应
 		}
-		proto := 1 // ICMPv4
-		if a.Is6() {
-			proto = 58
-		}
 		rm, err := icmp.ParseMessage(proto, buf[:n])
 		if err != nil {
 			continue
@@ -275,13 +279,70 @@ func pingOnce(conn icmpConn, a netaddr.Addr, dst net.Addr, id, seq int, timeout 
 				continue
 			}
 			return time.Since(start), verdictReachable, nil
-		case *icmp.DstUnreach:
+		default:
+			// ★ 不可达必须对上「说的是我们这一发」才算数，见 unreachableFor。
+			//   对不上就接着等真回音 —— 宁可报「没回应」，也不许把别处的失败记在这台机器头上。
+			if rm.Type != errTyp || !unreachableFor(a.Is6(), buf[:n], seq) {
+				continue
+			}
 			return 0, verdictUnreachable, nil
 		}
-		if time.Now().After(deadline) {
-			return 0, verdictNoReply, nil
+	}
+}
+
+// seqBase 一轮探测的线上序号起点。
+//
+// ★★ 随机、不从 1 开始，是为了同一进程里同时跑几路 ping 时不互摘回包：
+//
+//	非特权 ICMP 的 ID 会被内核改写，收包时只能按 Seq 认（见 pingOnce），
+//	两路都从 1 开始编号时，A 路的回包会被 B 路当成自己的 —— A 看到「丢包」，
+//	B 看到不知道哪来的数，而网络什么都没丢。体检里同时有到网关、对照组和出口探测，
+//	正是会撞上这件事的地方。
+func seqBase() int { return rand.IntN(40000) + 1 }
+
+// unreachableFor 判断一条 ICMP 不可达是不是在说我们刚发出去的那一发。
+//
+// ★ 不可达报文里会带一段原包的头部（至少带到原 ICMP 头），拿它比对序号才知道是谁的。
+//
+//	不对这段就收下，等于把同一个套接字上任何一条不相干的错误算到被 ping 的那台机器头上 ——
+//	实测过这种错法：同一进程里往一个没人听的 UDP 端口发包，本机自己产生的
+//	「端口不可达」被记成了「网关回了明确不可达」，体检因此指出一条根本不存在的根因。
+func unreachableFor(is6 bool, pkt []byte, seq int) bool {
+	// 不可达报文的固定头是 8 字节（类型/代码/校验和 4 字节 + 未使用 4 字节），
+	// 往后就是被投诉的那个原包。
+	const icmpHdr = 8
+	if len(pkt) < icmpHdr {
+		return false
+	}
+	raw := pkt[icmpHdr:]
+	off := 40
+	if !is6 {
+		if len(raw) < 20 || raw[0]>>4 != 4 {
+			return false
+		}
+		// v4 头第 10 字节是上层协议。不先看它，一条 UDP 的端口不可达（内层第 21 字节
+		// 恰好是源端口高八位）也有机会被读成「像我们的回显请求」。
+		if raw[9] != 1 {
+			return false
+		}
+		off = int(raw[0]&0x0f) * 4
+	} else {
+		if len(raw) < 40 || raw[0]>>4 != 6 || raw[6] != 58 {
+			return false
 		}
 	}
+	// 内层至少要有 type/code/checksum/id/seq 这 8 字节才认得出是谁的。
+	if len(raw) < off+8 {
+		return false
+	}
+	echo := byte(8) // ICMPv4 Echo Request
+	if is6 {
+		echo = 128 // ICMPv6 Echo Request
+	}
+	if raw[off] != echo {
+		return false
+	}
+	return int(binary.BigEndian.Uint16(raw[off+6:off+8])) == seq
 }
 
 func familyOf(a netaddr.Addr) string {
