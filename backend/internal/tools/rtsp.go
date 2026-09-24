@@ -26,12 +26,14 @@ import (
 // ★ 这几个的区分就是现场「盒子没画面」的排查树：
 //
 //	stream-ok       拿到了流描述，参数解出来了 —— 流本身没问题，问题在下游
+//	stream-no-media 认证过了、也回了 200，可应答里没有一条媒体轨 —— 这路流没配出来
 //	auth-required   要认证，没给或给错了 —— 十有八九是密码错，不是网络问题
 //	not-found       连上了、认证过了，但这个路径没有流 —— 通道号/路径写错了
 //	no-response     TCP 连上了，RTSP 不回话 —— 对面开着端口但不是 RTSP，或者卡死了
 //	unreachable     连都连不上
 const (
 	verdictStreamOK     = "stream-ok"
+	verdictStreamNoMed  = "stream-no-media"
 	verdictAuthRequired = "auth-required"
 	verdictNotFound     = "not-found"
 	verdictNoResponse   = "no-response"
@@ -191,6 +193,13 @@ func probeRTSP(ctx context.Context, raw json.RawMessage) (any, error) {
 	values["tracks"] = tracks
 	if n := len(tracks); n > 0 {
 		values["trackCount"] = n
+	}
+	// ★ 回了 200 不等于有流。描述头是空的（该通道没配码流、固件半应答），
+	//	按 stream-ok 报就成了「工具说流是好的、画面还是没有」——
+	//	这一格必须单独说，因为它把「去看下游」翻成「回设备那头配通道」。
+	if len(tracks) == 0 {
+		return ots.Verdict{Code: verdictStreamNoMed, Values: values,
+			Note: "连上、认证都过了，应答里却一条媒体轨都没有 —— 这路流在设备那侧就没配出来"}, nil
 	}
 	if v := firstVideo(tracks); v != nil && v.Width > 0 {
 		values["width"], values["height"], values["codec"] = v.Width, v.Height, v.Codec

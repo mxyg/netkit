@@ -58,6 +58,7 @@ const PAGES = [
   { g: '谁在网里', id: 'switch', name: '交换机（SNMP）', render: renderSwitch },
 
   { g: '出问题了', id: 'checkup', name: '一键体检与诊断包', render: renderCheckup },
+  { g: '出问题了', id: 'trouble', name: '按症状排查', render: renderTrouble },
 
   { g: '管别的机器', id: 'remote', name: '远程', render: renderRemote },
 
@@ -617,6 +618,12 @@ const DS_DNS = {
   'ok': ['解析出记录', 'ok'], 'no-record': ['这一族没有记录', 'warn'],
   'error': ['解析失败', 'bad'], 'skipped': ['未测', ''],
 };
+// Happy Eyeballs 那一步的读数。★ 单独拎出来是因为「按症状排查」走到双栈时，
+//   吐的顶层判定就是这一批码 —— 两处共用一份，换一句说法不必改两个地方。
+const DS_EYEBALLS = {
+  'eyeballs-ok': ['不会卡', 'ok'], 'eyeballs-stall': ['★ 会先卡一下', 'bad'],
+  'eyeballs-single': ['只有一族能连，没得选', 'warn'], 'eyeballs-fail': ['这个域名两族都连不上', 'bad'],
+};
 
 const pillOf = (map, code) => {
   const [text, cls] = map[code] || [code || '—', ''];
@@ -652,11 +659,7 @@ function attemptRow(title, list) {
 }
 
 function eyeballRow(eb) {
-  const map = {
-    'eyeballs-ok': ['不会卡', 'ok'], 'eyeballs-stall': ['★ 会先卡一下', 'bad'],
-    'eyeballs-single': ['只有一族能连，没得选', 'warn'], 'eyeballs-fail': ['这个域名两族都连不上', 'bad'],
-  };
-  const [text, cls] = map[eb.code] || [eb.code, ''];
+  const [text, cls] = DS_EYEBALLS[eb.code] || [eb.code, ''];
   let extra = '';
   if (eb.code === 'eyeballs-stall') {
     extra = ` 应用先试 <b>${esc(eb.preferred)}</b>，${eb.connDelayMs}ms 没连上就并行起 <b>${esc(eb.winner)}</b>：`
@@ -3759,6 +3762,8 @@ function rtspCard() {
 const RTSP_CODE = {
   'stream-ok': ['有流', 'ok',
     '★ 设备肯给流，上面这些轨就是它能给的全部规格。接进平台前对一下编码和分辨率是不是要的那路码流——主码流/子码流常常只差路径里的一位数字。'],
+  'stream-no-media': ['回了 200，但一轨媒体都没有', 'bad',
+    '★ 连上、认证都过了，这条路径上却没配出码流 —— 不是下游的问题。去设备那侧看这个通道有没有启用（很多相机加完通道默认不开子码流），再把路径里的通道号 / 码流类型对一遍。'],
   'auth-required': ['要账号密码', 'warn',
     '★ 401 不是设备坏了，是问到了、只是不让看。先核对账号密码，再确认这个账号有没有该通道的取流权限（NVR 上不同用户开的通道不一样）。'],
   'not-found': ['这个路径没有流', 'bad',
@@ -4424,6 +4429,10 @@ async function renderLocal(root) {
 async function renderCheckup(root) {
   root.appendChild(checkupCard());
   root.appendChild(diagBundleCard());
+}
+
+async function renderTrouble(root) {
+  root.appendChild(troubleCard());
 }
 
 // ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
@@ -5531,6 +5540,491 @@ function fileshareCard() {
   };
   card.querySelector('#fs-root').onkeydown = (e) => { if (e.key === 'Enter') card.querySelector('#fs-go').click(); };
   refresh(true);   // 只读一次状态，不动系统：进页面就要看得见「现在开着没有」
+  return card;
+}
+
+/*
+ * ── 按症状排查（net.troubleshoot）──
+ *
+ * ★★ 和上面那张体检卡的分工写在脸上：体检是「不管三七二十一全过一遍」，给出八项结果，
+ *   从哪一条开始看由人判断；这一张是人先说一句症状，按工程师的顺序**只走那一条路**，
+ *   停在第一个能解释症状的判定上，并且把「第几步问了什么 / 答了什么 / 所以接下来问什么」
+ *   整条留下 —— 那条路径才是拿去跟二线对质的东西，一句「网络没问题」不是。
+ *
+ * ★★ 每一步的判定话术**这里一份都不重写**。树里每一步就是本页另一张卡用的那个工具，
+ *   给的也是它那一批判定码，所以直接查它自己那份字典（TREE_CODE_OF）。
+ *   在这儿另写一套，等于给同一件事造两套会各自腐烂的说法 ——
+ *   和后端「树不重造判定，只调已有工具」是同一条纪律。
+ *
+ * ★ 没问出去的步骤必须显式渲染成「没问」，不许留空栏：空栏会被读成「问了，没问题」。
+ */
+
+// 六种症状：名字和后端那六个稳定标识一致，中文只活在这里。
+const SYMPTOM = {
+  'no-internet': ['这台机器上不去网',
+    '什么都不用填，这台机器就是主角。★ 要拿某个内网域名当对照组，再填在「目标」里。'],
+  'host-down': ['点名一台机器连不上',
+    '把连不上的那一台填在「目标」（IP 或域名都收）。★ 不填就只查我们这台到公网那一段，点不到你手上那一台。'],
+  'slow': ['通是通，但很慢',
+    '填那个慢的地址。要是慢的是某个网页或接口，把完整地址填在高级的「网址」里 —— 只有那样才量得出各段各占了多少。'],
+  'flaky': ['偶尔卡一下 / 时好时坏',
+    '填那个「时好时坏」的地址。★ 这种病要多发几发才挑得出来，别勾「快一点」。'],
+  'cert-error': ['证书报错 / HTTPS 打不开',
+    '填报错的那个地址（或者把浏览器地址栏那串贴到高级的「网址」）。★ 这一条会先问时间，再决定是不是证书的锅。'],
+  'device-down': ['一台设备不在线 / 没画面',
+    '把那台设备的地址填进来。有 rtsp 取流地址就填在高级的「网址」里，最后一步会去问它肯不肯给流。'],
+};
+
+// 五种状态。★ 这一列是这张卡最要紧的一列：「没去问」和「问了没有」差一次跑错机房。
+const TREE_STATUS = {
+  asked: ['问了', '', ''],
+  'not-asked': ['没问出去', 'warn', '缺前面的事实，这一步一个包都没发'],
+  skipped: ['没问到这一步', '', '停在前面那一步了，按顺序不必问'],
+  unreadable: ['问了，但没读出要的那一项', 'bad', '是我们读不到，不是网络没答'],
+  failed: ['这一步自己出错了', 'bad', '参数、权限或工具内部的错，不能当成「查过了没问题」'],
+};
+
+// 顶层那三种「没定位到根因」的读数。
+const TREE_TOP = {
+  'no-cause-found': ['这条路每一步都正常', 'warn',
+    '★ 这不等于「没毛病」，只等于「毛病不在我们问的这几步里」：症状多半在对端、在应用配置、或者在'
+    + '另一块网卡上。看下面哪几步压根没问出去 —— 那几步才是这份结论的边界，也是下一步该补的地方。'],
+  stopped: ['时间用完，只走到一半', 'warn',
+    '这份路径只到标了状态的那几步，后面全是「没问到」。★ 别把这份当整条结论用：'
+    + '在高级里把「最长跑多久」调大，或者勾上「快一点」少发几发，再跑一次。'],
+  'nothing-asked': ['一步都没问出去', 'bad',
+    '要问的目标信息压根没给够，所以一个探测包都没发。★ 这一档最容易被读成「查过了，都没事」—— '
+    + '它什么都没说。把「目标」填上（点名的那台机器 / 那个网址）再来一次。'],
+};
+
+// 每一步的判定话术 = 那个工具自己那份字典（可以不止一份：双栈那一步的顶层判定
+// 有两种来源，双栈体检自己那批、和 Happy Eyeballs 那一批）。
+// ★ 见上面的注释：一份都不重写。
+const TREE_CODE_OF = {
+  checkup: [CK_TOP], 'route-list': [RT_CODE], 'route-target': [RT_CODE],
+  dns: [DNS_CODE], 'dns-multi': [DNS_CODE], dualstack: [DS_TOP, DS_EYEBALLS],
+  'gw-watch': [WATCH_CODE], watch: [WATCH_CODE], ping: [PING_CODE],
+  trace: [TRACE_CODE], mtr: [MTR_CODE], clock: [TIME_CODE], tcp: [PROBE_CODE],
+  ports: [SCAN_CODE], 'on-link': [SUBNET_CODE], tls: [CERT_CODE],
+  http: [HTTP_CODE], mtu: [MTU_CODE], stream: [RTSP_CODE],
+};
+
+// 树里问到的那一步没给出话术时，只回落到码本身 —— 不许在这儿编一句人话顶上：
+// 那等于把「我们没译」演成「网络就这么个说法」。测试逐条钉着这批码。
+function treeCodePill(step, code) {
+  if (!code) return '';
+  for (const dict of TREE_CODE_OF[step] || []) {
+    const hit = dict[code];
+    if (hit) return `<span class="pill ${hit[1]}">${esc(hit[0])}</span>`;
+  }
+  return `<span class="pill">${esc(code)}</span>`;
+}
+
+/*
+ * 根因话术。★★ 这里的每一条都是「停在这一点上，接下来去动什么」，
+ *   不是对判定的复述 —— 复述那一步的判定在表格里已经有，人要看的是下一步的手。
+ */
+const TREE_CAUSE = {
+  // ── 这台机器上不去网 ──
+  'cause-no-interface': ['一块在用的网卡都没有', 'bad',
+    '要么全被禁用，要么没有一块拿到可用地址 —— 后面每一步都是在它之上测的，先解决这一步。'
+    + '查网卡开关、虚拟口 / VPN 的残留、无线关联上了没有。'],
+  'cause-link-down': ['网卡开着，链路却没起来', 'bad',
+    '线没插 / 对端那个口没起来 / 没连上 AP。★ 这一条不用查任何配置：先看这块口的灯和对端口，'
+    + '是物理层的事。'],
+  'cause-no-address': ['链路是好的，但没拿到地址', 'bad',
+    'DHCP 没发地址（现场最常见的是那个口被划在另一个 VLAN 里），或者静态地址压根没配。'
+    + '去「DHCP 分地址」那一页看有没有应答，再回来看这块口的地址。'],
+  'cause-no-default-route': ['有地址，却没有默认路由', 'bad',
+    '这台机器只会发到本网段：局域网里什么都通，外面一个都到不了。查 DHCP 有没有发网关、'
+    + '静态配置里网关那栏填了没有。'],
+  'cause-gateway-loss': ['到网关就在丢包', 'bad',
+    '★ 网关在丢包时，解析和外网的「慢」都是它带出来的，不是那几层自己的毛病 —— 先修这一段，'
+    + '再回头看后面那些数。查线、查 AP 信号、查那个口的协商速率。'],
+  'cause-gateway-unreachable': ['网关明确回了「到不了」', 'bad',
+    '有人答了话，说明本机到网关这一路是通的，是网关自己没有出路。'
+    + '查它上游那条链路、它自己的默认路由和 NAT。'],
+  'cause-gateway-silent': ['网关一个都不回', 'bad',
+    '★ 这不能直接读成「网关死了」：它拦 ICMP 时长得一模一样。换个不依赖 ICMP 的办法验一次 —— '
+    + '探一个公网 IP（跳过解析），或者另拿一台机器同时测，才知道是不是只有这台的事。'],
+  'cause-dns-server-dead': ['配了 DNS 服务器却问不到', 'bad',
+    '「网页打不开，但 IP ping 得通」就是这一层。换成问网关或一个公共 DNS 再试一次：'
+    + '能出结果说明配的那台不干活，还不行就是 53 端口被拦。'],
+  'cause-dns-upstream': ['DNS 服务器自己查不到', 'bad',
+    'SERVFAIL 是它那一侧的账（它的上游或转发坏了），改本机没用的方向。'
+    + '换一台服务器就能出结果 —— 现场常是内网 DNS 只配了转发、转发目标却不通。'],
+  'cause-dns-refused': ['DNS 服务器不给递归查询', 'bad',
+    '这台解析器只服务内网（不替你查公网名字）。换一台公共 DNS，'
+    + '或者把查询发给你自己搭的那台递归。'],
+  'cause-dns-bad-response': ['回来的不是能解的 DNS 报文', 'bad',
+    '★ 这多半不是 DNS 坏了，是有设备在冒充 / 改写它（老网关、透明代理、被投毒的缓存）。'
+    + '换一个 DNS 服务器或走加密 DNS 再问一次，能分清是谁在动。'],
+  'cause-name-missing': ['这个域名不存在', 'bad',
+    '服务器明确说没有这个名字。先核对有没有拼错、少带后缀；内网名字要看这台机器有没有走'
+    + '那个搜索域 / 那个 hosts 文件。'],
+  'cause-v6-egress-broken': ['IPv6 有路却出不了外网', 'bad',
+    '★ 这是「网很慢」的真身之一：应用先试 IPv6，等它失败才回落到 IPv4，于是每一次连接都慢半拍，'
+    + '而 ping 和体检看着都正常。要么修上游的 IPv6，要么先把这块口的 IPv6 关掉。'],
+  'cause-path-stalled': ['路断在中间某一跳', 'bad',
+    '最后一台有回应的设备之后，再没人回过话 —— 停在哪台写在那一步的依据里。'
+    + '查那一台和它后面那条链路，别再从两头互相 ping 了。'],
+  'cause-path-silent': ['第一跳就没回应，说不通路断没断', 'warn',
+    '★ 路由器不回应探测包时，「路好好的」和「路断了」是同一个形状。改用探端口或直接连服务确认'
+    + '终点到不到得了，再决定查哪一段。'],
+  'cause-no-route-to-target': ['本机没有去往那个地址的路由', 'bad',
+    '一个包都没发出去，所以跟对端防不防火没有任何关系。查自己：地址和掩码配得对不对、'
+    + '是不是根本不在同一个网段、多网卡机器上有没有那块口的路由。'],
+  'cause-clock-way-off': ['本机时钟差得足以让别的东西出错', 'bad',
+    '这个量级上证书会被判「已过期」或「还没生效」、租约会算成早到期、日志时间戳排不进正确顺序 —— '
+    + '现场看到的「网有问题」，根在这里。先校时，再回头看别的。'],
+  'cause-clock-skewed': ['时钟有偏差，但还没到出事的地步', 'warn',
+    '★ 只有一个时间源答的时候，这里只说差多少、不指认是谁不对。要指认，多配几个源再问一次。'],
+  'cause-proxy-in-the-way': ['系统代理指着一台连不上的机器', 'bad',
+    '★ 这种机器最骗人：ping、探端口、直连公网全都正常，只有应用打不开 —— 因为应用走代理，'
+    + '而体检那一圈里有几项是不走代理的。查代理地址、端口，或者先把系统代理关掉再试。'],
+
+  // ── 点名一台机器 ──
+  'cause-target-off-link': ['二层就没有它（同网段没人认它）', 'bad',
+    '★ 这一条值得单独一档：扫的是它所在那一段，清单里别的设备都在，只有它一个信号都没发过 —— '
+    + '网络配置已经不用查了，去查线、查供电（PoE 那个口给没给功率）、查它是不是关着机。'],
+  'cause-target-alive-noicmp': ['它是活的，只是不理 ping', 'warn',
+    '同网段那一问里它吭过声（应了 ARP），却不回 ICMP —— 摄像头、NVR 十台九台这样，'
+    + '多数还带「一键禁 ping」的开关。★ 别再拿 ping 不通当证据了，直接去问它服务的端口。'],
+  'cause-target-unreachable': ['有设备明确回了「到不了这台」', 'bad',
+    '这比「没回应」有用得多：包出得去、也有人回话，路是通的，问题在终点或某台设备的路由上。'
+    + '查它的地址还在不在、中间那台路由有没有到它的路由。'],
+  'cause-target-no-reply': ['一路都没回，也没拿到二层证据', 'bad',
+    '★ 这一档故意不给「它挂了」的结论：整段被静默、它自己关机、地址被人改了，全是这个形状。'
+    + '要么把「目标」填成它的 IP（跳过解析）再跑一次，要么换一台同网段的机器同时测。'],
+  'cause-service-closed': ['机器在，那个端口上没服务', 'bad',
+    '端口明确回了拒绝 —— 拒绝说明它收到了包，所以主机活着、路也通。'
+    + '去看服务起没起、端口号对不对（摄像头 554 是 RTSP，80 是 Web，8000 / 8200 是各家私有 SDK）。'],
+  'cause-service-filtered': ['那个端口一个回包都没有', 'bad',
+    '多半是中间有人静默丢（防火墙 / ACL / 端口防护），也可能是主机根本不在。'
+    + '★ 这两件事的下一步完全不同，所以先用同网段那一问或探一片端口确认主机在不在。'],
+  'cause-host-alive': ['网络和端口都没问题，症状不在这条路上', 'warn',
+    '★ 这一条是拿来收口的：它活着、端口也开着，所以「上不去」的账要记到服务里去的'
+    + '那一层（账号、通道号、并发满了、它只放行指定 IP）。拿取流那一步去问它回什么。'],
+
+  // ── 通是通，但很慢 ──
+  'cause-link-jitter': ['链路本身在抖', 'bad',
+    '没丢包，但快慢差得明显。★ 抖和丢是两种病：丢要查链路（线、信号、协商、环路），'
+    + '抖多半是排队 —— 查那条链路是不是被某台机器占满了，或者 AP 上挂了太多客户端。'],
+  'cause-link-loss': ['链路上有丢包，重传把一切拖慢', 'bad',
+    '★ 丢包时的「慢」不该记到应用头上：TCP 每丢一次就要等一次重传超时，'
+    + '用户看到的就是「转很久」。先把这一段修干净，再看那些分段耗时还剩多少。'],
+  'cause-v6-stall': ['应用先卡在 IPv6 上，再回落', 'bad',
+    '双栈机器上「慢」最省事的解释：每一次新建连接先赌 IPv6，赌输了再走 IPv4，'
+    + '于是每次多等一截。修上游 v6，或先把这块口的 IPv6 关掉再测一次对比。'],
+  'cause-dns-slow': ['慢在解析这一段', 'bad',
+    '各段耗时里解析占了大头，说明服务器能答只是答得慢（转发链长、DNS sec 校验、'
+    + '或者被限速）。换一台近的 DNS、或者把常用名字做成本地解析，效果立竿见影。'],
+  'cause-connect-slow': ['慢在 TCP 握手这一段', 'bad',
+    '网络往返本身就慢或第一跳 SYN 被丢了一次 —— 查路由距离、对端 backlog，'
+    + '以及中间有没有在改写连接。★ 服务端处理慢不是这一条。'],
+  'cause-tls-slow': ['慢在 TLS 那一段', 'bad',
+    '常见于设备证书链太长、要现场补中间证书，或者双方的套件要来回试几轮才谈成。'
+    + '把证书链配齐（配上中间证书）能省掉这一段的大半。'],
+  'cause-app-slow': ['网络各段都利索，慢在服务自己想', 'bad',
+    '★ 这条的作用是把人从网络侧叫回来：包没丢、往返没抬升、握手也快，账全在服务器处理时间里。'
+    + '去查那个服务的日志、数据库和上游，别再翻交换机了。'],
+  'cause-path-latency': ['从某一跳起往返抬升，并一路带到终点', 'bad',
+    '抬升起点那一跳就是分界：它之前还是好的。要查的是那一段链路（或那个出口在拥塞），'
+    + '不是终点机器 —— 它只是替前面所有环节把账付了。'],
+  'cause-mtu-too-small': ['路上有一个更小的包长限制', 'bad',
+    '大包就是在中间某一环被挡住或被迫分片：隧道、VPN、PPPoE、被人改小过的交换机口。'
+    + '★ 这条专门治「连得上、ping 得通，视频一出来就卡 / 传文件传到一半断」——'
+    + '因为别的探测发的是小包。把本机网卡 MTU 设成那一步给的建议值就能先绕过去。'],
+
+  // ── 偶尔卡一下 ──
+  'cause-intermittent-loss': ['有一段在突发丢包', 'bad',
+    '★ 「一直不丢」和「偶尔丢」是两个查法：一直丢能立刻定位，突发丢要么有规律（定时任务、'
+    + '无线信道跳频、某台机器周期发广播），要么是被偶发拥塞。连续 ping 和逐跳质量里都写了第几轮、'
+    + '第几发丢的，拿那个时间点对它的日志。'],
+  'cause-path-moved': ['等价路径在翻动', 'warn',
+    '同一跳出现过不止一个下一跳：负载分担本来就这样，不算故障。★ 只有当每次翻到一条更烂的路时才卡人 —— '
+    + '对照那一步的丢包和往返看，别看它翻没翻。'],
+  'cause-multi-default': ['同族有多条默认路由，选路在换', 'bad',
+    '多网卡、或者插了 VPN 之后最典型的病：两条一样的路优先级接近，内核在它们之间换 —— '
+    + '换到那条不通的就卡一下。★ 这是本机的事，留一条默认路由，或者给另一条降优先级 / '
+    + '改成只走指定网段。'],
+  'cause-round-robin-bad': ['一个名字解出几台，其中一台是坏的', 'bad',
+    'DNS 轮询里混了一台下线或半死的机器：解到它就通、解到它就不通，看上去完全是随机。'
+    + '★ 这一条要拿那个名字的完整清单去看，哪一台连不上就先从解析里摘掉。'],
+  'cause-clock-disagree': ['两台机器的钟不一致，日志对不上号', 'bad',
+    '★ 这时候不能指认谁不对：至少有一个时间源自己就是坏的（或者中间有设备在改写 NTP）。'
+    + '先把对不上的那一个从服务器列表里去掉再问一次，剩下的才可信。'],
+
+  // ── 证书 ──
+  'cause-cert-expired': ['证书确实过期了', 'bad',
+    '时间也对得上，所以是证书自己的账。必须重新签发一张 —— 过期之后所有客户端都会拒绝，'
+    + '重装应用、清缓存、换浏览器都没用。'],
+  'cause-cert-not-yet-valid': ['证书确实还没到生效时间', 'bad',
+    '★ 走到这一条，本机那个钟已经对过了、是好的（偏到足以冤枉证书的那种会单独报出来），'
+    + '所以「还没生效」是证书自己说的实话：要么这张证书刚签、还没到它写的生效时刻，'
+    + '要么签它的那台机器钟超前，把生效时间签到了未来。去签发的那一头对时刻。'],
+  'cause-cert-name-mismatch': ['证书上的名字和访问的地址对不上', 'bad',
+    '要么改用证书上写着的名字访问，要么按现在这个地址重签一张。'
+    + '★ 用 IP 访问内网设备最常撞这一条（设备证书一般只写名字，不写 IP）。'],
+  'cause-cert-untrusted': ['证书本身没坏，是本机不认这条链', 'warn',
+    '自签、缺中间证书、或者本机没装那个根 —— 内网设备的出厂默认。'
+    + '把它的根证书装进本机信任列表，或者让设备出示完整的链。'],
+  'cause-cert-weak-protocol': ['对方只肯谈老版本 TLS', 'bad',
+    'TLS 1.0 / 1.1 已被新版浏览器和平台直接拒绝连接。★ 要升级的是设备侧的 TLS 栈，'
+    + '换证书解决不了 —— 老固件的设备只能换固件或者放在只走专网的位置上。'],
+  'cause-clock-made-cert-bad': ['证书是被本机时钟冤枉的', 'bad',
+    '★★ 这一条是这张树里最值钱的一档：证书没过期，是这台机器的钟偏得把它推出了有效期窗口。'
+    + '没有「先问时间」这一步，现场就会白跑一趟 CA，而毛病在自己主机的任务栏上。先校时，'
+    + '再看那个报错还在不在。'],
+  'cause-not-tls': ['那个端口回的不是 TLS', 'bad',
+    '地址写成了 https，端口后面却是明文服务（或者反过来）。★ 改个前缀就好，'
+    + '不用查证书也不用查网络 —— 这一条单独占一档就是为了别让人去装证书。'],
+
+  // ── 一台设备不在线 / 没画面 ──
+  'cause-device-off-link': ['二层就没有这台设备', 'bad',
+    '★ 同网段那一问里别的设备都在，只有它一个信号没发过：网络配置不用查了。'
+    + '去查线、查那个 PoE 口给没给功率、查它是不是关着机或被人搬走了。'],
+  'cause-device-no-icmp': ['设备活着，只是不理 ping', 'warn',
+    '它应了 ARP 却不回 ICMP —— 这是摄像头的常态，不是毛病。★ 别拿「ping 不通」写进报告里说设备离线，'
+    + '去问它的服务端口（554 / 80 / 私有 SDK 口）。'],
+  'cause-device-no-service': ['设备在，但那些服务口一个都没开', 'bad',
+    '端口明确回了拒绝，说明主机活着。★ 那就不是链路的事：查取流服务开没开、'
+    + '通道号对不对、这个账号有没有该通道的权限（NVR 上不同用户开的通道不一样）。'],
+  'cause-stream-auth': ['问到了，只是不让看', 'warn',
+    '★ 401 不是设备坏了，是它答了并且认得这个请求。核对账号密码，再确认这个账号'
+    + '对该通道有取流权限 —— 现场十次有八次是权限而不是密码。'],
+  'cause-port-not-rtsp': ['那个口接了 TCP，却不说 RTSP', 'bad',
+    '★ 端口是开的、连接也建了，但对面不认 RTSP 这句话 —— 多半是端口号填错了：'
+    + '554 才是 RTSP，80 是 Web 管理页，8000 / 8200 是各家私有 SDK 的口子。'
+    + '对着「扫一片端口」那一行看它到底开的是哪个口，再改地址里的端口。'],
+  'cause-stream-missing': ['设备答了，但这个通道上没有这路流', 'bad',
+    '设备是好的、账号是好的，只有路径不对。★ 海康是 /Streaming/Channels/101，'
+    + '大华是 /cam/realmonitor?channel=1&subtype=0 —— 通道号和主/子码流就差最后那几位。'],
+  'cause-stream-broken': ['设备应了，但这路流没配出媒体轨', 'bad',
+    '连上、认证都过了，DESCRIBE 的应答里一条媒体轨都没有 —— 这不是「拉不到画面」，'
+    + '是设备上那一通道根本没出码流。去设备那侧确认通道已启用、码流（主/子）已配置，'
+    + '再换一条路径问一次。'],
+  'cause-stream-ok': ['流在播，「没画面」是那头的显示侧', 'warn',
+    '★ 这一条的作用是把人从设备前叫走：它肯给流、编码和分辨率都对。'
+    + '查客户端的解码能力、播放器那边收没收到、或者平台有没有把这路转发出去。'],
+  'cause-egress-blocked': ['路到得了出口那台机器，却连不上它那个口', 'bad',
+    '局域网好、解析也正常、路径也追到了，就是连不上那个端口 —— 拦在中间或出口那一段：'
+    + 'NAT 没做、ACL 只放行了内网、或者认证门户还没过。★ 这一档不该去查终端设备。'],
+  'cause-wrong-scheme': ['协议前缀写反了', 'warn',
+    '明文口写成 https（或反过来）。★ 这不是慢，是先撞一次再重试 —— 所以症状看着像「慢」，'
+    + '改个前缀就消失。取流地址用 rtsp://，别用 http://。'],
+};
+
+// 每一步给人看的那几项取值。★ 后端按 shows 挑好了给人看的字段，这里只负责说清是什么。
+const TREE_FACT = {
+  first: '先坏在', count: '一共几条', multiDefault: '同族默认路由',
+  iface: '出口网卡', destination: '目的', direct: '是不是直连', from: '这个结论从哪来',
+  sent: '发出', recv: '收到', received: '收到', lossPercent: '丢包率',
+  jitterAvgMs: '抖动', rttMaxMs: '最大往返', rttAvgMs: '平均往返', spikes: '尖峰在第几发',
+  lostAt: '丢在第几发',
+  rcode: '应答码', server: '问的是哪台服务器', elapsedMs: '用时', eyeballs: '两族谁先连上',
+  family: '地址族', hopsSeen: '见到几跳', engine: '用什么测的',
+  lossHop: '丢包从第几跳起', latencyHop: '变慢从第几跳起', goalSeen: '见到终点',
+  roundsDone: '跑完几轮', target: '问的是', open: '开着的口', closed: '关着的口',
+  filtered: '一个都没回', scanned: '扫了几个口', openPorts: '开着的端口清单',
+  subnets: '扫的网段', alive: '在有几台', asked: '问了几个地址', hosts: '清单',
+  notAfter: '到期时间', notBefore: '生效时间', issuer: '签发者', subject: '证书上的名字',
+  protocol: '谈成的协议版本', daysLeft: '还剩几天', status: '状态', timings: '各段耗时',
+  url: '地址', offsetMs: '差了多少', checkedWith: '问的是哪台时间源',
+  agreeSources: '互相印证的源', attribution: '是谁不对', codec: '编码',
+  width: '宽', height: '高', trackCount: '有几路轨', answers: '解出来的地址',
+  pathMtu: '路上允许的包长', suggestion: '建议设成', mtu: '这块口的 MTU',
+  lossAt: '丢在第几发',
+  // 双栈那一步里 Happy Eyeballs 那几项
+  code: '读数', preferred: '先试', winner: '连上的是', stallMs: '要卡',
+  worstMs: '最坏卡', connDelayMs: '多久回落', willStall: '会不会先卡',
+  // 网页探测那一步的分段耗时
+  lookupMs: '解析', connectMs: '建连', tlsMs: 'TLS', serverMs: '服务端', totalMs: '合计',
+};
+
+// 布尔值在人话里必须带上「是谁给的」：direct=true 是「按表算着像直连」，不是「一定直连」。
+const TREE_YESNO = { direct: ['算直连', '不算直连'], goalSeen: ['见到了', '没见到'] };
+
+function treeFactWord(k, v) {
+  if (typeof v === 'boolean') {
+    // 布尔值也要有个名字：直接印 true/false 等于没译。
+    const t = TREE_YESNO[k] || ['是', '否'];
+    return v ? t[0] : t[1];
+  }
+  if (typeof v === 'number') return /Ms$/.test(k) ? ms(v) : `${v}`;
+  return esc(v);
+}
+
+function treeFactVal(k, v) {
+  if (v === null || v === undefined || v === '') return '<span class="dim">—</span>';
+  if (k === 'first') return esc(CK_STEP[v] || v); // 体检那一步说「先坏在」哪一项，用同一套词
+  // 套在事实里的小判定（双栈那一步的 eyeballs 读数）用同一张字典，别露英文码。
+  if (k === 'code' && DS_EYEBALLS[v]) return esc(DS_EYEBALLS[v][0]);
+  if (Array.isArray(v)) {
+    if (!v.length) return '<span class="dim">一条都没有</span>';
+    const items = v.slice(0, 4).map((x) => {
+      if (x && typeof x === 'object') {
+        // 主机 / 解析结果那一类：优先给地址，再给它凭什么在线。
+        const addr = x.addr || x.ip || x.address || x.name || x.value || '';
+        const ev = x.evidence ? `（${esc(EVIDENCE[x.evidence] ? EVIDENCE[x.evidence][0] : x.evidence)}）` : '';
+        const mac = x.mac ? `<span class="dim"> ${esc(x.mac)}</span>` : '';
+        if (addr) return `${esc(addr)}${ev}${mac}`;
+        return esc(Object.entries(x).slice(0, 2).map(([kk, vv]) => treeFactWord(kk, vv)).join(' '));
+      }
+      return esc(String(x));
+    });
+    const more = v.length > 4 ? `<span class="dim"> 等 ${v.length} 条</span>` : '';
+    return `${items.join('、')}${more}`;
+  }
+  if (typeof v === 'object') {
+    return Object.entries(v)
+      .map(([kk, vv]) => `<span class="dim">${esc(TREE_FACT[kk] || kk)}</span> ${treeFactVal(kk, vv)}`)
+      .join('　');
+  }
+  return treeFactWord(k, v);
+}
+
+function treeFacts(f) {
+  const e = Object.entries(f || {});
+  if (!e.length) return '<span class="dim">—</span>';
+  return e.map(([k, v]) => `<span class="dim">${esc(TREE_FACT[k] || k)}</span> ${treeFactVal(k, v)}`)
+    .join('<br>');
+}
+
+function treeArgs(a) {
+  const e = Object.entries(a || {});
+  if (!e.length) return '<span class="dim">—（这一步不带参数）</span>';
+  // ★ 后端已经把口令和团体名换成占位词了；这里只是别把它们摊成一大片。
+  return e.map(([k, v]) => `<code>${esc(k)}=${esc(treeArgWord(k, v))}</code>`).join(' ');
+}
+
+function treeArgWord(k, v) {
+  if (typeof v === 'boolean') return v ? '是' : '否';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return v;
+}
+
+function treeStepRow(s, i) {
+  const st = TREE_STATUS[s.status] || [s.status || '—', 'bad', ''];
+  const codePill = s.code === 'tool-missing'
+    // ★ 这一条不是网络的读数，是我们那张表写错了 —— 必须说成我们的锅。
+    ? '<span class="pill bad">路线里写着它，可它没注册</span>'
+    : treeCodePill(s.step, s.code);
+  const why = s.note || s.toolNote || st[2];
+  return `<tr>
+    <td class="dim">${i + 1}</td>
+    <td>${esc(s.stepName || s.step)}<div class="dim"><code>${esc(s.tool)}</code></div></td>
+    <td>${treeArgs(s.args)}</td>
+    <td><span class="pill ${st[1]}">${esc(st[0])}</span></td>
+    <td>${codePill || '<span class="dim">没有判定</span>'}${why ? `<div class="dim" style="margin-top:3px">${esc(why)}</div>` : ''}</td>
+    <td>${treeFacts(s.facts)}</td>
+  </tr>`;
+}
+
+function troubleCard() {
+  const card = $(`<div class="card">
+    <h2>按症状排查 <span id="tr-top"></span></h2>
+    <p class="hint">上面那张体检是「全过一遍」，这一张是<b>你说一句症状，我按工程师的顺序只走那一条路</b>，
+      停在第一个能解释它的判定上。★ 每一步都写明「问了什么工具、答了什么、所以接下来问什么」，
+      没问出去的那几步也留着 —— 那份推理路径可以直接拿去跟二线对质，比一句「网络没问题」有用。
+      全程只读、不发多余的包、不改任何东西。</p>
+    <div class="row">
+      <div style="flex:0 0 250px"><label>哪一句症状</label>
+        <select id="tr-s">${Object.entries(SYMPTOM).map(([k, v]) =>
+          `<option value="${k}">${esc(v[0])}</option>`).join('')}</select></div>
+      <div><label>目标（地址或域名）</label>
+        <input id="tr-t" placeholder="192.168.1.64 或 cam.example.com"></div>
+      <div style="flex:0 0 110px"><label>端口</label><input id="tr-p" placeholder="554 / 443"></div>
+    </div>
+    <p class="hint" id="tr-hint" style="margin-top:8px"></p>
+    <div id="tr-auth" style="display:none;margin-top:10px">
+      <div class="row">
+        <div><label>账号（问设备取流时用）</label><input id="tr-u" autocomplete="off"></div>
+        <div><label>口令</label><input id="tr-w" type="password" autocomplete="off"></div>
+        <div><label>SNMP 团体名</label><input id="tr-c" autocomplete="off"></div>
+      </div>
+      <p class="dim" style="margin-top:6px">★ 填在这里的口令和团体名<b>不会</b>出现在结果、推理路径或诊断包里
+        —— 路径上只留「给了、但没写出来」，所以「配了但没给你看」和「没配」在结果里分得开。</p>
+    </div>
+    <details style="margin-top:8px"><summary class="dim">高级：换网址 / 多个端口 / 只在哪块网卡上找 / 跑多久</summary>
+      <div class="row" style="margin-top:10px">
+        <div><label>网址（慢、证书报错时给具体地址；取流给 rtsp://）</label>
+          <input id="tr-x" placeholder="https://192.168.1.20 或 rtsp://..."></div>
+        <div style="flex:0 0 170px"><label>要看好几个端口</label><input id="tr-ps" placeholder="554,80,8000"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div style="flex:0 0 190px"><label>只在这块网卡上找</label><input id="tr-i" placeholder="en0 / eth0"></div>
+        <div style="flex:0 0 120px"><label>单发等待 ms</label><input id="tr-to" placeholder="默认 2000"></div>
+        <div style="flex:0 0 130px"><label>这棵树最长跑几秒</label><input id="tr-ms" placeholder="默认 120"></div>
+        <div style="flex:0 0 150px"><label>&nbsp;</label>
+          <label class="dim"><input type="checkbox" id="tr-q"> 快一点（少发几发，先要个方向）</label></div>
+      </div>
+    </details>
+    <div style="margin-top:12px"><button class="btn primary" id="tr-go">开始排查</button></div>
+    <div id="tr-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#tr-out');
+  const top = card.querySelector('#tr-top');
+  const pick = card.querySelector('#tr-s');
+  const hint = card.querySelector('#tr-hint');
+  const auth = card.querySelector('#tr-auth');
+  const sync = () => {
+    hint.textContent = SYMPTOM[pick.value][1];
+    // ★ 凭据那一栏只在会用得着它的那一句症状下现身。
+    auth.style.display = pick.value === 'device-down' ? '' : 'none';
+  };
+  pick.onchange = sync;
+  sync();
+
+  card.querySelector('#tr-go').onclick = async () => {
+    top.innerHTML = '';
+    const args = { symptom: pick.value };
+    const put = (id, key, asNumber) => {
+      const x = card.querySelector('#' + id).value.trim();
+      if (!x) return;
+      args[key] = asNumber ? Number(x) : x;
+    };
+    put('tr-t', 'target'); put('tr-p', 'port', true); put('tr-ps', 'ports');
+    put('tr-x', 'url'); put('tr-i', 'iface'); put('tr-to', 'timeoutMs', true);
+    put('tr-ms', 'maxSeconds', true);
+    put('tr-u', 'username'); put('tr-w', 'password'); put('tr-c', 'community');
+    if (card.querySelector('#tr-q').checked) args.quick = true;
+    out.innerHTML = `<div class="empty">排查中…（按顺序只走那一条路，最长 ${args.maxSeconds || 120} 秒 ——
+      逐跳和连续 ping 那几步要多发几发，稍等）</div>`;
+    const r = await call('net.troubleshoot', args);
+    if (!r.ok) {
+      top.innerHTML = '';
+      out.innerHTML = `<div class="empty">没跑起来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values || {};
+    const steps = v.steps || [];
+    const [tTitle, tCls, tAdvice] = TREE_CAUSE[r.verdict] || TREE_TOP[r.verdict]
+      || [r.verdict, 'warn', ''];
+    top.innerHTML = `<span class="pill ${tCls}">${esc(tTitle)}</span>`;
+    const idx = steps.findIndex((s) => s.step === v.causeStep);
+    const bg = tCls === 'ok' ? 'var(--green-bg)' : tCls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = tCls === 'ok' ? 'var(--green-dim)' : tCls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const causeFacts = treeFacts(v.causeFacts);
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(tAdvice)}
+        ${idx >= 0 ? `<div class="dim" style="margin-top:6px">定位在第 ${idx + 1} 步（${
+          esc(v.causeName || v.causeStep)}）—— 那一步的依据：${causeFacts}</div>` : ''}
+      </div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <table style="margin-top:12px">
+        <tr><th></th><th>按排查顺序</th><th>问了什么</th><th>状态</th><th>判定</th><th>依据</th></tr>
+        ${steps.map(treeStepRow).join('')}
+      </table>
+      <p class="hint" style="margin-top:10px">★ 一共问了 ${v.asked || 0} 步。状态写成「没问出去」或「没问到这一步」的那些，
+        就是这份结论的边界 —— 想让它们也问出结果，把「目标」填实，或者去高级里把时间调够。</p>
+      <p class="hint" style="margin-top:6px">每一步的判定用的就是那一页同一个工具的判定，话术一份都没有重写。
+        想单独把某一步问细，去下面「出问题了」以外的对应页。</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(r.raw, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#tr-t').onkeydown = (e) => { if (e.key === 'Enter') card.querySelector('#tr-go').click(); };
   return card;
 }
 

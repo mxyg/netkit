@@ -224,6 +224,19 @@ func Test没有参数集时如实说拿不到而不是编一个(t *testing.T) {
 	}
 }
 
+func Test回了200却没带媒体轨时报流没配出来(t *testing.T) {
+	// ★ 设备只回会话头、一条 m= 都没有：这不能算「流没问题」。
+	sdp := "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=No Media\r\nt=0 0\r\n"
+	addr := (&fakeRTSP{sdp: sdp}).start(t)
+	code, vals := probe(t, `{"url":"rtsp://`+addr+`/"}`)
+	if code != verdictStreamNoMed {
+		t.Fatalf("判定 = %q —— 一轨都没有却按有流报，人会去查下游", code)
+	}
+	if _, has := vals["trackCount"]; has {
+		t.Error("一条轨都没有却给了 trackCount")
+	}
+}
+
 // Digest 挑战里 qop="auth,auth-int" 带逗号，按逗号切会把它切坏。
 func TestDigest挑战里带逗号的qop(t *testing.T) {
 	p := parseChallenge(`Digest realm="IPCamera", nonce="abc", qop="auth,auth-int"`)

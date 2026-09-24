@@ -20,12 +20,20 @@ import (
 	"net.yuhox.com/netkit/internal/ots"
 )
 
+// localTools 是本包自带的那一叠工具。★ 只列一次：
+// 注册进注册表的是它，装进排查路线的可选步骤也是它 ——
+// 否则新加一个工具忘了登记给路线，路线里就永远问不到它，而编译器不会提醒。
+var localTools = []ots.Tool{
+	interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, neighborsTool, discoverTool, identifyTool,
+	dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
+	fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
+	diagBundleTool, troubleshootTool,
+}
+
 // Register 把本包的工具装进注册表。
 func Register(r *ots.Registry) {
-	r.MustRegister(interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, neighborsTool, discoverTool, identifyTool,
-		dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
-		fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
-		diagBundleTool)
+	r.MustRegister(localTools...)
+	installTreeCalls(localTools)
 	RegisterAddress(r)
 	RegisterDHCP(r)
 	RegisterRemote(r)
