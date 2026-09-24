@@ -24,6 +24,37 @@ const DefaultPort = 161
 //	只说「超时」的话，现场会去查第三和第二种，而最常见的其实是第一种。
 var ErrNoReply = errors.New("snmp: 没有回话")
 
+// Unmatched 是「收到了东西，但没算成答案」的条数。
+type Unmatched struct {
+	WrongID   int // 回包里的请求标识对不上：路上有第二台在答，或者这台实现有问题
+	WrongHost int // 不是我们点名的那台答的
+	NotReply  int // 是报文但不是响应（设备上往我们这台推 trap 时最常见）
+}
+
+// Any 有没有收到过任何东西。
+func (u Unmatched) Any() bool { return u.WrongID+u.WrongHost+u.NotReply > 0 }
+
+// NoReplyError 是「没回话」这一类失败的完整形状。
+//
+// ★★ 为什么不直接返回 ErrNoReply 就完了：「一条包都没回来」和「回来几条但对不上号」
+//
+//	在「超时」两个字上一样，可查的方向相反 —— 前者查防火墙、团体名、设备没开 SNMP，
+//	后者说明路上有东西在答话（第二台冒充，或者这台在往我们推 trap）。
+//	不把这个分出来，界面上就只能说「三种可能都有」，而现场其实已经能排除一种。
+//
+// Unwrap 到 ErrNoReply，所以 errors.Is 那条老写法照旧成立。
+type NoReplyError struct {
+	Addr  string // 实际发去了哪儿（端口补齐后的）
+	Tries int    // 一共问了几次
+	Seen  Unmatched
+}
+
+func (e *NoReplyError) Error() string {
+	return fmt.Sprintf("%v（%s，问了 %d 次）%s", ErrNoReply, e.Addr, e.Tries, e.Seen.Note())
+}
+
+func (e *NoReplyError) Unwrap() error { return ErrNoReply }
+
 // ClientVersion 是客户端这一侧的版本选择。
 //
 // ★★ 这里的编号和报文里的**不一样**，是故意反过来的：
@@ -232,7 +263,7 @@ func (c *Client) Do(ctx context.Context, p Packet) (Packet, error) {
 	if lastErr != nil && !errors.Is(lastErr, ErrNoReply) {
 		return Packet{}, fmt.Errorf("snmp: 问了 %d 次都没成（%s）：%w", tries, ra.String(), lastErr)
 	}
-	return Packet{}, fmt.Errorf("%w（%s，问了 %d 次）%s", ErrNoReply, ra.String(), tries, dropped.note())
+	return Packet{}, &NoReplyError{Addr: ra.String(), Tries: tries, Seen: dropped.seen()}
 }
 
 // watchCancel 在 ctx 取消的那一瞬间把连接的读截止时间推到当下。
@@ -252,13 +283,7 @@ func watchCancel(ctx context.Context, conn net.PacketConn) func() {
 	return func() { close(done) }
 }
 
-// miss 记下「收到了回包但没算数」的几种原因。
-//
-// ★★ 这一条不是锦上添花：设备答了、标识对不上，和压根没答，在「超时」两个字上
-//
-//	长得一模一样，可查的方向完全相反 —— 前者是网上有第二台设备在抢答（或者这台
-//	设备的实现有问题），后者才是防火墙、团体名、没开 SNMP。
-//	不报出来的话，人就会去 ACL 上白绕一圈。
+// miss 记下「收到了回包但没算数」的几种原因，读的时候汇成 Unmatched 给外面。
 type miss struct {
 	wrongID   int
 	wrongHost int
@@ -271,16 +296,21 @@ func (m *miss) add(o miss) {
 	m.notReply += o.notReply
 }
 
-func (m miss) note() string {
+func (m miss) seen() Unmatched {
+	return Unmatched{WrongID: m.wrongID, WrongHost: m.wrongHost, NotReply: m.notReply}
+}
+
+// Note 把「对不上号」那几条说成人话，给上面拼判定用。
+func (u Unmatched) Note() string {
 	var why []string
-	if m.wrongID > 0 {
-		why = append(why, fmt.Sprintf("%d 条回包的请求标识对不上", m.wrongID))
+	if u.WrongID > 0 {
+		why = append(why, fmt.Sprintf("%d 条回包的请求标识对不上", u.WrongID))
 	}
-	if m.wrongHost > 0 {
-		why = append(why, fmt.Sprintf("%d 条不是这台设备答的", m.wrongHost))
+	if u.WrongHost > 0 {
+		why = append(why, fmt.Sprintf("%d 条不是这台设备答的", u.WrongHost))
 	}
-	if m.notReply > 0 {
-		why = append(why, fmt.Sprintf("%d 条不是响应报文", m.notReply))
+	if u.NotReply > 0 {
+		why = append(why, fmt.Sprintf("%d 条不是响应报文", u.NotReply))
 	}
 	if len(why) == 0 {
 		return ""

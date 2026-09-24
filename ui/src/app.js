@@ -42,6 +42,7 @@ const PAGES = [
   { id: 'dhcp', name: '开启路由（DHCP）', render: renderDHCP },
   { id: 'probe', name: '连通性', render: renderProbe },
   { id: 'scan', name: '扫描与发现', render: renderScan },
+  { id: 'switch', name: '交换机（SNMP）', render: renderSwitch },
   { id: 'stream', name: '视频流', render: renderStream },
   { id: 'remote', name: '远程', render: renderRemote },
   { id: 'tools', name: '小工具', render: renderTools },
@@ -2150,6 +2151,148 @@ const DISCOVER_CODE = {
     '要用的那块网卡连自己的 IPv6 链路本地地址都没有 —— 这个地址是自动生成的，'
     + '没有它就说明这台的 IPv6 没起来，先去「本机网络」看一眼。'],
 };
+
+/*
+ * ── 交换机 / SNMP ──
+ *
+ * ★★ 这一组卡片买到的东西是「把设备拆开问」。SNMP 的失败特别省 —— 团体名写错、
+ *   防火墙丢了、设备压根没开 SNMP，三种病在报文层面是同一个「没回话」。
+ *   后端拿对照探测和 error-status 把它们分开，界面就一个码一句话，
+ *   不许在这里再拼句子（拼句子的是后端，AI 和界面读同一份）。
+ * ★ 团体名这一栏是 password 输入框：界面就一个人用，但截图、投屏、
+ *   站在后面看的人是真实存在的。后端也不会把它回传，两边各守一半。
+ */
+const SNMP_CODE = {
+  'snmp-ok': ['SNMP 通，团体名可用', 'ok',
+    '这台设备认这个团体名，路也是通的。下面 MAC 表、端口、PoE、LLDP 那几栏都可以问了。'],
+  'snmp-no-reply': ['没有回话', 'bad',
+    '问了两次（重传）都没一个包回来。这三种病在报文上完全同形，分不开：'
+    + '团体名不对（v2c 不报错，直接把你的包丢在地上）、防火墙或设备 ACL 没放行、这台设备没开 SNMP。'
+    + '先核团体名，再用上面的「探 UDP 端口」问 161/udp 有没有反应。'],
+  'snmp-reply-unmatched': ['有回包，但对不上号', 'warn',
+    '路上有东西在回话，只是对不上这次问的 —— 这「不是」没人答。最常见的是设备上把 trap 目标'
+    + '配成了这台机器（那 SNMP 本身是通的，把团体名或视图再核一遍），其次是同网段有第二台在答同一个请求。'],
+  'snmp-v1-only': ['这台只认 v1', 'warn',
+    'v2c 没答、换成 v1 就答了。★ 后面几栏（MAC 表、端口、PoE、LLDP）都要把版本填成 v1，'
+    + '不然每一栏都会「没回话」。v1 没有 GETBULK，走表会慢很多。'],
+  'snmp-v2c-only': ['这台只认 v2c', 'warn',
+    '指定了 v1 没答、换成 v2c 答了 —— 把版本留空或填 v2c 即可。'],
+  'snmp-error': ['设备答了，但说「这一栏不给读」', 'warn',
+    '设备认这个请求（团体名是对的、SNMP 也开着），只是这一栏不给读或读不了。'
+    + '★ 这跟「不通」是两回事：这一条要查的是设备上的视图/权限配置，不是防火墙。'],
+  'unknown': ['观测没做成', 'warn', '请求根本没发出去（看原始结果里的 detail），这不算设备不通。'],
+};
+
+const SNMP_SYS_LABEL = {
+  sysDescr: '说明', sysObjectID: '对象标识符', sysName: '设备名',
+  sysLocation: '位置', uptime: '已开机',
+};
+
+// 五张 SNMP 卡共用的一段表单。前缀传进来，免得五个 id 打架。
+function snmpFormHTML(p) {
+  return `
+    <div class="row">
+      <div><label>设备地址（只收 IP，可带端口）</label><input id="${p}a" placeholder="192.168.1.2 或 192.168.1.2:1161"></div>
+      <div style="flex:0 0 90px"><label>端口</label><input id="${p}p" placeholder="161"></div>
+      <div><label>读团体名</label><input id="${p}c" type="password" placeholder="必填，没有默认值" autocomplete="off"></div>
+      <div style="flex:0 0 110px"><label>版本</label><select id="${p}v">
+        <option value="">v2c（默认）</option><option value="v2c">v2c</option><option value="v1">v1</option>
+      </select></div>
+      <div style="flex:0 0 150px"><label>从哪块网卡出去</label><input id="${p}i" placeholder="en0 / 以太网"></div>
+    </div>
+    <p class="hint" style="margin:8px 0 0">团体名<b>必填、故意不给默认值</b>：猜一个「public」只会把上面那三种病揉成一种。
+      它不会出现在结果里，也不会进日志。多网卡机器上「从哪块网卡出去」常常决定设备答不答
+      （管理 VLAN 只放行一个口，或者设备按源地址收口）；解不开这一栏会<b>直接报错</b>，不会退化成「随便哪个口都行」。</p>`;
+}
+
+function readSnmpArgs(card, p) {
+  const args = { addr: card.querySelector('#' + p + 'a').value.trim() };
+  const port = Number(card.querySelector('#' + p + 'p').value);
+  const community = card.querySelector('#' + p + 'c').value;
+  const version = card.querySelector('#' + p + 'v').value;
+  const iface = card.querySelector('#' + p + 'i').value.trim();
+  if (port > 0) args.port = port;
+  if (community) args.community = community;
+  if (version) args.version = version;
+  if (iface) args.iface = iface;
+  return args;
+}
+
+// SNMP 结果顶部那一排共用信息。
+function snmpHead(v) {
+  // ★ 「回话」那一格先看 matched：有包但对不上号时 answered 也是 true，
+  //   这时候给一个绿的「有」等于把这一条最要紧的区别抹平。
+  const reply = v.matched === false ? '<span class="pill warn">有包，对不上号</span>'
+    : v.answered ? '<span class="pill ok">有</span>' : '<span class="pill bad">没有</span>';
+  return `
+    <div class="row" style="align-items:flex-end;gap:18px;margin-bottom:12px">
+      <div><label>目标</label><div><b><code>${esc(v.target)}</code></b></div></div>
+      <div><label>版本</label><div>${esc(v.version || '')}
+        ${v.askedVersion && v.askedVersion !== v.version ? `<span class="dim">（问的是 ${esc(v.askedVersion)}）</span>` : ''}
+        ${v.iface ? `<span class="dim">从 ${esc(v.iface)} 出去</span>` : ''}</div></div>
+      <div><label>回话</label><div>${reply}</div></div>
+      ${v.elapsedMs !== undefined ? `<div><label>等了</label><div>${esc(v.elapsedMs)}ms</div></div>` : ''}
+      ${v.vendor ? `<div><label>厂商</label><div>${esc(v.vendor)}</div></div>` : ''}
+    </div>`;
+}
+
+function snmpAdviceBox(cls, advice, extra) {
+  const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+  const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+  return `<div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+    ${esc(advice)}${extra ? `<div class="dim" style="margin-top:6px;font-size:12.5px">${esc(extra)}</div>` : ''}</div>`;
+}
+
+function snmpProbeCard() {
+  const card = $(`<div class="card">
+    <h2>这台设备 SNMP 通不通 <span id="sv"></span></h2>
+    <p class="hint">问一句「你是谁、开机多久了」（系统组那七栏）。这是 SNMP 那几栏的第一步：
+      MAC 表、端口、PoE、LLDP 查不出来，先回这张卡确认团体名和路是通的。
+      没回话时会自动换另一档版本再问一次（v2c 不通换 v1），用来把「这台只认另一档」从三种病里摘出去。</p>
+    ${snmpFormHTML('sw')}
+    <div class="row" style="margin-top:10px">
+      <div style="flex:0 0 auto;min-width:0">
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400">
+          <input type="checkbox" id="snover" style="width:auto"> 不做版本对照（只问指定那一档）</label></div>
+      <div style="flex:0 0 auto;min-width:0"><button class="btn primary" id="sgo">问一问</button></div>
+    </div>
+    <div id="sout" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#sout');
+  const top = card.querySelector('#sv');
+  card.querySelector('#sgo').onclick = async () => {
+    top.innerHTML = '';
+    const args = readSnmpArgs(card, 'sw');
+    args.noVersionProbe = card.querySelector('#snover').checked;
+    out.innerHTML = '<div class="empty">正在问…（两档都试过的话最坏等四个超时）</div>';
+    const r = await call('net.snmp.probe', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const v = r.values;
+    const [text, cls, advice] = SNMP_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(text)}</span>`;
+    const extra = [v.detail, v.versionProbe ? `已换成 ${v.versionProbe} 对照过` : '',
+      v.otherVersionSilent ? '另一档也没答（版本这一条已经排除了）' : ''].filter(Boolean).join('；');
+    const rows = Object.keys(SNMP_SYS_LABEL).filter((k) => v[k] !== undefined && v[k] !== '')
+      .map((k) => `<tr><td>${SNMP_SYS_LABEL[k]}</td><td>${k === 'uptime'
+        ? `${esc(v.uptime)} <span class="dim">（${esc(v.uptimeSeconds)} 秒）</span>`
+        : `<code>${esc(v[k])}</code>`}</td></tr>`).join('');
+    out.innerHTML = `
+      ${snmpHead(v)}
+      ${rows ? `<table><tr><th style="width:110px">系统信息</th><th></th></tr>${rows}</table>` : ''}
+      ${v.sysMissing && v.sysMissing.length
+        ? `<p class="dim" style="margin:8px 0 0">设备没填这几栏：${esc([].concat(v.sysMissing).join('、'))}
+           <span class="dim">（v1 设备上少几栏很常见，不代表它坏了）</span></p>` : ''}
+      <div style="margin-top:12px">${snmpAdviceBox(cls, advice, extra)}</div>
+      <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  return card;
+}
+
+async function renderSwitch(root) {
+  root.appendChild(snmpProbeCard());
+}
 
 async function renderScan(root) {
   root.appendChild(subnetScanCard());
