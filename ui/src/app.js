@@ -35,35 +35,80 @@ async function call(tool, args = {}) {
 const $ = (h) => { const d = document.createElement('div'); d.innerHTML = h.trim(); return d.firstElementChild; };
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-// ── 页面 ──
-
+/*
+ * ★★ 导航分两层（老板 2026-09-25：「功能太多了，不会用了」）。
+ *
+ *   工具涨到四十多项之后，八个平铺按钮里有一个「连通性」页堆了十五张卡，
+ *   一开到底、滚动半天，谁都找不到自己要的那一个 —— 平铺已经不承担导航了。
+ *   所以拆成：**上面一组是「现在要回答的问题」，下面才是那一组里的具体页**。
+ *   硬规矩：每组不超过 4 页、每页不超过 5 张卡，再多就继续拆页，不许在页里堆。
+ */
 const PAGES = [
-  { id: 'nic', name: '本机网络', render: renderNIC },
-  { id: 'dhcp', name: '开启路由（DHCP）', render: renderDHCP },
-  { id: 'probe', name: '连通性', render: renderProbe },
-  { id: 'scan', name: '扫描与发现', render: renderScan },
-  { id: 'switch', name: '交换机（SNMP）', render: renderSwitch },
-  { id: 'stream', name: '视频流', render: renderStream },
-  { id: 'remote', name: '远程', render: renderRemote },
-  { id: 'tools', name: '小工具', render: renderTools },
+  { g: '这台机器', id: 'nic', name: '网卡与路由', render: renderNIC },
+  { g: '这台机器', id: 'dhcp', name: 'DHCP 分地址', render: renderDHCP },
+  { g: '这台机器', id: 'local', name: '本机端口与文件共享', render: renderLocal },
+
+  { g: '通不通', id: 'connect', name: 'ping 与端口', render: renderConnect },
+  { g: '通不通', id: 'path', name: '路径与质量', render: renderPath },
+  { g: '通不通', id: 'name', name: '域名与时间', render: renderName },
+  { g: '通不通', id: 'service', name: '网站与证书', render: renderService },
+
+  { g: '谁在网里', id: 'scan', name: '网段上有哪些地址', render: renderScan },
+  { g: '谁在网里', id: 'device', name: '设备与取流', render: renderDevice },
+  { g: '谁在网里', id: 'switch', name: '交换机（SNMP）', render: renderSwitch },
+
+  { g: '出问题了', id: 'checkup', name: '一键体检与诊断包', render: renderCheckup },
+
+  { g: '管别的机器', id: 'remote', name: '远程', render: renderRemote },
+
+  { g: '工具箱', id: 'tools', name: '算子网 / MAC / 编解码', render: renderTools },
 ];
 
-let current = 'nic';
+const GROUPS = [...new Set(PAGES.map((p) => p.g))];
+
+let group = GROUPS[0];
+let current = PAGES[0].id;
 
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  for (const p of PAGES) {
+  const rows = [document.createElement('div'), document.createElement('div')];
+  rows.forEach((r) => { r.className = 'navrow'; });
+  GROUPS.forEach((g) => {
     const b = document.createElement('button');
-    b.textContent = p.name;
-    b.className = p.id === current ? 'btn on' : 'btn';
-    b.onclick = () => { current = p.id; renderNav(); show(); };
-    nav.appendChild(b);
+    b.textContent = g;
+    b.className = 'btn grp' + (g === group ? ' on' : '');
+    b.onclick = () => {
+      if (g === group) return;
+      group = g;
+      current = PAGES.find((p) => p.g === g).id;
+      renderNav(); show();
+    };
+    rows[0].appendChild(b);
+  });
+  const subs = PAGES.filter((p) => p.g === group);
+  if (subs.length > 1) {
+    for (const p of subs) {
+      const b = document.createElement('button');
+      b.textContent = p.name;
+      b.className = 'btn sub' + (p.id === current ? ' on' : '');
+      b.onclick = () => {
+        if (p.id === current) return;
+        current = p.id;
+        renderNav(); show();
+      };
+      rows[1].appendChild(b);
+    }
   }
+  nav.append(...rows);
 }
 
 async function show() {
   const main = document.getElementById('main');
+  // ★ DHCP 那页的租约轮询只在停在那一页时才该跑：换页后它还每 2.5 秒发一次请求，
+  //   而且往**当前这页**的 #leases 里写 —— 页面拆细了以后这个尾巴更明显，当场断掉。
+  clearInterval(pollTimer);
+  pollTimer = null;
   main.innerHTML = '<div class="empty">读取中…</div>';
   const p = PAGES.find((x) => x.id === current);
   main.innerHTML = '';
@@ -194,6 +239,16 @@ function dhcpClass(n) {
   return 'disabled';
 }
 
+// net.dhcp.probe 的两档。★★ 这一栏的分量在于「问了没有」和「问了没人应」不是一回事：
+//   探测本身要占 :68 端口，本机 DHCP 客户端还开着时根本问不出去，
+//   那种情况后端直接报错（走「探测失败」），不会冒充「这个网没人发地址」。
+const PROBE_DHCP_CODE = {
+  'dhcp-found': ['这个网已经有人在发地址', 'bad',
+    '★ 别再起第二个。两边同时发地址时，设备拿到哪个看运气，故障是间歇的、而且每台机器不一样 —— 这是现场最难查的一类问题。要看是谁在发，问它下发的网关和 DNS 指向哪。'],
+  'no-dhcp': ['这个网里没人发地址', 'ok',
+    '可以放心开。★ 这只代表刚才那几秒没人应答；网里随时可能接入一台带 DHCP 的设备（路由器、热点、别的电脑），开之前再点一次问一遍。'],
+};
+
 async function renderDHCP(root) {
   clearInterval(pollTimer);
   const nics = await call('net.interfaces');
@@ -315,9 +370,28 @@ async function renderDHCP(root) {
 
   card.querySelector('#btnProbe').onclick = async () => {
     say('正在广播探测…（约 3 秒）');
+    out.style.whiteSpace = 'pre-wrap';
     const p = await call('net.dhcp.probe', { iface: sel.value, waitMs: 3000 });
     if (!p.ok) { say('探测失败：' + p.message); return; }
-    say(p.note + '\n\n' + JSON.stringify(p.values.servers || [], null, 2));
+    const v = p.values || {};
+    const servers = v.servers || [];
+    const [title, cls, advice] = PROBE_DHCP_CODE[p.verdict] || [p.verdict || '没给判定', '', ''];
+    const rows = servers.map((s) => `<tr>
+        <td><code>${esc(s.serverId || s.from || '')}</code>${s.serverId && s.from && s.serverId !== s.from
+          ? `<br><span class="dim">报文来自 <code>${esc(s.from)}</code></span>` : ''}</td>
+        <td>${esc(s.offeredIp || '—')}</td>
+        <td>${esc(s.mask || '—')}</td>
+        <td>${esc(s.router || '—')}</td>
+        <td>${(s.dns || []).length ? esc(s.dns.join('、')) : '—'}</td>
+        <td>${s.leaseSeconds ? esc(String(Math.round(s.leaseSeconds / 60))) + ' 分钟' : '—'}</td>
+      </tr>`).join('');
+    out.style.whiteSpace = 'normal';
+    out.innerHTML = `<p><span class="pill ${cls}">${esc(title)}</span></p>
+      ${rows ? `<table>
+        <tr><th>它自称</th><th>打算发的地址</th><th>掩码</th><th>网关</th><th>DNS</th><th>租期</th></tr>${rows}
+      </table>` : ''}
+      <p class="dim" style="margin:10px 0 0">${esc(p.note || '')}</p>
+      ${advice ? adviceBox(cls, esc(advice)) : ''}`;
   };
 
   card.querySelector('#btnStart').onclick = async () => {
@@ -397,51 +471,113 @@ function startPolling(root) {
   }, 2500);
 }
 
-// ── 连通性 ──
+// ── 通不通 ──
+//
+// ★ 原来这是「连通性」一页，十五张卡从头滚到底。现在按**问的层次**拆成四页：
+//   端口通不通 → 路上几跳 → 名字解析得对不对 → 上层服务答得好不好。
+//   顺序也是排查的顺序：下层没通之前，上面的数字都别当准。
 
-async function renderProbe(root) {
-  root.appendChild(checkupCard());
-  root.appendChild(diagBundleCard());
-  root.appendChild(dualStackCard());
+async function renderConnect(root) {
+  root.appendChild(pingCard());
+  root.appendChild(scanCard());
+  root.appendChild(udpCard());
+}
+
+async function renderPath(root) {
   root.appendChild(traceCard());
   root.appendChild(mtrCard());
-  root.appendChild(timeCard());
+  root.appendChild(pingWatchCard());
+  root.appendChild(mtuCard());
+}
+
+async function renderName(root) {
   root.appendChild(dnsCard());
-  root.appendChild(certCard());
+  root.appendChild(dualStackCard());
+  root.appendChild(timeCard());
+}
+
+async function renderService(root) {
   root.appendChild(httpCard());
+  root.appendChild(certCard());
+}
+
+// adviceBox 给一句「所以怎么办」的彩色块。★ 和判定盒同一套配色，不新造颜色。
+function adviceBox(cls, text) {
+  const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+  const line = cls === 'ok' ? 'var(--green-line)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+  return `<div style="background:${bg};border:1px solid ${line};border-radius:6px;`
+    + `padding:10px 12px;margin-top:12px;font-size:13.5px">${text}</div>`;
+}
+
+const PING_CODE = {
+  'reachable': ['通', 'ok', '往返和丢包在下面。★ 通了只说明 ICMP 过得去，不说明端口开着。'],
+  'unreachable': ['回了明确的不可达', 'bad',
+    '★ 这个「不通」是有用的：有设备（多半是路由或防火墙）回答了「到不了」，说明「路是通的」，问题在终点或那条路由。去查对端的地址、路由和防火墙，别再 ping 了。'],
+  'no-reply': ['完全没回应', 'bad',
+    '分不清是机器不在、还是 ICMP 被静默丢掉 —— 这两件事的下一步完全不同：先用「探端口」或网段扫描问一次，能连上就说明机器在。'],
+};
+
+const PROBE_CODE = {
+  'open': ['端口开着', 'ok', '三次握手成了。★ 这只说明有人在听，服务是不是对的要看它回什么（RTSP、HTTP、SNMP 各有各的卡）。'],
+  'closed': ['端口关着（对方回了拒绝）', 'warn',
+    '对端明确回了 RST —— ★ 主机是「活着」的，只是这个端口没服务。去看服务起没起、端口号对不对。'],
+  'filtered': ['没有任何回应', 'bad',
+    '等到超时，一个回包都没有。多半是中间有人静默丢（防火墙/ACL），也可能主机压根不在。'],
+};
+
+function pingCard() {
   const card = $(`<div class="card">
-    <h2>ping / 探端口</h2>
-    <p class="hint">ping 会区分「对方明确回了不可达」和「完全没回应」——前者说明路是通的、问题在对端。</p>
+    <h2>ping 一个地址 <span id="p-top"></span></h2>
+    <p class="hint">只问一次，看它答不答。★ ping 区分「回了明确的不可达」和「完全没回应」——
+      前者说明路是通的、问题在终点；后者连机器在不在都说不清。要连着看稳不稳，去「路径与质量」那一页用「连续 ping」。</p>
     <div class="row">
-      <div><label>目标地址</label><input id="t" placeholder="192.168.1.1 或 fd00::1"></div>
-      <div><label>端口（探端口时填）</label><input id="p" placeholder="554"></div>
+      <div><label>目标地址</label><input id="p-t" placeholder="192.168.1.1 或 fd00::1"></div>
+      <div style="flex:0 0 190px"><label>端口（探端口时填）</label><input id="p-p" placeholder="554"></div>
     </div>
     <div style="margin-top:12px;display:flex;gap:10px">
-      <button class="btn primary" id="bp">ping</button>
-      <button class="btn" id="bt">探端口</button>
+      <button class="btn primary" id="p-bp">ping</button>
+      <button class="btn" id="p-bt">探端口</button>
     </div>
-    <div class="out" id="o" style="margin-top:12px;display:none"></div>
+    <div id="p-out" style="margin-top:14px"></div>
   </div>`);
-  root.appendChild(card);
-  root.appendChild(portProcCard());
-  root.appendChild(pingWatchCard());
-  root.appendChild(udpCard());
-  root.appendChild(scanCard());
-  root.appendChild(mtuCard());
-  const o = card.querySelector('#o');
-  const say = (s) => { o.style.display = 'block'; o.textContent = s; };
-  card.querySelector('#bp').onclick = async () => {
-    say('ping 中…');
-    const r = await call('net.ping', { addr: card.querySelector('#t').value, count: 4 });
-    say(r.ok ? `${r.note}\n\n${JSON.stringify(r.values, null, 2)}` : r.message);
+  const out = card.querySelector('#p-out');
+  const top = card.querySelector('#p-top');
+  const say = (html) => { out.innerHTML = html; };
+  card.querySelector('#p-bp').onclick = async () => {
+    top.innerHTML = '';
+    say('<div class="empty">ping 中…</div>');
+    const r = await call('net.ping', { addr: card.querySelector('#p-t').value.trim(), count: 4 });
+    if (!r.ok) { say(`<div class="empty">问不了：${esc(r.message)}</div>`); return; }
+    const [title, cls, advice] = PING_CODE[r.verdict] || [r.verdict, '', ''];
+    const v = r.values || {};
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    say(`<table>
+        ${tCell('目标', `<code>${esc(v.target || '')}</code> <span class="dim">${esc(v.family || '')}</span>`)}
+        ${tCell('发 / 收到', `${v.sent ?? '—'} / ${v.received ?? '—'}`)}
+        ${tCell('丢包', v.lossPercent === undefined ? '—' : `${Math.round(v.lossPercent)}%`)}
+        ${tCell('往返（最快/平均/最慢）', ms(v.rttMinMs) + ' / ' + ms(v.rttAvgMs) + ' / ' + ms(v.rttMaxMs))}
+      </table>${advice ? adviceBox(cls, esc(advice)) : ''}`);
   };
-  card.querySelector('#bt').onclick = async () => {
-    say('探测中…');
+  card.querySelector('#p-bt').onclick = async () => {
+    top.innerHTML = '';
+    say('<div class="empty">探测中…</div>');
+    const port = Number(card.querySelector('#p-p').value);
     const r = await call('net.tcp.probe', {
-      addr: card.querySelector('#t').value, port: Number(card.querySelector('#p').value) || undefined });
-    say(r.ok ? `${r.note}\n\n${JSON.stringify(r.values, null, 2)}` : r.message);
+      addr: card.querySelector('#p-t').value.trim(), port: port || undefined,
+    });
+    if (!r.ok) { say(`<div class="empty">问不了：${esc(r.message)}</div>`); return; }
+    const [title, cls, advice] = PROBE_CODE[r.verdict] || [r.verdict, '', ''];
+    const v = r.values || {};
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    say(`<table>
+        ${tCell('目标', `<code>${esc(v.target || '')}</code> <span class="dim">${esc(v.family || '')}</span>`)}
+        ${tCell('端口', v.port ?? '—')}
+        ${tCell('等了多久', ms(v.elapsedMs))}
+      </table>${advice ? adviceBox(cls, esc(advice)) : ''}`);
   };
+  return card;
 }
+
 
 /*
  * ── 双栈体检 ──
@@ -709,12 +845,21 @@ function ckFacts(step, f) {
         + (others ? ` <span class="dim">其它：${esc(others)}</span>` : '');
     }
     case 'clock': {
+      // ★ 偏差那个数只有在它真答过话时才存在。没答时后端给的 offsetMs 是 0，
+      //   照着写成「本机慢 0.0 毫秒」就是把「没问到」伪装成「问了、很准」。
+      const asked = f.code === 'answered';
       const off = f.offsetMs;
-      const has = off || off === 0;
+      const why = {
+        'time-no-response': '没回话（内网封 UDP/123 时天天如此）',
+        'time-kiss-rejected': '它拒答了（限速，或明说本机钟太离谱）',
+        'time-bad-response': '回了，但不是 NTP 的样子',
+      }[f.code] || (f.code ? `问不到：${esc(f.code)}` : '没去问');
       return `问 <code>${esc(f.server || '')}</code> · 回了 ${f.answers || 0}/${f.samples || 0} 包`
-        + (has ? ` · <b>${off >= 0 ? '本机慢' : '本机快'} ${esc(humanMs(Math.abs(off)))}</b>` : '')
-        + (f.rttMs ? ` · 往返 ${ms(f.rttMs)}` : '')
-        + (f.serverTime ? `<div class="dim">它说 ${esc(fmtStamp(f.serverTime))} · 本机 ${esc(fmtStamp(f.localTime))}</div>` : '');
+        + (asked ? ` · <b>${off >= 0 ? '本机慢' : '本机快'} ${esc(humanMs(Math.abs(off)))}</b>`
+                 : ` · <span class="dim">${why}</span>`)
+        + (asked && f.rttMs ? ` · 往返 ${ms(f.rttMs)}` : '')
+        + (asked && f.serverTime
+            ? `<div class="dim">它说 ${esc(fmtStamp(f.serverTime))} · 本机 ${esc(fmtStamp(f.localTime))}</div>` : '');
     }
     case 'proxy': {
       const e = f.entries || [];
@@ -931,7 +1076,8 @@ function diagBundleCard() {
       ${(v.truncated || []).length ? `<p class="dim" style="margin:4px 0 0">被截断的页：${
         esc((v.truncated || []).join('、'))} —— 原文太长，要看全文用对应的工具单独再查一次。</p>` : ''}
       <p class="hint" style="margin-top:10px">★ 每一项都带读到的原文：解开后那几页是给别人<b>接着查</b>的，
-        不是截图那种「看着像结论」的东西。时钟准不准、v6 出不出得去，都在「02 连通性」那一页里。</p>
+        不是截图那种「看着像结论」的东西。时钟准不准、v6 出不出得去，在包里「02 连通性」那一页 ——
+        界面上要单独再问一次，去「域名与时间」。</p>
       <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
@@ -1240,7 +1386,7 @@ const HTTP_CODE = {
   'http-timeout': ['整条请求超时', 'bad',
     '哪一段没走完看下面的分段：耗时是 0 的那一段就是没走到的那一段。'],
   'not-http': ['这个端口回的不是 HTTP', 'warn',
-    '多半是 RTSP、RTMP 或设备自己的私有协议 —— 视频流用「视频流」那一页探。'],
+    '多半是 RTSP、RTMP 或设备自己的私有协议 —— 取流用「设备与取流」那一页探。'],
   'wrong-scheme': ['协议前缀写反了', 'warn',
     '★ 这不是故障：把地址开头的 http / https 换成另一个就能通。省得去查一个根本没坏的服务。'],
   'tls-handshake-failed': ['TLS 握手被对方拒了', 'bad',
@@ -1374,7 +1520,7 @@ function httpCard() {
 
 const TRACE_CODE = {
   'path-ok': ['这条路走得通', 'ok',
-    '每一族的追踪都到了终点。慢不慢看下面逐跳的往返 —— 某一跳突然变大，就是那里。到了终点还上不了服务，那是端口或服务的事，换「网页 / 接口探测」。'],
+    '每一族的追踪都到了终点。慢不慢看下面逐跳的往返 —— 某一跳突然变大，就是那里。到了终点还上不了服务，那是端口或服务的事，去「网站与证书」那一页问它回什么。'],
   'path-partial': ['一族到、另一族断在半路', 'bad',
     '★ 双栈机器上最贵的一种漏报：应用往往优先走 IPv6，就先卡在那条上。下面两族并排，断的那族写着停在哪台设备。'],
   'path-broken': ['两族都没走到终点', 'bad',
@@ -1385,7 +1531,7 @@ const TRACE_CODE = {
   'stalled': ['断在中间某跳', 'bad',
     '最后一台有回应的设备之后，再没人回过话。停在哪台下面写着。'],
   'no-response': ['第一跳就没回应', 'warn',
-    '★ 这**不说明路断了**：路由器不回应 ICMP 超时时，整条路都是这个形状，目标可能好好的。改用 ping / 探端口确认到不到得了终点。'],
+    '★ 这「不说明路断了」：路由器不回应 ICMP 超时时，整条路都是这个形状，目标可能好好的。改用 ping / 探端口确认到不到得了终点。'],
   'max-hops': ['跳数用完了', 'warn',
     '一路都有回应、只是没走到终点。该做的是把上面的「最多几跳」调大再看，不是查网络。'],
   'no-route': ['本机这一族没有出路', 'bad',
@@ -1511,17 +1657,17 @@ function traceCard() {
 const MTR_CODE = {
   'quality-ok': ['这条路一直很好', 'ok', '每一跳的丢包和往返都在正常范围里。要是还是觉得卡，那多半不是这条路径的事 —— 换「网页 / 接口探测」看服务自己慢不慢。'],
   'quality-silent-loss': ['中间有设备不回探测，但路是通的', 'warn',
-    '★ 看着吓人的那一行是**这台设备不爱回话**，不是它丢包：它后面的每一跳都收得到。家用和园区网的路由器普遍给 ICMP 超时做限速。要修的是探测能不能问到自己，不是这条路。'],
+    '★ 看着吓人的那一行是「这台设备不爱回话」，不是它丢包：它后面的每一跳都收得到。家用和园区网的路由器普遍给 ICMP 超时做限速。要修的是探测能不能问到自己，不是这条路。'],
   'quality-path-changed': ['同一跳出现过不止一个地址', 'warn',
-    '多为等价路径负载分担（本来就这样），或者是路由在翻动。翻动本身不卡人，**每次换到一条更烂的路**才会 —— 对照下面的丢包和往返看。'],
+    '多为等价路径负载分担（本来就这样），或者是路由在翻动。翻动本身不卡人，「每次换到一条更烂的路」才会 —— 对照下面的丢包和往返看。'],
   'quality-latency-jump': ['从某一跳起明显变慢，而且一直到终点都慢', 'bad',
     '抬升起点那一跳就是分界：它之前还是好的，之后一路都带上这份延迟。要查的是那一段链路（或者出口拥塞），不是终点自己。'],
   'quality-target-loss': ['中间的跳都正常，只有终点在丢', 'bad',
-    '路是通的（每一跳都替它作证了），丢的是**到终点这最后一段**：终点自己在限速 ICMP、防火墙把它挡了，或者它真的忙不过来。先用 ping / 探端口确认它服不服务。'],
+    '路是通的（每一跳都替它作证了），丢的是「到终点这最后一段」：终点自己在限速 ICMP、防火墙把它挡了，或者它真的忙不过来。先用 ping / 探端口确认它服不服务。'],
   'quality-loss': ['从某一跳起，丢包一路延续到终点', 'bad',
     '★ 这才是真的拥塞/故障点：下面标了从第几跳开始。中间某跳丢但后面能收到，不算这一条 —— 那种是它不爱回话。'],
   'quality-no-response': ['一个像样的样本都没拿到', 'warn',
-    '★ 这**不说明路断了**：第一跳起就不回 ICMP（整条路都被限速）时就是这个形状。改用 ping / 探端口确认终点到不到得了。'],
+    '★ 这「不说明路断了」：第一跳起就不回 ICMP（整条路都被限速）时就是这个形状。改用 ping / 探端口确认终点到不到得了。'],
   'no-route': ['本机这一族没有出路', 'bad', '探测包在这台机器上就发不出去 —— v6 被关的招牌表现。查这一族的地址和默认路由，用上方「双栈体检」。'],
   'needs-privilege': ['命令要管理员权限', 'warn', '持续逐跳探测要发原始包。以管理员身份再跑一次。'],
   'no-command': ['这台机器没有可用的探测命令', 'warn', '★ 这是工具没有，不是路上没设备 —— 装 traceroute 或 mtr，或换台机器再测。'],
@@ -1861,10 +2007,10 @@ const SCAN_CODE = {
     + '★ 别把它当成「机器挂了」去查链路。'],
   'ports-no-response': ['一个都没回话', 'bad',
     '所有端口都静默。这不能说明主机不在：整段被防火墙静默丢、地址根本没人用，都是这个形状。'
-    + '先用上面的 ping 看机器在不在，再查对端的防火墙。'],
+    + '先用「ping 与端口」那一页问一次它在不在，再查对端的防火墙。'],
   'ports-no-route': ['包根本没出去', 'bad',
     '到这个地址没有路 —— 一个包都没发出去，所以这跟对端防不防火没有关系。查自己：网卡起来了吗、'
-    + '和它是不是同一个网段（看「本机网络」那一页，和这一页顶部的双栈体检）。'],
+    + '和它是不是同一个网段（看「网卡与路由」那一页；两族是不是都通，去「域名与时间」那一页做双栈体检）。'],
 };
 
 // 单端口状态沿用 net.tcp.probe 那三个码，界面和体检项因此只有一套词。
@@ -1964,10 +2110,10 @@ const MTU_CODE = {
     + '把上限调大再测一次，多花的只是几次二分。'],
   'mtu-no-response': ['对方不回回执，这一栏测不出东西', 'bad',
     '连起手的那个小包都没回执 —— 这台主机不回 ICMP，或者这条路把差错报文挡了。'
-    + '★ 这不代表 MTU 有问题：「收不到回执」和「大包真的过不去」长得一模一样。先用上面的 ping 看它在不在。'],
+    + '★ 这不代表 MTU 有问题：「收不到回执」和「大包真的过不去」长得一模一样。先用「ping 与端口」那一页问一次它在不在。'],
   'mtu-no-route': ['包根本没出去', 'bad',
     '到这个地址没有路，一个包都没发出去，所以跟路径 MTU 无关。查自己：网卡起来了吗、'
-    + '和它是不是同一个网段（看「本机网络」那一页，和这一页顶部的双栈体检）。'],
+    + '和它是不是同一个网段（看「网卡与路由」那一页；两族是不是都通，去「域名与时间」那一页做双栈体检）。'],
   'mtu-df-unsupported': ['这台机器上测不了', 'bad',
     '这一栏靠的是「不许分片」那个套接字选项；它设不上、或者设上了内核却照旧自己把大包切开时，'
     + '量出来的数会大得离谱。宁可不给结论，也不端一个假的 MTU 出来 —— 那是会照着设进网卡的。'],
@@ -2087,7 +2233,7 @@ const WATCH_CODE = {
     '有发数没拿到回执。★ 丢和抖是两种病，处理方向不同：丢要查链路（信号、网线、端口协商、环路），'
     + '抖多半是排队。底下写清了丢在第几发、是超时还是明确不可达。'],
   'no-reply': ['一个都没回', 'warn',
-    '这一栏分不出「主机不在」和「ICMP 被挡」，所以给不出稳定性结论。先去上面的 ping 确认这台存在。'],
+    '这一栏分不出「主机不在」和「ICMP 被挡」，所以给不出稳定性结论。先去「ping 与端口」那一页确认这台存在。'],
   'unreachable': ['明确不可达', 'bad',
     '每一发都拿到了「到不了」的回执 —— 包出得去、也有人回话，中间的路是通的，'
     + '问题在终点或路由（对端关机、地址没人要、中间设备没路由）。这跟「被防火墙挡了」是两个结论。'],
@@ -2275,7 +2421,7 @@ const CMP_TEXT = {
 const SUBNET_CODE = {
   'hosts-found': ['问到了设备', 'ok',
     '清单在下面，每台都写着凭什么判定它在线。★ 收到自己的 ping 应答最硬，'
-    + '「应了 ARP 但没应 ping」的摄像头很常见（上面有一键禁 ping），别当成不在。'],
+    + '「应了 ARP 但没应 ping」的摄像头很常见（不少设备管理页里有一键禁 ping），别当成不在。'],
   'no-hosts': ['一个信号都没收到', 'warn',
     '这不能读成「这个网段是空的」：整段被静默（交换机端口隔离、防火墙拦 ICMP）'
     + '和「真的没有设备」在结果上长一个样。先确认本机这块网卡真的接在这个网里。'],
@@ -2292,7 +2438,7 @@ const EVIDENCE = {
 /*
  * ── 设备识别（net.device.identify）的判定话术 ──
  *
- * ★★ 这一张与上面「扫一个网段」的分工必须在脸上就分得开：扫网段答的是
+ * ★★ 这一张与「网段上有哪些地址」那一页的分工必须在脸上就分得开：扫网段答的是
  *   「这个地址上有没有人」，这一张答的是「它是哪一台」。
  *   所以这里最要紧的一句话是 heard-anonymous —— 有东西应了但没说身份，
  *   它既不是「发现了设备」也不是「没有设备」，混进任何一边都会把人支到错的地方去。
@@ -2305,14 +2451,14 @@ const DEVICE_CODE = {
   'heard-anonymous': ['有人应，但一句身份都没说', 'warn',
     '这些地址上有东西在答话，可它没说过自己是谁 —— 这<b>不等于没有设备</b>，'
     + '也不等于坏了。最常见的是固件里把发现服务关掉的摄像头，和不开 UPnP 的路由/交换机。'
-    + '下一步：拿其中一个地址去「连通性」页扫端口，看它开了什么（554 是 RTSP、80/443 是管理页）。'],
+    + '下一步：拿其中一个地址去「ping 与端口」那一页扫端口，看它开了什么（554 是 RTSP、80/443 是管理页）。'],
   'no-device-answered': ['问过的口径没人应答', 'warn',
     '★ 这一条<b>不能</b>读成「这个网段里没有设备」：设备不喊这几种话、中间隔着一层路由、'
     + '交换机做了组播抑制，三种病在这里长一个样。先在「问几轮」填 3 再问一次'
-    + '（UDP 会丢，问两轮的命中率明显高于把一轮拉长），再用上面「扫一个网段」确认地址上到底有没有人。'],
+    + '（UDP 会丢，问两轮的命中率明显高于把一轮拉长），再用「网段上有哪些地址」那一页确认地址上到底有没有人。'],
   'no-interface': ['一块能问的网卡都没有', 'bad',
     '一个都没问出去，所以这份结果里没有任何一栏可以说设备的事。'
-    + '先看网线插没插、这块网卡禁没禁用、有没有拿到 IPv4 地址（在「本机网络」那页）。'],
+    + '先看网线插没插、这块网卡禁没禁用、有没有拿到 IPv4 地址（「网卡与路由」那一页）。'],
   'no-multicast-route': ['组播发不出去', 'bad',
     '本机或路上某台设备把组播挡了 —— 容器里跑、VPN 只给了一个 /32、系统禁了组播，都会卡在这里。'
     + '换一块有 IPv4 的网卡，或者在「点名问哪些地址」里直接填那个 IP：'
@@ -2333,7 +2479,7 @@ const DISCOVER_CODE = {
     '一个应答都没收到。可能是这块网卡没插线、不在这个网里，或者上游把 IPv6 邻居发现挡了。'],
   'no-link-local': ['本机喊不出去', 'bad',
     '要用的那块网卡连自己的 IPv6 链路本地地址都没有 —— 这个地址是自动生成的，'
-    + '没有它就说明这台的 IPv6 没起来，先去「本机网络」看一眼。'],
+    + '没有它就说明这台的 IPv6 没起来，先去「网卡与路由」那一页看一眼。'],
 };
 
 /*
@@ -2352,7 +2498,7 @@ const SNMP_CODE = {
   'snmp-no-reply': ['没有回话', 'bad',
     '问了两次（重传）都没一个包回来。这三种病在报文上完全同形，分不开：'
     + '团体名不对（v2c 不报错，直接把你的包丢在地上）、防火墙或设备 ACL 没放行、这台设备没开 SNMP。'
-    + '先核团体名，再用上面的「探 UDP 端口」问 161/udp 有没有反应。'],
+    + '先核团体名，再用「ping 与端口」那一页的「探 UDP 端口」问 161/udp 有没有反应。'],
   'snmp-reply-unmatched': ['有回包，但对不上号', 'warn',
     '路上有东西在回话，只是对不上这次问的 —— 这「不是」没人答。最常见的是设备上把 trap 目标'
     + '配成了这台机器（那 SNMP 本身是通的，把团体名或视图再核一遍），其次是同网段有第二台在答同一个请求。'],
@@ -3556,17 +3702,79 @@ async function renderSwitch(root) {
 
 async function renderScan(root) {
   root.appendChild(subnetScanCard());
-  root.appendChild(deviceIdentifyCard());
-  root.appendChild(discoverCard());
   root.appendChild(neighborsCard());
 }
+
+// ── 设备与取流 ──
+//
+// ★ 「视频流」原来自己占一页，孤零零一张卡，看着像给视频软件开的后门。
+//   它答的其实是「这个取流地址上到底有没有一路流、以什么规格在播」——
+//   和识别设备、听广播是同一个问题（现场那台摄像头在不在、说的什么话），
+//   所以并到这一页。后面 ONVIF / GB28181 的探测也归这里。
+
+async function renderDevice(root) {
+  root.appendChild(deviceIdentifyCard());
+  root.appendChild(discoverCard());
+  root.appendChild(rtspCard());
+  root.appendChild(wolCard());
+}
+
+function rtspCard() {
+  const card = $(`<div class="card">
+    <h2>取流探测 <span id="rt-top"></span></h2>
+    <p class="hint">问一个 RTSP 地址「这里有一路流吗」。读的是它的应答（SDP），
+      ★ 不解码、不放画面、不装任何播放器 —— 所以它答的是「设备肯不肯给流、给的是什么规格」，
+      图像本身好不好看不归它管。</p>
+    <label>取流地址</label>
+    <input id="rt-u" placeholder="rtsp://192.168.1.64:554/cam/realmonitor?channel=1&subtype=0">
+    <div style="margin-top:12px"><button class="btn primary" id="rt-b">探测</button></div>
+    <div id="rt-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#rt-out');
+  const top = card.querySelector('#rt-top');
+  card.querySelector('#rt-b').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">探测中…</div>';
+    const u = card.querySelector('#rt-u').value.trim();
+    const r = await call('media.rtsp.probe', { url: u });
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const [title, cls, advice] = RTSP_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+    const v = r.values || {};
+    const rows = (v.tracks || []).map((t) => `<tr><td>${esc(t.kind || '')}</td>`
+      + `<td>${esc(t.codec || '—')}</td>`
+      + `<td>${t.width ? `${t.width}×${t.height}${t.fps ? ' @' + t.fps + 'fps' : ''}` : '<span class="dim">没给参数集</span>'}</td></tr>`).join('');
+    // 有流时 note 就是那几轨的文字版，表格里已经有了，不再重复一行。
+    const note = r.note && r.verdict !== 'stream-ok'
+      ? `<p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>` : '';
+    out.innerHTML = `<table>
+      ${tCell('问的地址', `<code>${esc(v.url || u)}</code>`)}
+      ${tCell('连的端', `<code>${esc(v.target || '')}</code>${v.status ? ` · 应答 ${v.status}` : ''}`)}
+      ${rows ? `<tr><th>轨</th><th>编码</th><th>规格（分辨率 / 帧率）</th></tr>${rows}` : tCell('轨', '<span class="dim">应答里没有媒体描述</span>')}
+    </table>${note}${advice ? adviceBox(cls, esc(advice)) : ''}`;
+  };
+  return card;
+}
+
+const RTSP_CODE = {
+  'stream-ok': ['有流', 'ok',
+    '★ 设备肯给流，上面这些轨就是它能给的全部规格。接进平台前对一下编码和分辨率是不是要的那路码流——主码流/子码流常常只差路径里的一位数字。'],
+  'auth-required': ['要账号密码', 'warn',
+    '★ 401 不是设备坏了，是问到了、只是不让看。先核对账号密码，再确认这个账号有没有该通道的取流权限（NVR 上不同用户开的通道不一样）。'],
+  'not-found': ['这个路径没有流', 'bad',
+    '★ 设备是好的、账号是好的，只有路径不对。海康是 /Streaming/Channels/101，大华是 /cam/realmonitor?channel=1&subtype=0，通道号和码流类型就在最后那几位。'],
+  'no-response': ['连上了没回应', 'bad',
+    '端口开着却不回 RTSP，大概率端口号填错了：554 才是 RTSP，80 是 Web，8000 / 8200 是各家私有 SDK 的口子。也可能是设备只放行了指定 IP。'],
+  'unreachable': ['连不上', 'bad',
+    '★ 连不上先别改密码。去「ping 与端口」那页探一下这个端在不在：端口在而 RTSP 不通，是服务的问题；端口就不在，先确认地址、网段和中间隔没隔路由。'],
+};
 
 function subnetScanCard() {
   const card = $(`<div class="card">
     <h2>扫一个网段 <span id="nv"></span></h2>
     <p class="hint">问一遍<b>某个 IPv4 网段上现在有谁</b>。网段留空就扫本机自己所在的各段。
       ★ 只扫 IPv4：IPv6 一个 /64 有 1.8×10<sup>19</sup> 个地址，逐个问是问不完的，
-      v6 那一套在下面「听谁在应答」那张卡里。</p>
+      v6 那一套在「设备与取流」那一页的「听谁在应答」里。</p>
     <div class="row">
       <div><label>网段（CIDR，留空 = 本机所在网段）</label><input id="nc" placeholder="192.168.1.0/24"></div>
       <div style="flex:0 0 150px"><label>只扫某块网卡</label><input id="ni" placeholder="en0 / 以太网"></div>
@@ -3625,7 +3833,7 @@ function subnetScanCard() {
         ${advice}</div>
       ${rows ? `<table style="margin-top:14px"><tr><th>地址</th><th>MAC</th><th>网卡</th><th>凭什么判定在线</th><th>等了</th></tr>${rows}</table>` : ''}
       ${v.alive ? `<p class="dim" style="margin-top:10px">「没信号」的那些<b>不是</b>「不在线」的证据 ——
-        它们只是没在这轮里吭声。要确认某一台，去「连通性」页单独 ping 它。</p>` : ''}
+        它们只是没在这轮里吭声。要确认某一台，去「ping 与端口」那一页单独 ping 它。</p>` : ''}
       <p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>
       <details style="margin-top:10px"><summary class="dim">原始结果</summary>
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
@@ -3909,24 +4117,6 @@ function neighborsCard() {
         <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
   };
   return card;
-}
-
-async function renderStream(root) {
-  const card = $(`<div class="card">
-    <h2>视频流探测</h2>
-    <p class="hint">输入取流地址，直接告诉你编码、**真实分辨率**、帧率。不需要播放器，也不解码。</p>
-    <label>RTSP 地址</label>
-    <input id="u" placeholder="rtsp://admin:密码@192.168.1.64:554/cam/realmonitor?channel=1&subtype=0">
-    <div style="margin-top:12px"><button class="btn primary" id="b">探测</button></div>
-    <div class="out" id="o" style="margin-top:12px;display:none"></div>
-  </div>`);
-  root.appendChild(card);
-  const o = card.querySelector('#o');
-  card.querySelector('#b').onclick = async () => {
-    o.style.display = 'block'; o.textContent = '探测中…';
-    const r = await call('media.rtsp.probe', { url: card.querySelector('#u').value });
-    o.textContent = r.ok ? `${r.note}\n\n${JSON.stringify(r.values, null, 2)}` : r.message;
-  };
 }
 
 // ── 远程 ──
@@ -4217,8 +4407,23 @@ async function renderTools(root) {
   root.appendChild(macCard());
   root.appendChild(macRandomCard());
   root.appendChild(codecCard());
-  root.appendChild(wolCard());
+}
+
+// ── 这台机器：端口占用与文件共享 ──
+
+async function renderLocal(root) {
+  root.appendChild(portProcCard());
   root.appendChild(fileshareCard());
+}
+
+// ── 出问题了：先体检，再把整包事实带走 ──
+//
+// ★ 这两张卡是配套的一对：体检给「第一个坏掉的是哪一步」，诊断包给「连同机器上
+//   看得见的一切，打包发给远程的人」。原来它们埋在十五张卡中间，现场找不到。
+
+async function renderCheckup(root) {
+  root.appendChild(checkupCard());
+  root.appendChild(diagBundleCard());
 }
 
 // ★ 每个码带一句「所以下一步做什么」：这几个码的处置完全不同 ——
@@ -4238,7 +4443,7 @@ const SC_CODE = {
   'networks-overlap': ['两段重叠', 'bad',
     '这是「有时候连得上有时候连不上」的根因：两条路由都能到一个地址，走哪条看内核当时怎么选。得改掩码或改地址池。'],
   'families-differ': ['两族各自编址', '',
-    '这个问法本身不成立 —— v4 段和 v6 段谈不上撞。要说「这台机器两族是不是都通」，去连通性页做双栈体检。'],
+    '这个问法本身不成立 —— v4 段和 v6 段谈不上撞。要说「这台机器两族是不是都通」，去「域名与时间」那一页做双栈体检。'],
 };
 
 function subnetCalcCard() {

@@ -155,10 +155,20 @@ header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em;
 header .en { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
 header .state { margin-left: auto; color: var(--muted); font-size: 12.5px; }
 
-/* ── 导航 ── */
+/* ── 导航：两层 ──
+ *
+ * ★ 上面一组是「现在要回答的问题」，下面才是那一组里的具体页。
+ *   四十多个工具平铺成一排按钮等于没有导航，所以分两层。
+ *   这里只排布局、不加颜色 —— 颜色一律用现成令牌，见文件头那条规矩。
+ */
 
-nav { display: flex; gap: 6px; padding: 10px 16px; background: var(--panel-2);
-      border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+nav { display: block; padding: 8px 16px; background: var(--panel-2);
+      border-bottom: 1px solid var(--line); }
+.navrow { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.navrow + .navrow { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line-soft); }
+.btn.grp { font-weight: 600; }
+.btn.sub { font-size: 12.5px; padding: 4px 10px; color: var(--muted); }
+.btn.sub.on { color: var(--gold); }
 
 /* ── 按钮：照 stage 的 .btn 一套 ── */
 
