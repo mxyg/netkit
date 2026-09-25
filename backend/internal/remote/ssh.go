@@ -181,8 +181,18 @@ func Exec(ctx context.Context, c *ssh.Client, d *Device, cmd string, timeout tim
 		return out, nil
 	case <-ctx.Done():
 		_ = sess.Signal(ssh.SIGKILL)
-		return nil, fmt.Errorf("命令超过 %s 没跑完，已中止", timeout)
+		return nil, timeoutErr(timeout)
 	}
+}
+
+// timeoutErr 到点没跑完的那句错。
+//
+// ★ 必须把 context.DeadlineExceeded 用 %w 带上：调用方要分得开
+//
+//	「这条命令在这台机器上跑砸了」和「等太久了我把它掐了」——
+//	前者要改剧本，后者要加等待秒数。只给一句人话会把两种捏成一种。
+func timeoutErr(timeout time.Duration) error {
+	return fmt.Errorf("命令超过 %s 没跑完，已中止：%w", timeout, context.DeadlineExceeded)
 }
 
 // winUTF8Preamble 每条 Windows 命令前垫的编码协商。

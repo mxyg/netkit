@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -529,5 +530,16 @@ func TestSendMsgWindowsMsgDisabled(t *testing.T) {
 	}
 	if r.Code != "send-failed" || !strings.Contains(r.Detail, "禁用") {
 		t.Errorf("msg.exe 失败该判 send-failed 并提示可能被禁用：%+v", r)
+	}
+}
+
+// 掐表和跑砸是两件事：剧本那一层靠这个码分得开「加等待秒数」和「改这条命令」。
+func Test掐掉的命令要能被认成超时(t *testing.T) {
+	err := timeoutErr(20 * time.Second)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("丢了 DeadlineExceeded，调用方会把「等太久」判成「跑砸」：%v", err)
+	}
+	if !strings.Contains(err.Error(), "没跑完") {
+		t.Errorf("光有码没有人话：%v", err)
 	}
 }

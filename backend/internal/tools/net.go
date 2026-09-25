@@ -37,6 +37,7 @@ func Register(r *ots.Registry) {
 	RegisterAddress(r)
 	RegisterDHCP(r)
 	RegisterRemote(r)
+	RegisterPlaybooks(r)
 }
 
 // version 是本机跑的产品版本，由 main 在启动时装进来（编译台注入，本地构建是 dev）。

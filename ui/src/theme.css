@@ -225,6 +225,11 @@ tr.fresh td { background: var(--green-bg); }
        font-size: 12.5px; color: var(--muted); max-height: 300px; overflow: auto; }
 .empty { color: var(--muted); padding: 14px 0; }
 code { font-family: ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace; font-size: 13px; }
+/* 剧本里关键词命中的那一行：从整段输出中单独挑出来的证据，
+   要一眼看出「这是被挑出来的话」，不是叙述的一部分 */
+pre.hit { background: var(--gold-bg); border-radius: 4px; padding: 3px 8px;
+          font-family: ui-monospace, 'IBM Plex Mono', Menlo, Consolas, monospace;
+          font-size: 12.5px; color: var(--text); }
 
 /* 次要列（MAC、MTU）：在场的人先看「能不能用」，这些是核对时才看的 */
 td.dim { color: var(--muted); }

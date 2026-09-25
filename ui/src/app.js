@@ -60,7 +60,8 @@ const PAGES = [
   { g: '出问题了', id: 'checkup', name: '一键体检与诊断包', render: renderCheckup },
   { g: '出问题了', id: 'trouble', name: '按症状排查', render: renderTrouble },
 
-  { g: '管别的机器', id: 'remote', name: '远程', render: renderRemote },
+  { g: '管别的机器', id: 'remote', name: '远程设备与审计', render: renderRemote },
+  { g: '管别的机器', id: 'remote-work', name: '连上去干活', render: renderRemoteWork },
 
   { g: '工具箱', id: 'tools', name: '算子网 / MAC / 编解码', render: renderTools },
 ];
@@ -4315,9 +4316,12 @@ function neighborsCard() {
   return card;
 }
 
-// ── 远程 ──
+// ── 远程：分成「这台机器是谁」和「连上去干活」两页 ──
 //
-// ★ 设备登记、执行命令、传文件、弹消息、开桌面，背后全是同一批工具 ——
+// ★ 原来五张卡挤一页，加体检剧本就超了「每页不超过五张」这条。
+//   拆开的分法也正好是人的分法：一页管登记簿和留痕，一页对着某台机器干活。
+//
+// ★ 设备登记、执行命令、传文件、弹消息、开桌面、跑剧本，背后全是同一批工具 ——
 //   改系统的操作由后端走批准渠道弹框，UI 不替人做判断。
 // ★★ 「对方可见」关成静默时，UI 当场再弹一次责任确认（docs/设计.md 安全第 3 条），
 //   这句话必须出现在人点下去之前，不能只藏在后端返回里。
@@ -4331,9 +4335,253 @@ async function renderRemote(root) {
   root.appendChild(notifyCard(r.values.notifyTarget !== false));
   root.appendChild(deviceTable(devices));
   root.appendChild(addDeviceCard());
-  const sel = devices.find((d) => d.id === remoteSel);
-  if (sel) root.appendChild(remoteOps(sel));
   root.appendChild(auditCard());
+}
+
+async function renderRemoteWork(root) {
+  const r = await call('remote.device.list');
+  if (!r.ok) { root.appendChild($(`<div class="card">远程功能不可用：${esc(r.message)}</div>`)); return; }
+  const devices = r.values.devices || [];
+  const sel = devices.find((d) => d.id === remoteSel) || null;
+  root.appendChild(devicePickCard(devices));
+  // 有活儿才现身：没挑设备时下面那两张卡除了占地方没有别的用处。
+  if (sel) root.appendChild(remoteOps(sel));
+  root.appendChild(playbookCard(devices, sel));
+}
+
+function devicePickCard(devices) {
+  const card = $(`<div class="card">
+    <h2>这一页要对哪台干活</h2>
+    <p class="hint">登记、删除、看审计在「远程设备与审计」那页。这里只挑一台，下面每一项都会先弹框确认再动。</p>
+    <div class="row" style="align-items:flex-end">
+      <div style="min-width:280px"><label>设备</label>
+        <select id="pick">${devices.length
+          ? devices.map((d) => `<option value="${esc(d.id)}" ${d.id === remoteSel ? 'selected' : ''}>${esc(d.name || d.id)} · ${esc(OS_LABEL[d.os] || '系统未知')}</option>`).join('')
+          : '<option value="">（还没有登记的设备）</option>'}</select></div>
+      <button class="btn primary" id="go"${devices.length ? '' : ' disabled'}>就这台</button>
+      <button class="btn" id="clr"${remoteSel ? '' : ' disabled'}>取消选择</button>
+    </div>
+  </div>`);
+  card.querySelector('#go').onclick = () => { remoteSel = card.querySelector('#pick').value; show(); };
+  card.querySelector('#clr').onclick = () => { remoteSel = null; show(); };
+  return card;
+}
+
+// 剧本的状态码 → 界面中文。后端只给码（和判定与账同源的那套规矩一致）。
+const PLAYBOOK_STEP = {
+  ran: ['问到', 'ok'],
+  failed: ['没问到答案', 'bad'],
+  timeout: ['没跑完', 'bad'],
+  'skipped-platform': ['这台问不出', 'warn'],
+  aborted: ['没问到（机器已经不答话）', 'warn'],
+};
+const PLAYBOOK_VERDICT = {
+  'playbook-ok': ['该问的都问到了', 'ok'],
+  'playbook-step-failed': ['有几条没问到答案', 'bad'],
+  'playbook-platform-skipped': ['这一本在这台机器上一条都没问到', 'warn'],
+  'playbook-unreachable': ['问到一半机器不答话了', 'bad'],
+  'playbook-empty': ['这本是空的', 'warn'],
+};
+
+function playbookCard(devices, sel) {
+  const card = $(`<div class="card">
+    <h2>体检剧本</h2>
+    <p class="hint">把「连上去挨个敲那十几条」录成一本能看、能改、能发给同事的剧本。
+      跑之前先看清它要敲什么、有几条会改那台机器的东西 —— 批准框上也会照原样念一遍。</p>
+    <div id="body"><div class="empty">读取中…</div></div>
+  </div>`);
+  const body = card.querySelector('#body');
+  // ★ 存完 / 删完的那句话要活得过重绘：不然点下去只看见列表闪了一下，
+  //   到底存没存上得靠人去猜。换一本时清掉（那句话说的是上一本）。
+  let flash = '';
+  // ★ 刚存的那本也要活得过重绘：存完跳回列表第一本，等于没告诉他存到哪了。
+  let keepBook = '';
+
+  const load = async () => {
+    const r = await call('remote.playbook.list', sel ? { device: sel.id } : {});
+    if (!r.ok) { body.innerHTML = `<div class="empty">列不出剧本：${esc(r.message)}</div>`; return; }
+    draw(r.values.playbooks || [], r.values);
+  };
+
+  const draw = (books, vals) => {
+    const known = sel && sel.os && sel.os !== 'unknown';
+    body.innerHTML = `
+      ${flash ? `<p class="hint" id="flash" style="color:var(--gold)">${esc(flash)}</p>` : ''}
+      <div class="row" style="align-items:flex-end">
+        <div style="min-width:300px"><label>挑一本</label>
+          <select id="book">${books.map((b) => `<option value="${esc(b.id)}"${b.id === keepBook ? ' selected' : ''}>${esc(b.name)} —— ${esc(b.stepCount)} 条，其中 ${esc(b.writeSteps)} 条会改东西${b.builtIn ? '（内置）' : ''}</option>`).join('')}</select></div>
+        <div style="max-width:120px"><label>每条等多久</label>
+          <select id="wait"><option value="0">按剧本标的</option><option value="30">30 秒</option><option value="60">60 秒 —— 磁盘慢的机器</option></select></div>
+        <button class="btn primary" id="run"${sel && known ? '' : ' disabled'}>跑这一本</button>
+      </div>
+      <p class="dim" style="margin:8px 0 0" id="applies"></p>
+      <details style="margin-top:6px"><summary class="dim">这一本要问哪几问、哪几条会改东西</summary>
+        <div id="preview" style="margin-top:8px"></div></details>
+      ${sel && !known ? '<p class="hint" style="color:var(--gold)">这台机器的系统还没探过 —— 先去「远程设备与审计」那页点一次「探测」。不知道系统就把分系统的条判成「问不出」，那是猜的。</p>' : ''}
+      <div class="out" id="result" style="display:none;margin-top:12px"></div>
+      <details style="margin-top:12px"><summary class="dim">改这一本 / 另存一本 / 导入同事发来的</summary>
+        <div id="editor" style="margin-top:8px"></div></details>`;
+
+    const bookOf = () => books.find((b) => b.id === body.querySelector('#book').value) || books[0];
+    const drawBook = () => {
+      const b = bookOf();
+      if (!b) return;
+      const pv = body.querySelector('#preview');
+      pv.innerHTML = `${b.note ? `<p class="hint">${esc(b.note)}</p>` : ''}
+        <table><tr><th>问什么</th><th>敲什么</th><th>哪种系统</th><th></th></tr>
+        ${b.steps.map((s) => `<tr>
+          <td>${esc(s.name)}<br><span class="dim">${esc(s.why || '')}</span></td>
+          <td><code class="dim">${esc(s.run)}</code></td>
+          <td class="dim">${(s.os || []).map((o) => OS_LABEL[o] || o).join(' / ') || '哪都一样'}</td>
+          <td>${s.write ? '<span class="pill bad">会改东西</span>' : '<span class="pill">只看</span>'}</td></tr>`).join('')}</table>
+        <p class="dim" style="margin:8px 0 0">跑完的每一条都会回到审计日志里（命令和字节数，输出不进审计 —— 里面可能有口令）。</p>`;
+      const a = body.querySelector('#applies');
+      if (!a) return;
+      if (!sel) { a.textContent = '还没挑设备 —— 挑一台才能跑。'; return; }
+      if (!known) { a.textContent = ''; return; }
+      a.textContent = `在 ${sel.name || sel.id}（${OS_LABEL[sel.os] || sel.os}）上，这本有 ${b.appliesOnDevice}/${b.stepCount} 条问得出去。`;
+      drawEditor(b);
+    };
+
+    const drawEditor = (b) => {
+      const ed = body.querySelector('#editor');
+      const json = JSON.stringify({
+        id: b.id, name: b.name, note: b.note || '',
+        steps: b.steps.map((s) => ({
+          name: s.name, run: s.run, why: s.why,
+          ...(s.os && s.os.length ? { os: s.os } : {}),
+          ...(s.marks && s.marks.length ? { marks: s.marks } : {}),
+          ...(s.write ? { write: true } : {}),
+          ...(s.timeoutSec ? { timeoutSec: s.timeoutSec } : {}),
+        })),
+      }, null, 2);
+      ed.innerHTML = `
+        <p class="hint">这里改的就是那本剧本的原文。<b>改内置那本只能另存成新的一本</b> ——
+        内置的那本是「照着官方那本跑」的基准，覆盖了就没人知道你和别人跑的不是同一套。</p>
+        <p class="hint">同事发来的那本：把整段 JSON 贴进下面这个框，点「存成新的一本」就进来了。
+        不合式的贴法会原样把哪儿不合式说回来，不会存半本进去。</p>
+        <textarea id="txt" rows="14" style="width:100%;font-family:ui-monospace,Menlo,monospace">${esc(json)}</textarea>
+        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+          <button class="btn primary" id="saveAs">存成新的一本</button>
+          <button class="btn" id="saveOver"${b.builtIn ? ' disabled title="内置那本不许覆盖"' : ''}>保存修改这一本</button>
+          <button class="btn" id="copy">复制这段（发给同事）</button>
+          <button class="btn" id="copyOut">复制最近一次结果</button>
+          <button class="btn danger" id="del"${b.builtIn ? ' disabled title="内置那本删不掉"' : ''}>删掉这一本</button>
+        </div>
+        <div class="out" id="esave" style="display:none;margin-top:8px"></div>`;
+      let lastResult = '';
+      ed.querySelector('#copy').onclick = async (e) => {
+        const t = ed.querySelector('#txt').value;
+        try { await navigator.clipboard.writeText(t); e.target.textContent = '已复制，发过去就行'; }
+        catch { e.target.textContent = '复制不了，全选框里那段自己拷'; }
+      };
+      ed.querySelector('#copyOut').onclick = async (e) => {
+        const t = lastResult || body.querySelector('#result').innerText;
+        try { await navigator.clipboard.writeText(t); e.target.textContent = '已复制'; }
+        catch { e.target.textContent = '复制不了'; }
+      };
+      const save = (replace) => {
+        const say = (s) => { const o = ed.querySelector('#esave'); o.style.display = 'block'; o.textContent = s; };
+        let book;
+        try { book = JSON.parse(ed.querySelector('#txt').value); }
+        catch (err) { say('这段不是合法 JSON：' + err.message); return; }
+        say(replace ? '保存中…（等待批准）' : '存入中…（等待批准）');
+        call('remote.playbook.save', { playbook: book, replace }).then((r) => {
+          if (!r.ok) { say('存不下：' + r.message); return; }
+          say(r.note);
+          flash = r.note;
+          keepBook = r.values.playbook;
+          setTimeout(load, 800);
+        });
+      };
+      ed.querySelector('#saveAs').onclick = () => save(false);
+      ed.querySelector('#saveOver').onclick = () => save(true);
+      ed.querySelector('#del').onclick = async () => {
+        const cur = bookOf();
+        // 删的是本机上那一个文件：万一里面记着「只有这台机器管用」的经验，
+        // 删了就没了 —— 所以先给一次把 JSON 拷走的机会，再让点。
+        const ok = await confirmModal(
+          `删掉剧本「${cur.name}」？`,
+          ['只删本机配置目录里那一个文件，<b>设备上跑过的痕迹和审计日志都不动</b>。',
+           '内置的那些本删不掉，这里也不会去碰它们。',
+           '想留着的话：先点「复制这段（发给同事）」把 JSON 收好，再回来删。'],
+          '确认删掉');
+        if (!ok) return;
+        const r = await call('remote.playbook.delete', { playbook: cur.id });
+        const say = (s) => { const o = ed.querySelector('#esave'); o.style.display = 'block'; o.textContent = s; };
+        if (!r.ok) { say('删不掉：' + r.message); return; }
+        say(r.note);
+        flash = r.note;
+        setTimeout(load, 800);
+      };
+      // 跑完一次结果就换一次；另存时给人一个能把结果一起发走的口子
+      card.__setResult = (t) => { lastResult = t; };
+    };
+
+    body.querySelector('#book').onchange = (e) => {
+      // 那句说的是上一本（「已存好 X」），换一本再挂着就是假线索 ——
+      // 清变量不够，那行已经在页上了，得当场摘掉。
+      flash = ''; keepBook = e.target.value;
+      body.querySelector('#flash')?.remove();
+      drawBook();
+    };
+    body.querySelector('#run').onclick = async () => {
+      const b = bookOf();
+      const o = body.querySelector('#result');
+      const wait = Number(body.querySelector('#wait').value) || undefined;
+      o.style.display = 'block';
+      o.textContent = `正在 ${sel.id} 上跑「${b.name}」…（${b.writeSteps} 条会改东西，批准框上会一条条念给你看）`;
+      const args = { device: sel.id, playbook: b.id };
+      if (wait) args.timeoutSec = wait;
+      const r = await call('remote.playbook.run', args);
+      if (!r.ok) { o.textContent = '跑不了：' + r.message; return; }
+      o.innerHTML = playbookResult(r);
+      if (card.__setResult) card.__setResult(o.innerText);
+    };
+    drawBook();
+  };
+
+  load();
+  return card;
+}
+
+function playbookResult(r) {
+  const v = r.values || {};
+  const c = v.counts || {};
+  const [label, cls] = PLAYBOOK_VERDICT[r.verdict] || [r.verdict, ''];
+  const red = Object.values(v.redacted || {}).reduce((a, b) => a + b, 0);
+  const steps = (v.steps || []).map((s) => {
+    const [sl, sc] = PLAYBOOK_STEP[s.status] || [s.status, ''];
+    const hits = (s.hits || []).filter((h) => h.lines > 0);
+    const misses = (s.hits || []).filter((h) => !h.lines);
+    return `<div style="border-top:1px solid var(--line);padding:10px 0">
+      <div><span class="pill ${sc}">${esc(sl)}</span>
+        <b>${esc(s.name)}</b>
+        ${s.write ? '<span class="pill bad">改了那台机器的东西</span>' : ''}
+        ${s.exitCode ? `<span class="pill warn">退出码 ${esc(s.exitCode)}</span>` : ''}
+        <span class="dim">${esc(s.elapsedMs ? (s.elapsedMs / 1000).toFixed(1) + ' 秒' : '')}</span></div>
+      ${s.why ? `<p class="dim" style="margin:4px 0">为什么问它：${esc(s.why)}</p>` : ''}
+      <p style="margin:4px 0"><code>${esc(s.command)}</code></p>
+      ${hits.map((h) => `<div style="border-left:3px solid var(--gold);padding:2px 0 2px 8px;margin:6px 0">
+          <b>命中 ${esc(h.lines)} 行</b>
+          ${(h.sample || []).map((x) => `<pre class="hit" style="margin:2px 0;white-space:pre-wrap">${esc(x)}</pre>`).join('')}
+          <p style="margin:4px 0 0">${esc(h.say)}</p></div>`).join('')}
+      ${misses.length ? `<p class="dim" style="margin:6px 0 0">这几样在这段输出里没提到：${misses.map((h) => `「${esc(h.say)}」`).join('、')}
+        —— <b>没提到不等于没有</b>，它只说明这本剧本要找的那句话没出现。</p>` : ''}
+      ${s.output ? `<pre class="out" style="white-space:pre-wrap;margin:6px 0 0">${esc(s.output)}</pre>` : ''}
+      ${s.error ? `<p style="margin:6px 0 0">没问到的原因：${esc(s.error)}</p>` : ''}
+      ${s.note ? `<p class="dim" style="margin:6px 0 0">${esc(s.note)}</p>` : ''}
+    </div>`;
+  }).join('');
+
+  return `<div><span class="pill ${cls}">${esc(label)}</span> <b>${esc(v.verdictNote || r.note || '')}</b></div>
+    <p class="dim" style="margin:8px 0">共 ${esc(c.total)} 条：问到 ${esc(c.ran)}、没问到答案 ${esc(c.failed)}、
+      没跑完 ${esc(c.timedOut)}、这台问不出 ${esc(c.skippedPlatform)}、没问到（机器断了）${esc(c.aborted)}${c.hitLines ? `；关键词命中 ${esc(c.hitLines)} 处` : ''}</p>
+    ${red ? `<p class="hint" style="color:var(--gold)">结果里抹掉了凭据：${esc(v.redactedHow)}。键名留着、值换成掩码 —— 那是「有口令、没给你看」，不是「没配口令」。</p>`
+          : `<p class="dim" style="margin:8px 0">凭据核过一遍：${esc(v.redactedHow)}。</p>`}
+    ${steps}
+    <p style="margin:10px 0 0"><b>下一步：</b>${esc(v.nextStep || '')}
+      <span class="dim">（这台 ${esc(v.device)} · 剧本 ${esc(v.playbook)} · 用了 ${esc(v.seconds ? v.seconds.toFixed(1) : '—')} 秒）</span></p>`;
 }
 
 function notifyCard(on) {

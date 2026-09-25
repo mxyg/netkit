@@ -21,6 +21,7 @@ import (
 	"net.yuhox.com/netkit/internal/api"
 	"net.yuhox.com/netkit/internal/mcp"
 	"net.yuhox.com/netkit/internal/ots"
+	"net.yuhox.com/netkit/internal/playbook"
 	"net.yuhox.com/netkit/internal/remote"
 	"net.yuhox.com/netkit/internal/state"
 	"net.yuhox.com/netkit/internal/tools"
@@ -69,6 +70,10 @@ func main() {
 		} else {
 			tools.SetRemote(m)
 		}
+	}
+	// 体检剧本：内置的在代码里，自定义的一本一个文件落在配置目录。
+	if dir, err := playbook.DefaultDir(); err == nil {
+		tools.SetPlaybook(playbook.NewStore(dir))
 	}
 	if *approveURL != "" {
 		reg.SetApprover(&api.HTTPApprover{URL: *approveURL})
