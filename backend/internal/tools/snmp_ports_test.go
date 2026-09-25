@@ -353,7 +353,7 @@ func TestSnmpPortsCappedSpeedIsNotASpeed(t *testing.T) {
 		t.Errorf("顶格值被当成速率给了：%v", ps[0])
 	}
 	if got := ps[0]["speedAtLeast"]; got != uint64(speedMaxIfSpeed) {
-		t.Errorf("speedAtLeast = %v，要 %d", got, speedMaxIfSpeed)
+		t.Errorf("speedAtLeast = %v，要 %d", got, uint64(speedMaxIfSpeed))
 	}
 	if !strings.Contains(fmt.Sprint(ps[0]["speedText"]), "至少") {
 		t.Errorf("speedText = %v：要写成「至少」", ps[0]["speedText"])

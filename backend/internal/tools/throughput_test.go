@@ -168,7 +168,7 @@ func Test对测口的参数界限全在代码里夹住(t *testing.T) {
 	thruErr(t, throughputServeTool, map[string]any{"addrs": []string{"127.0.0.1"}, "port": 70000}, "端口只认")
 	// 字节闸。太小会把一条健康链路判成「被对面截了」，太大这一口就成了放大器。
 	thruErr(t, throughputServeTool, map[string]any{"maxBytes": 1024}, "maxBytes 只认")
-	thruErr(t, throughputServeTool, map[string]any{"maxBytes": 1 << 40}, "maxBytes 只认")
+	thruErr(t, throughputServeTool, map[string]any{"maxBytes": int64(1) << 40}, "maxBytes 只认")
 	thruErr(t, throughputServeTool, map[string]any{"maxBytes": -1}, "maxBytes 只认")
 	// 路数。
 	thruErr(t, throughputServeTool, map[string]any{"maxSessions": 9}, "maxSessions 只认")
