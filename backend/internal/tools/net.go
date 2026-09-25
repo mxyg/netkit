@@ -28,6 +28,7 @@ var localTools = []ots.Tool{
 	dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
 	fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
 	throughputServeTool, throughputStatusTool, throughputStopTool, throughputTestTool, speedTestTool,
+	qualityWatchTool, qualityStatusTool, qualityReportTool, qualityStopTool,
 	diagBundleTool, troubleshootTool,
 }
 

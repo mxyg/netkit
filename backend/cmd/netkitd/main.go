@@ -22,6 +22,7 @@ import (
 	"net.yuhox.com/netkit/internal/mcp"
 	"net.yuhox.com/netkit/internal/ots"
 	"net.yuhox.com/netkit/internal/playbook"
+	"net.yuhox.com/netkit/internal/quality"
 	"net.yuhox.com/netkit/internal/remote"
 	"net.yuhox.com/netkit/internal/state"
 	"net.yuhox.com/netkit/internal/tools"
@@ -74,6 +75,11 @@ func main() {
 	// 体检剧本：内置的在代码里，自定义的一本一个文件落在配置目录。
 	if dir, err := playbook.DefaultDir(); err == nil {
 		tools.SetPlaybook(playbook.NewStore(dir))
+	}
+	// 持续质量监测的留痕目录：一路一个文件，落在配置目录下。
+	// ★ 装不上就不许开监测 —— 记不下来的监测只是给人一个「我盯着呢」的错觉。
+	if dir, err := quality.DefaultDir(); err == nil {
+		tools.SetQualityDir(dir)
 	}
 	if *approveURL != "" {
 		reg.SetApprover(&api.HTTPApprover{URL: *approveURL})

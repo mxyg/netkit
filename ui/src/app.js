@@ -54,6 +54,7 @@ const PAGES = [
 
   { g: '快不快', id: 'thru', name: '两台机器对测', render: renderThru },
   { g: '快不快', id: 'speed', name: '出去公网有多快', render: renderSpeed },
+  { g: '快不快', id: 'quality', name: '盯一段时间', render: renderQuality },
 
   { g: '谁在网里', id: 'scan', name: '网段上有哪些地址', render: renderScan },
   { g: '谁在网里', id: 'device', name: '设备是谁', render: renderDevice },
@@ -115,6 +116,10 @@ async function show() {
   // ★ 对测口那本台账每 3 秒问一次：人不在这页了还问，就是拿别人的屏幕当轮询靶子
   clearInterval(thruTimer);
   thruTimer = null;
+  // ★ 监测状态每 3 秒问一次：人不在这页了还问，就是拿别人的屏幕当轮询靶子
+  clearInterval(qualityTimer);
+  qualityTimer = null;
+  qualityPick = null;
   main.innerHTML = '<div class="empty">读取中…</div>';
   const p = PAGES.find((x) => x.id === current);
   main.innerHTML = '';
@@ -7089,6 +7094,457 @@ function speedXfer(x) {
       ${x.status ? ` · 回 ${f(x.status)}` : ''}</div>
     ${kw ? `<div class="${kc}">${esc(kw)}</div>` : ''}
     ${x.error ? `<div class="dim">${esc(x.error)}</div>` : ''}`;
+}
+
+/*
+ * ── 盯一段时间（net.quality.*）──
+ *
+ * ★★ 这一页回答的是「那一段时间到底怎么样」，不是「此刻怎么样」。
+ *   前面两页量的都是现在这一秒（对测、公网），而现场最常见的说法是
+ *   「偶尔卡一下，你去的时候它又是好的」—— 那一句只能靠一本按窗记下来的账去问。
+ *
+ * ★ 开这一路要人点头：它是后台持续发包 + 一直写文件，一开就是几十分钟起步，
+ *   没人点「停」它就一直在发（[OTS-7.1]）。
+ *
+ * ★★ 界面上一处都不算：丢包率、中位、抖动、断档、被截过，全是后端从那本账里算好的。
+ *   图上那一格和判定点名的那一窗必须同源，否则人看完图再看结论就对不上，
+ *   对不上一次，这张图以后就没人信了。
+ *
+ * ★ 断档画成缺口，不许连一条落到 0 的斜线：那一段是「没问到」，不是「慢到 0」。
+ *   画成后者等于凭空造一个现场没有的故障 —— 和对测那张图的方块同一条线。
+ */
+
+const QUALITY_STATE = {
+  'quality-running': ['正在盯', 'ok'],
+  'quality-idle': ['没在跑', ''],
+  'quality-stopped': ['停掉了，账还在', ''],
+  'quality-barred': ['包发不出去', 'bad'],
+  'quality-ledger-blocked': ['账写不下去', 'bad'],
+};
+
+// 读一本账的七档。★ 每一档的下一步不一样，所以不许并成一句「有问题」。
+const QUALITY_READ = {
+  'quality-stable': ['这些窗里没毛病', 'ok'],
+  'quality-loss': ['有窗在丢包', 'warn'],
+  'quality-flapping': ['通断交替', 'bad'],
+  'quality-rtt-rise': ['往返在往上走', 'warn'],
+  'quality-gap': ['留痕有断档', 'warn'],
+  'quality-truncated': ['看到的不是全程', 'warn'],
+  'quality-barred': ['这本账全是包没出去', 'bad'],
+  'quality-idle': ['还没有账可读', ''],
+};
+
+let qualityTimer = null;
+let qualityPick = null;   // 状态卡上的「读这本账」按下去，填进报表卡
+
+async function renderQuality(root) {
+  root.appendChild(qualityWatchCard());
+  root.appendChild(qualityReportCard());
+}
+
+const qHms = (s) => (s ? String(s).replace('T', ' ').slice(11, 19) : '—');
+
+// qDur 与后端 note 里那个 humanDur 同一个口径：整刻度不写小数点。
+// ★ 这里显示的是「你选的刻度」，不是量出来的数 —— 「每 5.0 秒一窗」让人以为
+//   刻度本身在抖，而 500.0 毫秒这种写法 nobody reads。
+const qDur = (ms) => {
+  const a = Math.round(Math.abs(Number(ms) || 0));
+  if (a < 1000) return `${a} 毫秒`;
+  if (a < 60000 && a % 1000 === 0) return `${a / 1000} 秒`;
+  return humanMs(a);
+};
+
+/**
+ * qualityChart 一本账两条线：上面是每窗中位往返，下面是每窗丢包率。
+ *
+ * ★ 为什么两条一起画：只看往返会把「全丢」画成没有点（图上是一段空白），
+ *   只看丢包会把「越来越慢」看不出来 —— 现场那两种病的下一步完全不同。
+ */
+function qualityChart(recs) {
+  const rs = (recs || []).filter((x) => x && x.startAt && x.endAt);
+  if (!rs.length) return '';
+  if (rs.length < 2) {
+    return '<p class="hint">只有一窗，画不出形状 —— 一窗是一段时间的平均，'
+      + '至少两窗才看得见「变没变」。多等一窗，或者把窗口调短。</p>';
+  }
+  const W = 620, H = 208, PL = 46, PR = 14, TOP = 30, MID = 122, BOT = 190;
+  const t0 = Date.parse(rs[0].startAt);
+  const t1 = Date.parse(rs[rs.length - 1].endAt);
+  const span = Math.max(1, t1 - t0);
+  const X = (t) => PL + ((t - t0) / span) * (W - PL - PR);
+  const hi = Math.max(...rs.map((x) => Number(x.medianMs) || 0)) * 1.2 || 1;
+  const Y = (v) => MID - (v / hi) * (MID - TOP);
+  const segs = [], dots = [], holes = [], bars = [], lost = [];
+  let prev = null, prevEnd = null;
+  for (const x of rs) {
+    const a = Date.parse(x.startAt), b = Date.parse(x.endAt);
+    const bw = Math.max(2.5, X(b) - X(a) - 1);
+    // 两窗之间空了一大段：那是「没采到」，先把缺口画出来，再把线断掉。
+    if (prevEnd !== null && a - prevEnd > (Number(x.windowMs) || 0) * 1.6) {
+      holes.push(`<rect x="${X(prevEnd).toFixed(1)}" y="${TOP}" width="${(X(a) - X(prevEnd)).toFixed(1)}"
+          height="${MID - TOP}" fill="var(--sunken)" stroke="var(--line)" stroke-dasharray="3 3"/>`);
+      prev = null;
+    }
+    const sent = Number(x.sent) || 0, recv = Number(x.recv) || 0;
+    const lp = Number(x.lossPercent) || 0;
+    if (lp > 0) {
+      const h = Math.max(2, (lp / 100) * (BOT - MID - 16));
+      bars.push(`<rect x="${X(a).toFixed(1)}" y="${(BOT - h).toFixed(1)}" width="${bw.toFixed(1)}"
+          height="${h.toFixed(1)}" fill="${lp >= 50 ? 'var(--red-bg)' : 'var(--sunken)'}"
+          stroke="${lp >= 50 ? 'var(--red-line)' : 'var(--line)'}"/>`);
+    }
+    if (x.blocked) {
+      // 包根本没出去：这一窗那条丢包线不是对端不响，是这台机器没路 —— 单画一种颜色
+      lost.push(`<rect x="${X(a).toFixed(1)}" y="${(MID - 9).toFixed(1)}" width="${bw.toFixed(1)}" height="9"
+          fill="var(--red-bg)" stroke="var(--red-line)"/>`);
+      prev = null;
+      prevEnd = b;
+      continue;
+    }
+    if (!recv) {
+      lost.push(`<rect x="${(X(a) + bw / 2 - 3).toFixed(1)}" y="${(MID - 3).toFixed(1)}" width="7" height="7"
+          fill="none" stroke="var(--red-line)"/>`);
+      prev = null;
+      prevEnd = b;
+      continue;
+    }
+    const cx = X((a + b) / 2), cy = Y(Number(x.medianMs) || 0);
+    if (prev) {
+      segs.push(`<line x1="${prev[0].toFixed(1)}" y1="${prev[1].toFixed(1)}"
+          x2="${cx.toFixed(1)}" y2="${cy.toFixed(1)}" stroke="var(--green-dim)" stroke-width="1.7"/>`);
+    }
+    dots.push(`<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.6" fill="var(--green-dim)"/>`);
+    prev = [cx, cy];
+    prevEnd = b;
+  }
+  const hhmm = (ms) => {
+    const d = new Date(ms);
+    return Number.isFinite(d.getTime()) ? d.toTimeString().slice(0, 8) : '';
+  };
+  const ticks = [0, 0.5, 1].map((k) => `<text x="${(PL + k * (W - PL - PR)).toFixed(1)}" y="${H - 4}"
+      text-anchor="${k === 0 ? 'start' : k === 1 ? 'middle' : 'end'}"
+      fill="var(--muted)" font-size="10">${esc(hhmm(t0 + k * span))}</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"
+      style="max-width:100%;height:auto;display:block" role="img" aria-label="这一本账每一窗的往返与丢包">
+      <line x1="${PL}" y1="${MID}" x2="${W - PR}" y2="${MID}" stroke="var(--line)"/>
+      <line x1="${PL}" y1="${BOT}" x2="${W - PR}" y2="${BOT}" stroke="var(--line)"/>
+      ${holes.join('')}${bars.join('')}${segs.join('')}${dots.join('')}${lost.join('')}
+      <text x="${PL}" y="${TOP - 8}" fill="var(--muted)" font-size="10">${esc(hi.toFixed(1))} ms</text>
+      <text x="${W - PR}" y="${TOP - 8}" text-anchor="end" fill="var(--muted)" font-size="10">
+        ${rs.length} 窗 · 每窗 ${esc(qDur(Number(rs[0].windowMs) || 0))}</text>
+      <text x="${PL}" y="${BOT + 4}" fill="var(--muted)" font-size="10">100% 丢包</text>
+      <text x="${W - PR}" y="${BOT + 4}" text-anchor="end" fill="var(--muted)" font-size="10">
+        下方柱 = 那一窗的丢包率（0–100%）</text>
+      ${ticks}
+      <text x="6" y="${TOP + 6}" fill="var(--muted)" font-size="10">中位往返</text>
+      <text x="6" y="${MID - 2}" fill="var(--muted)" font-size="10">0</text>
+    </svg>
+    <p class="hint">红底方块 = 那一窗包根本没出去（这台机器没路，不是对端不响）·
+      空心方块 = 发出去了但一个回执都没有 · 虚线框 = 那一段时间<strong>没有账</strong>，
+      是「没问到」不是「没问题」。</p>`;
+}
+
+// 断档与全丢段：这两样是后端从那本账里算出来的，这里只摊开给人看是哪几段。
+function qualityAudit(aud) {
+  if (!aud) return '';
+  const holes = (aud.holes || []).map((h) => `<tr>
+      <td class="dim">${esc(qHms(h.from))} → ${esc(qHms(h.to))}</td>
+      <td>${esc(qDur(Number(h.ms) || 0))}</td>
+      <td class="bad">该有 ${esc(h.expectedWindows ?? '—')} 窗，一窗都没有</td></tr>`).join('');
+  const silent = (aud.silent || []).map((s) => `<tr>
+      <td class="dim">${esc(qHms(s.from))} → ${esc(qHms(s.to))}</td>
+      <td>${esc(qDur(Number(s.ms) || 0))}</td>
+      <td class="${s.block ? 'bad' : 'warn'}">${s.block ? '包发不出去（查自己这台）' : '一个回执都没有（查对端与路上）'}</td></tr>`).join('');
+  const parts = [];
+  if (holes) {
+    parts.push(`<div><label>账上的洞（共 ${(aud.holes || []).length} 段${aud.missingSeqs ? `，另外序号还缺 ${esc(aud.missingSeqs)} 个` : ''}）</label>
+      <table><tr><th>哪一段</th><th>多久</th><th>缺多少</th></tr>${holes}</table></div>`);
+  }
+  if (silent) {
+    parts.push('<div style="margin-top:10px"><label>连着全丢的那几段</label><table><tr><th>哪一段</th><th>多久</th><th>这一段的病</th></tr>'
+      + `${silent}</table></div>`);
+  }
+  // ★ 只说数得出的那个数：序号不是从 1 起的才有「滚掉了几窗」，
+  //   尾部没写干净那种不完整（droppedWindows 是 0）不许写成「滚掉过 0 窗」——那是句空话。
+  if ((aud.droppedWindows || 0) > 0) {
+    parts.push(`<p class="warn">这本账被滚掉过 ${esc(aud.droppedWindows)} 窗（留痕到上限，最早的先走）—— 你看到的不是全程。</p>`);
+  }
+  if (typeof aud.staleMs === 'number' && aud.staleMs > 0) {
+    parts.push(`<p class="warn">这一路还挂着，但最新一窗距今 ${esc(qDur(aud.staleMs))} 没落账 —— 到点了没写进来。</p>`);
+  }
+  if (!parts.length) return '';
+  return `<div style="margin-top:12px">${parts.join('')}</div>`;
+}
+
+function qualityLedgerTable(ledgers) {
+  const rows = (ledgers || []).map((l) => {
+    const err = l.error ? `<span class="bad">这本读不了：${esc(l.error)}</span>` : '';
+    return `<tr>
+      <td><code>${esc(l.target || '—')}</code>${err}</td>
+      <td class="dim">${esc(l.windows ?? '—')} 窗${l.tailBroken ? '<span class="warn"> · 尾部有一条没写完</span>' : ''}</td>
+      <td class="dim">${esc(qHms(l.firstAt))} → ${esc(qHms(l.lastAt))}</td>
+      <td class="dim">${typeof l.lastMedianMs === 'number' ? esc(l.lastMedianMs.toFixed(1)) + ' ms' : '—'}</td>
+      <td class="${(l.lastLossPercent || 0) > 0 ? 'warn' : 'dim'}">${esc(l.lastLossPercent ?? '—')}%</td>
+      <td><button class="btn" data-q="${esc(l.target || '')}">读这本账</button></td>
+    </tr>`;
+  }).join('');
+  return `<table><tr><th>盯的是谁</th><th>多少窗</th><th>哪一段时间</th><th>最新中位</th><th>最新丢包</th><th></th></tr>${rows}</table>`;
+}
+
+function qualityWindowTable(recs) {
+  const rs = recs || [];
+  if (!rs.length) return '';
+  const show = rs.slice(-12);
+  const rows = show.map((x) => {
+    const say = x.blocked ? `<span class="bad">${esc(x.blocked)}</span>`
+      : (!x.recv ? '<span class="warn">一个回执都没有</span>'
+        : (x.unreachable ? `<span class="warn">不可达 ${esc(x.unreachable)} 发</span>` : '<span class="dim">—</span>'));
+    const f = (n) => (typeof n === 'number' ? `${esc(n.toFixed(1))} ms` : '<span class="dim">—</span>');
+    return `<tr>
+      <td class="dim">第 ${esc(x.seq)} 窗<div>${esc(qHms(x.startAt))} → ${esc(qHms(x.endAt))}</div></td>
+      <td>${esc(x.sent)} 发 / ${esc(x.recv)} 回</td>
+      <td class="${(x.lossPercent || 0) > 0 ? 'warn' : 'dim'}">${esc(x.lossPercent)}%</td>
+      <td>${f(x.medianMs)}</td><td>${f(x.maxMs)}</td><td>${f(x.jitterMs)}</td>
+      <td class="dim">${(x.spikes || []).length ? `尖峰 ${esc((x.spikes || []).length)} 处` : '—'}</td>
+      <td>${say}</td></tr>`;
+  }).join('');
+  return `<div style="margin-top:12px"><label class="dim">最近 ${show.length} 窗（图上那几格就是这几行；一本账共 ${rs.length} 窗在这一次的读数里）</label>
+    <div style="max-height:300px;overflow:auto"><table>
+      <tr><th>哪一窗</th><th>发/回</th><th>丢包</th><th>中位</th><th>最慢</th><th>抖动</th><th>尖峰</th><th>这一窗的话</th></tr>
+      ${rows}</table></div></div>`;
+}
+
+function qualityWatchCard() {
+  const card = $(`<div class="card">
+    <h2>盯一段时间 <span id="q-top"></span></h2>
+    <p class="hint">「偶尔卡一下，你去的时候它又是好的」—— 这一句只能靠一本<strong>按窗记下来的账</strong>去问。
+      开一路之后它每隔一会儿发一发 ping，每满一窗把那一段时间记成一行（丢包率、中位、最慢、抖动、尖峰在哪几发）。
+      ★ 它改的是这台机器：后台持续对外发包 + 一直往配置目录写文件，所以要你点头，
+      而且<strong>会一直跑到你点停</strong>（或者这个后端退出）。
+      ★ 停掉<strong>不删账</strong> —— 那本账就是开这一路的目的；要腾地方自己删那个文件。
+      ★ 一次只开一路：现场那颗「停」必须明确知道停的是谁。
+      ★ 跨网段的目标请自己确认出口策略允许（持续发包在防火墙上看着像扫描）。</p>
+    <div class="row">
+      <div style="flex:1 1 220px"><label>盯哪个地址</label>
+        <input id="q-addr" placeholder="网关 / 平台 / 那台摄像头"></div>
+      <div style="flex:0 0 130px"><label>多久发一发（毫秒）</label>
+        <input id="q-interval" placeholder="默认 1000"></div>
+      <div style="flex:0 0 140px"><label>多久记一窗（毫秒）</label>
+        <input id="q-window" placeholder="默认 30000"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn danger" id="q-go">开这一路监测</button></div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:0 0 auto;min-width:0">
+        <button class="btn" id="q-refresh">刷新状态</button>
+        <button class="btn danger" id="q-stop" style="display:none">立刻停掉</button></div>
+    </div>
+    <div id="q-err" style="margin-top:12px"></div>
+    <div id="q-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#q-out');
+  const errBox = card.querySelector('#q-err');
+  const top = card.querySelector('#q-top');
+  const btnStop = card.querySelector('#q-stop');
+
+  const paint = (code, v, note) => {
+    const [title, cls] = QUALITY_STATE[code] || [code || '没给判定', ''];
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+    btnStop.style.display = code === 'quality-running' ? '' : 'none';
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--sunken)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--line)';
+    const facts = [];
+    if (v.target) { facts.push(['盯的是', `<code>${esc(v.target)}</code>`]); }
+    if (v.intervalMs) { facts.push(['发一发', `${esc(v.intervalMs)} 毫秒`]); }
+    if (v.windowMs) { facts.push(['记一窗', `${esc(v.windowMs)} 毫秒`]); }
+    if (typeof v.windows === 'number') {
+      // ★ 同一份 v.windows 在两种读数里不是同一个意思：
+      //   「这一路自己记了几窗」只在停掉那一刻才有，「这本账现在有几窗」是整本账。
+      //   后端两个都给了（windows / totalWindows），这里就得按给的是哪个来写标签。
+      facts.push([typeof v.totalWindows === 'number' ? '这一路记了几窗' : '这本账现在有几窗',
+        `${esc(v.windows)} 窗`]);
+    }
+    if (typeof v.totalWindows === 'number' && v.totalWindows !== v.windows) {
+      facts.push(['这本账现在一共', `${esc(v.totalWindows)} 窗`]);
+    }
+    if (v.startedAt) { facts.push(['这一路什么时候开的', esc(fmtStamp(v.startedAt))]); }
+    if (v.nextAt) { facts.push(['下一窗大约', `${esc(qHms(v.nextAt))}${typeof v.nextInMs === 'number' ? `（还有 ${esc(qDur(v.nextInMs))}）` : ''}`]); }
+    if (v.file) { facts.push(['账落在', `<code style="user-select:all">${esc(v.file)}</code>`]); }
+    if (v.last && v.last.seq) {
+      facts.push(['最新那一窗', `第 ${esc(v.last.seq)} 窗：${esc(v.last.sent)} 发回了 ${esc(v.last.recv)} 发`
+        + `（丢包 ${esc(v.last.lossPercent)}%）、中位 ${esc((Number(v.last.medianMs) || 0).toFixed(1))} ms`]);
+    }
+    const ledgers = v.ledgers || [];
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(note || '')}</div>
+      ${facts.length ? `<table style="margin-top:12px"><tr><th></th><th></th></tr>
+        ${facts.map((f) => `<tr><td class="dim" style="white-space:nowrap">${f[0]}</td><td>${f[1]}</td></tr>`).join('')}</table>` : ''}
+      ${ledgers.length ? `<div style="margin-top:12px"><label class="dim">盘上还留着哪几本账（停掉不删，这些就是现场留下的东西）</label>
+        ${qualityLedgerTable(ledgers)}</div>` : ''}`;
+    out.querySelectorAll('button[data-q]').forEach((b) => {
+      b.onclick = () => { if (qualityPick) qualityPick(b.dataset.q); };
+    });
+  };
+
+  // ★ busy：人正在点「开」或「停」的那一段时间（里面还包括等批准，可能几十秒）。
+  //   这段时间 3 秒一次的轮询不许往画布上画 —— 它一回来说「没在跑」，
+  //   就把人刚点出来的「等你点批准」或者「停掉了，账还在」盖掉了。
+  let busy = false;
+
+  const refresh = async (quiet) => {
+    const r = await call('net.quality.status');
+    if (busy) return;
+    if (!r.ok) {
+      if (!quiet) out.innerHTML = `<div class="empty">看不了状态：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    paint(r.verdict, r.values || {}, r.note);
+    if (r.verdict === 'quality-running') {
+      if (qualityTimer) clearInterval(qualityTimer);
+      qualityTimer = setInterval(() => refresh(true), 3000);
+    } else if (qualityTimer) {
+      clearInterval(qualityTimer);
+      qualityTimer = null;
+    }
+  };
+
+  const hush = () => {
+    busy = true;
+    if (qualityTimer) { clearInterval(qualityTimer); qualityTimer = null; }
+  };
+
+  card.querySelector('#q-go').onclick = async () => {
+    const addr = card.querySelector('#q-addr').value.trim();
+    if (!addr) {
+      out.innerHTML = '<div class="empty">先写盯哪个地址。这一路要盯几十分钟以上才有意义 —— '
+        + '挑那个「卡一下」最该怪到的地址（网关、平台、那台摄像头）。</div>';
+      return;
+    }
+    const args = { addr };
+    const iv = card.querySelector('#q-interval').value.trim();
+    const wd = card.querySelector('#q-window').value.trim();
+    // 不填就交给后端按默认来：这里替它填一个号，等于人没同意过的刻度
+    if (iv) { args.intervalMs = Number(iv); }
+    if (wd) { args.windowMs = Number(wd); }
+    hush();
+    errBox.innerHTML = '';
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">等你点批准…（取消的话一个包都不发）</div>';
+    const r = await call('net.quality.watch', args);
+    busy = false;
+    if (!r.ok) {
+      // 这一路没开起来 —— 但「这一路没开起来」和「现在这台是什么状态」是两句话：
+      // 前一句写在这里，后一句照样问回来（多半是「正在盯」的是上一路）。
+      errBox.innerHTML = `<div class="empty">这一路没开起来：${esc(r.message || r.error)}</div>`;
+      refresh(true);
+      return;
+    }
+    paint(r.verdict, r.values || {}, r.note);
+    if (qualityTimer) clearInterval(qualityTimer);
+    if (r.verdict === 'quality-running') qualityTimer = setInterval(() => refresh(true), 3000);
+  };
+  card.querySelector('#q-refresh').onclick = () => refresh(true);
+  card.querySelector('#q-stop').onclick = async () => {
+    btnStop.disabled = true;
+    hush();
+    errBox.innerHTML = '';
+    out.innerHTML = '<div class="empty">等你点批准…（取消就还在跑）</div>';
+    const r = await call('net.quality.stop');
+    btnStop.disabled = false;
+    busy = false;
+    if (!r.ok) {
+      errBox.innerHTML = `<div class="empty">停不下来：${esc(r.message || r.error)}</div>`;
+      // 停失败多半意味着它还在跑：把真实状态问回来，别让画面冻在「等你点批准」。
+      refresh(true);
+      return;
+    }
+    paint(r.verdict, r.values || {}, r.note);
+  };
+  card.querySelector('#q-addr').onkeydown = (e) => { if (e.key === 'Enter') card.querySelector('#q-go').click(); };
+  refresh(true);
+  return card;
+}
+
+function qualityReportCard() {
+  const card = $(`<div class="card">
+    <h2>这一本账怎么说 <span id="qr-top"></span></h2>
+    <p class="hint">读某一路留下的那本账，把「那一段时间」摊开：一条往返线、一条丢包柱，
+      外加<strong>账本身的洞</strong>（哪一段没采到、被滚掉了多少窗、上一次是不是没干净退出）。
+      ★ 结论按证据先后给：账上有洞的时候，绝不因为「洞以外没发现问题」就说成稳定 ——
+      那等于把「没问到」写成「问了没问题」。
+      ★ 没留痕的时候这里只会说「根本没采过」，不会说「没问题」。</p>
+    <div class="row">
+      <div style="flex:1 1 220px"><label>读哪个地址的账</label>
+        <input id="qr-addr" placeholder="就是开监测时填的那个地址"></div>
+      <div style="flex:0 0 150px"><label>读最近多少窗</label>
+        <input id="qr-windows" placeholder="默认 120，最多 2000"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn" id="qr-go">读这本账</button></div>
+    </div>
+    <div id="qr-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#qr-out');
+  const top = card.querySelector('#qr-top');
+  const addr = card.querySelector('#qr-addr');
+
+  const read = async () => {
+    const a = addr.value.trim();
+    if (!a) {
+      out.innerHTML = '<div class="empty">先写读哪个地址的账 —— 一本账一个地址，各读各的。</div>';
+      return;
+    }
+    const args = { addr: a };
+    const n = card.querySelector('#qr-windows').value.trim();
+    if (n) { args.windows = Number(n); }
+    out.innerHTML = '<div class="empty">读这本账…</div>';
+    const r = await call('net.quality.report', args);
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">读不出来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values || {};
+    const [title, cls] = QUALITY_READ[r.verdict] || [r.verdict || '没给判定', ''];
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--sunken)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--line)';
+    const recs = v.windows || [];
+    const facts = [];
+    facts.push(['盯的是', `<code>${esc(v.target || a)}</code>${v.running ? ' <span class="pill ok">这一路还在跑</span>' : ''}`]);
+    facts.push(['这一次读了多少窗', `${recs.length} 窗${typeof v.totalWindows === 'number' ? `（这本账一共 ${esc(v.totalWindows)} 窗）` : ''}`]);
+    if (recs.length) {
+      facts.push(['哪一段时间', `${esc(fmtStamp(v.from))} → ${esc(fmtStamp(v.to))}（共 ${esc(qDur(Number(v.spanMs) || 0))}）`]);
+      facts.push(['每窗 / 每发', `每窗 ${esc(qDur(Number(recs[0].windowMs) || 0))}、每发 ${esc(qDur(Number(recs[0].intervalMs) || 0))}`]);
+    }
+    if (typeof v.droppedWindows === 'number' && v.droppedWindows > 0) {
+      facts.push(['被滚掉多少窗', `<span class="warn">${esc(v.droppedWindows)} 窗（留痕到上限，最早的先走）—— 你看到的不是全程</span>`]);
+    } else if (v.truncated) {
+      facts.push(['被滚掉多少窗', '<span class="warn">序号不是从 1 起的：这本账前面还有过东西</span>']);
+    }
+    if (v.tailBroken) {
+      facts.push(['上一次怎么退出的', `<span class="warn">文件尾部有一条没写完的窗（${esc(v.skippedLines || 1)} 行解不开）`
+        + ' —— 上一次这个后端不是干净退出的（被杀 / 断电）</span>']);
+    }
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(r.note || '')}</div>
+      <table style="margin-top:12px"><tr><th></th><th></th></tr>
+        ${facts.map((f) => `<tr><td class="dim" style="white-space:nowrap">${f[0]}</td><td>${f[1]}</td></tr>`).join('')}</table>
+      ${recs.length ? `<div style="margin-top:14px">${qualityChart(recs)}</div>` : ''}
+      ${qualityAudit(v.audit)}
+      ${qualityWindowTable(recs)}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+  card.querySelector('#qr-go').onclick = read;
+  addr.onkeydown = (e) => { if (e.key === 'Enter') read(); };
+  qualityPick = (t) => {
+    addr.value = t;
+    read();
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  return card;
 }
 
 /*
