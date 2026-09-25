@@ -27,6 +27,7 @@ var localTools = []ots.Tool{
 	interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, onvifInfoTool, hlsProbeTool, rtmpProbeTool, neighborsTool, discoverTool, identifyTool,
 	dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
 	fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
+	throughputServeTool, throughputStatusTool, throughputStopTool, throughputTestTool,
 	diagBundleTool, troubleshootTool,
 }
 

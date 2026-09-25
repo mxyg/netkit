@@ -238,6 +238,10 @@ td.dim { color: var(--muted); }
 .dim { color: var(--muted); }
 /* 审计表里的失败结果：告警红，不是品牌金 */
 td.bad { color: var(--red-text); }
+/* 正文里那半句要上色的话（「差 165 MB」「被对面的字节闸截了」「第 3 路正在跑」）。
+   判定句里挑出来的那一点跟叙述一个颜色，就等于没说 —— 颜色和胶囊那三档保持一致。 */
+.bad { color: var(--red-text); }
+.warn { color: var(--gold); }
 
 /* ── 确认弹框：责任那段话要完整摆出来，native confirm() 放不下 ── */
 

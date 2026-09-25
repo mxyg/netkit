@@ -51,7 +51,7 @@ const PAGES = [
   { g: '通不通', id: 'connect', name: 'ping 与端口', render: renderConnect },
   { g: '通不通', id: 'path', name: '路径与质量', render: renderPath },
   { g: '通不通', id: 'name', name: '域名与时间', render: renderName },
-  { g: '通不通', id: 'service', name: '网站与证书', render: renderService },
+  { g: '快不快', id: 'thru', name: '两台机器对测', render: renderThru },
 
   { g: '谁在网里', id: 'scan', name: '网段上有哪些地址', render: renderScan },
   { g: '谁在网里', id: 'device', name: '设备是谁', render: renderDevice },
@@ -110,8 +110,9 @@ async function show() {
   const main = document.getElementById('main');
   // ★ DHCP 那页的租约轮询只在停在那一页时才该跑：换页后它还每 2.5 秒发一次请求，
   //   而且往**当前这页**的 #leases 里写 —— 页面拆细了以后这个尾巴更明显，当场断掉。
-  clearInterval(pollTimer);
-  pollTimer = null;
+  // ★ 对测口那本台账每 3 秒问一次：人不在这页了还问，就是拿别人的屏幕当轮询靶子
+  clearInterval(thruTimer);
+  thruTimer = null;
   main.innerHTML = '<div class="empty">读取中…</div>';
   const p = PAGES.find((x) => x.id === current);
   main.innerHTML = '';
@@ -6417,6 +6418,441 @@ function fileshareCard() {
   refresh(true);   // 只读一次状态，不动系统：进页面就要看得见「现在开着没有」
   return card;
 }
+/*
+ * ── 两台机器对测（net.throughput.*）──
+ *
+ * ★★ 这一页回答的是「这两台之间此刻能吃下多少」，而它必须单独成页：
+ *   现场问「网太慢」的时候，前面那几页（ping、路径、端口）给的都是「通不通、多久」，
+ *   没有一个能说出「一秒真过得去多少字节」。要问出这个数，得两头各跑一次这个工具 ——
+ *   所以页面上就两张卡：这台开对测口，另一台连过来打。
+ *
+ * ★ 为什么两张卡都要人点头：开那半句改的是这台机器对外的可见面（同网段任何机器
+ *   连上来都能让它收发字节，这一套协议不鉴权）；测那半句改的是这条链路
+ *   （一秒的满速流量足够把现场正在跑的摄像头、PLC 轮询挤掉）。
+ *
+ * ★ 界面上不算任何东西：Mbps、字节数、往返、天花板都是后端给的数，
+ *   这里只负责把「本机这一侧」和「对面那一侧」并排放，让人自己看见差。
+ */
+
+const THRU_CODE = {
+  // 对测口那三问
+  'thru-serving': ['正在开着对测口', 'ok'],
+  'thru-idle': ['没在开', ''],
+  'thru-stopped': ['已经停掉了', ''],
+  // 打一次对测的十二档。★ 每一档的下一步都不一样，所以不许并成一句「测失败」。
+  'thru-ok': ['量到了，也稳', 'ok'],
+  'thru-loopback': ['打在自己身上', 'warn'],
+  'thru-bufferbloat': ['中间那台在囤包', 'bad'],
+  'thru-unstable': ['一阵一阵', 'warn'],
+  'thru-window-limited': ['卡在这条连接自己', 'warn'],
+  'thru-truncated': ['被对面的闸截了', 'warn'],
+  'thru-dropped': ['两端账对不上', 'bad'],
+  'thru-busy': ['对面的口满了', 'warn'],
+  'thru-proto': ['那端口不是这套协议', 'bad'],
+  'thru-closed': ['对面没开对测口', 'bad'],
+  'thru-filtered': ['一句不答（路上被静默丢掉）', 'bad'],
+  'thru-timeout': ['连上了，问到一半超时', 'warn'],
+};
+
+// 后端给的是「这块口凭什么选上」的原话，界面翻成人话，并把风险点一句带上：
+// 指定网卡这条路绕开了默认路由，那块口连着谁只有现场的人知道。
+const THRU_WHY = {
+  '人指定的网卡': '说的就是你指的那块口 ★ 这一条没照着默认路由挑，确认一下这块口连着谁',
+  'IPv4 默认路由走这块': '按 IPv4 默认路由挑的（这台机器往上走的那块口）',
+  '本机只有一块带可用 IPv4 的网卡': '自动挑的：本机只有这一块带可用的 IPv4 地址',
+};
+
+// 内核那本账哪些字段这台给不了 —— 给不了就写出来，不许拿 0 冒充「没有重传」。
+const THRU_NO_TCP = '这台给不了';
+
+let thruTimer = null;
+
+async function renderThru(root) {
+  root.appendChild(thruServeCard());
+  root.appendChild(thruTestCard());
+}
+
+function thruSay(verdict, v) {
+  const [title, cls] = THRU_CODE[verdict] || [verdict || '没给判定', ''];
+  if (!title) return ['后端给了一个这里还没认得的判定。', ''];
+  return [title, cls];
+}
+
+// thruChart 把每 200 毫秒一个点的那一列画出来。
+//
+// ★ 为什么非画不可：平均数会骗人 —— 稳定 900M 和 1800M/0 交替，平均值一模一样，
+//   而这两种的下一步完全不同（前者查链路，后者查谁在抢这条路）。
+//   ★ 落在那一段 0 的位置上要看得见：断流不是「慢」，是「没动」。
+function thruChart(samples, word) {
+  const s = (samples || []).filter((x) => x && typeof x.mbps === 'number');
+  if (s.length < 2) {
+    return s.length ? `<p class="hint">${esc(word)}：只取到 1 个点，画不出形状 —— `
+      + '秒数给到 5 秒以上才看得见稳态。</p>' : '';
+  }
+  const W = 560, H = 132, P = 28;
+  const hi = Math.max(...s.map((x) => x.mbps)) * 1.15 || 1;
+  const span = Math.max(1, s[s.length - 1].atMs || 1);
+  const X = (at) => P + (at / span) * (W - 2 * P);
+  const Y = (m) => H - P - (m / hi) * (H - 2 * P);
+  let prev = null;
+  const segs = [], dots = [], stops = [];
+  for (const x of s) {
+    const cx = X(x.atMs), cy = Y(x.mbps);
+    if (x.mbps === 0) {
+      // 这一格没动：线在这里断开，另画一个方块，别让它看着像「慢到 0」的一条斜线
+      stops.push(`<rect x="${(cx - 3.5).toFixed(1)}" y="${(H - P - 3.5).toFixed(1)}" width="7" height="7"
+          fill="var(--red-bg)" stroke="var(--red-line)"/>`);
+      prev = null;
+      continue;
+    }
+    if (prev) {
+      segs.push(`<line x1="${prev[0].toFixed(1)}" y1="${prev[1].toFixed(1)}"
+          x2="${cx.toFixed(1)}" y2="${cy.toFixed(1)}" stroke="var(--green-dim)" stroke-width="1.7"/>`);
+    }
+    dots.push(`<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="2.6" fill="var(--green-dim)"/>`);
+    prev = [cx, cy];
+  }
+  // ★ 宽高写死在属性上：这条线是画在 <td> 里的，百分比宽度在表格里会退成默认小图，
+  //   曲线就细成一团 —— 而这一格要看的正是形状。
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}"
+      style="max-width:100%;height:auto;display:block"
+      role="img" aria-label="${esc(word)}这一段一段的速率">
+      <line x1="${P}" y1="${H - P}" x2="${W - P}" y2="${H - P}" stroke="var(--line)"/>
+      ${segs.join('')}${dots.join('')}${stops.join('')}
+      <text x="${P}" y="${P - 6}" fill="var(--muted)" font-size="10">${esc(hi.toFixed(0))} Mbps</text>
+      <text x="${W - P}" y="${P - 6}" text-anchor="end" fill="var(--muted)" font-size="10">
+        ${(span / 1000).toFixed(1)} 秒 · ${s.length} 个点</text>
+      <text x="${P}" y="${H - P + 14}" fill="var(--muted)" font-size="10">
+        方块 = 那 200 毫秒一个字节都没过</text>
+    </svg>`;
+}
+
+// 空载 / 带载 并排。★ 少了空载那一格，带载那个数就没有对照，
+//   「涨了」和「一向就这么高」分不出来 —— 后端没量到时给的是 count=0，这里写「没问到」。
+function thruRTT(v) {
+  const one = (r, label) => {
+    if (!r || !r.count) {
+      return `<div><label>${esc(label)}</label><div><span class="dim">没问到</span></div></div>`;
+    }
+    const f = (n) => (typeof n === 'number' ? n.toFixed(1) : '—');
+    return `<div><label>${esc(label)}</label>
+      <div><b>${f(r.avgMs)}</b> ms <span class="dim">平均</span>
+        · 最快 ${f(r.minMs)} · 最慢 ${f(r.maxMs)} · 抖动 ${f(r.jitterMs)}</div>
+      <div class="dim">${esc(r.count)} 发${r.fault ? ' · 断在：' + esc(r.fault) : ''}</div></div>`;
+  };
+  return `<div class="row" style="gap:22px;flex-wrap:wrap;margin-top:10px">
+    ${one(v.idle, '空载往返（没人打流的时候）')}${one(v.loaded, '带载往返（正在打流的时候）')}
+  </div>
+  <p class="hint">这两格是<strong>两条不同的线</strong>各量各的：复用正在传数据的那条量不出缓冲膨胀 ——
+    那 8 个字节排在几万个字节后面，量到的是队列深度，不是链路往返。
+    带载比空载涨几倍，现场的表现就是「带宽明明够，画面就是卡」。</p>`;
+}
+
+// 一个方向的一行账：本机这侧与对面那侧并排放，差多少一眼看见。
+function thruDirRow(word, d) {
+  if (!d) return '';
+  const num = (x, unit) => (x == null ? '<span class="dim">—</span>' : `<b>${esc(x)}</b>${unit}`);
+  const gap = d.bytes > 0 && d.peerBytes > 0 && d.peerBytes !== d.bytes
+    ? `<span class="bad">差 ${esc(fsSize(Math.abs(d.bytes - d.peerBytes)))}</span>` : '<span class="dim">一致</span>';
+  return `<tr>
+    <td class="dim" style="white-space:nowrap"><b>${esc(word)}</b></td>
+    <td>${num(d.mbps, ' Mbps')}<div class="dim">${esc(d.size || fsSize(d.bytes))} / ${esc(d.elapsedMs)} ms</div></td>
+    <td>${num(d.peerMBps, ' Mbps')}<div class="dim">${esc(d.peerSize || fsSize(d.peerBytes))} / ${esc(d.peerElapsedMs)} ms</div></td>
+    <td>${gap}${d.truncated ? '<div class="warn">被对面的字节闸截了</div>' : ''}</td>
+    <td>${thruTCPCell(d)}</td>
+  </tr>`;
+}
+
+// 曲线单独占一行，而且要**在 table 里面**：`<div>` 直接写进 `<table>` 会被浏览器
+// 挪到表格外头（foster parenting），那张 200 毫秒一个点的图就会跑到看不见的位置上。
+function thruChartRow(word, d) {
+  if (!d || !d.samples || !d.samples.length) return '';
+  return `<tr><td class="dim" style="white-space:nowrap">这一向的形状</td>
+    <td colspan="4" style="padding:4px 0 10px">${thruChart(d.samples, word)}</td></tr>`;
+}
+
+// 内核自己那本账：这一格说的不是「慢」，是「为什么慢」。
+function thruTCPCell(d) {
+  const t = d.tcp;
+  if (!t || !t.given) {
+    return `<span class="dim">${esc(THRU_NO_TCP)}${t && t.why ? '：' + esc(t.why) : ''}</span>`;
+  }
+  const f = (n, unit) => (typeof n === 'number' ? `${esc(n.toFixed ? n.toFixed(1) : n)}${unit}` : '<span class="dim">—</span>');
+  return `<div>往返估计 ${f(t.srttMs, ' ms')} · 重传 ${esc(t.retransSegments || 0)} 段</div>
+    <div class="dim">拥塞窗口 ${esc(fsSize(t.sndCwndBytes || 0))}
+      ${typeof d.ceilingMbps === 'number' ? ` · 这条连接的顶约 ${esc(d.ceilingMbps.toFixed(0))} Mbps` : ''}</div>
+    <div class="dim">${esc(d.tcpSource ? '取自 ' + d.tcpSource : '')}</div>`;
+}
+
+function thruLedger(recent) {
+  const rows = (recent || []).map((s) => `<tr>
+    <td class="dim">${esc((s.endedAt || '').replace('T', ' ').slice(0, 19))}</td>
+    <td><code>${esc(s.peer || '—')}</code></td>
+    <td class="dim">${esc({ up: '它往外打', down: '它收', ping: '只量往返' }[s.mode] || '没说模式')}</td>
+    <td>${esc(fsSize(s.bytes || 0))}</td>
+    <td class="dim">${typeof s.mbps === 'number' ? esc(s.mbps.toFixed(0)) + ' Mbps' : '—'}</td>
+    <td class="${s.fault ? 'bad' : ''}">${esc(s.fault || '跑完了')}</td>
+  </tr>`).join('');
+  if (!rows) return '<p class="hint">还没有谁来连过这个口。</p>';
+  return `<div style="max-height:260px;overflow:auto"><table>
+    <tr><th>什么时候</th><th>谁连的</th><th>哪一向</th><th>过了多少</th><th>速率</th><th>结果</th></tr>
+    ${rows}</table></div>
+    <p class="hint">只留最近 20 路，跑砸的那些也在里面（★ 排查「另一台说连不上 / 连上就断」就靠这一列）。</p>`;
+}
+
+function thruServeCard() {
+  const card = $(`<div class="card">
+    <h2>本机对测口 <span id="th-top"></span></h2>
+    <p class="hint">在这台机器上开一个局域网对测口，另一台 NetKit 用下面那张卡连过来打一轮 ——
+      两头各记一份账，才知道「这两台之间此刻能吃下多少」。
+      ★ 这不是 iperf3，也不听别的协议：回的不是这一套的第一句就被拒掉。
+      ★ 只绑你挑的那块网卡上的地址，<strong>不绑 0.0.0.0</strong> ——
+      多网卡机器上那等于把对测口从办公网甚至公网那块口也开出去。
+      ★ 这个口<strong>不鉴权</strong>：开着的时候同网段任何机器连上来都能让这台机器收发字节，
+      拦住它的是三道闸（一路最多多少字节、同时几路、每路最长 5 分钟）。
+      所以每次开都要你点头，用完请点停掉。</p>
+    <div class="row">
+      <div style="flex:0 0 170px"><label>开在哪块网卡（留空自动）</label>
+        <input id="th-iface" placeholder="en0 / eth0 / WLAN"></div>
+      <div style="flex:1 1 240px"><label>或者只绑这几个地址（填了就覆盖上面那块网卡）</label>
+        <input id="th-addrs" placeholder="192.168.1.20 fd00::1（不许写 0.0.0.0）"></div>
+      <div style="flex:0 0 100px"><label>端口</label>
+        <input id="th-port" placeholder="5201"></div>
+      <div style="flex:0 0 130px"><label>一路最多（GiB）</label>
+        <input id="th-max" placeholder="默认 16"></div>
+      <div style="flex:0 0 110px"><label>同时几路</label>
+        <input id="th-sess" placeholder="默认 4"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn danger" id="th-go">开对测口</button></div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:0 0 auto;min-width:0">
+        <button class="btn" id="th-refresh">刷新台账</button>
+        <button class="btn danger" id="th-stop" style="display:none">立刻停掉</button></div>
+    </div>
+    <div id="th-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#th-out');
+  const top = card.querySelector('#th-top');
+  const btnStop = card.querySelector('#th-stop');
+
+  const paint = (verdict, v) => {
+    const [title, cls] = thruSay(verdict, v);
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+    btnStop.style.display = verdict === 'thru-serving' ? '' : 'none';
+    const serving = verdict === 'thru-serving';
+    const st = v.status || v;
+    const port = v.port || st.port || 0;
+    const addrs = (v.addrs && v.addrs.length ? v.addrs : st.addrs) || [];
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--sunken)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--line)';
+
+    let say;
+    if (verdict === 'thru-idle') {
+      say = '现在没开着。对面连过来会得到「明确拒绝」。要量就先开一下，用完停掉 —— '
+        + '这一口不鉴权。';
+    } else if (verdict === 'thru-stopped') {
+      say = `${addrs.map((x) => `<code>${esc(x)}</code>`).join('、')} 的 ${port} 端口已经放掉，`
+        + `同网段连不上来了。这中间一共过了 ${esc(fsSize(v.servedBytes || 0))}、${v.sessions || 0} 路。`
+        + '跑完的那些账还在下面的「最近」里（停口不清账）。';
+    } else if (serving) {
+      say = `对测口正开着：${v.iface ? `网卡 <b>${esc(v.iface)}</b>（${esc(THRU_WHY[v.ifaceWhy] || v.ifaceWhy || '怎么定的没说')}），` : ''}`
+        + `绑 ${addrs.map((x) => `<code>${esc(x)}</code>`).join('、')} 端口 ${port || '—'}。`
+        + `★ 一路最多 ${esc(fsSize(v.maxBytes || 0))}、同时 ${esc(v.maxSessions || 0)} 路、每路最长 5 分钟。`;
+    } else {
+      say = '后端给了一个这里还没认得的判定，原文在下面展开看。';
+    }
+
+    out.innerHTML = `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${say}</div>
+      ${serving ? `<div style="margin-top:12px"><label class="dim">对面那台怎么填</label>
+        <div style="margin-top:4px"><code style="user-select:all;cursor:cell">${esc(v.peerHelp || '')}</code></div>
+        <p class="hint">★ 两端必须是同一个端口号，地址要用<strong>对面那块口到得了的那一个</strong>（隔着 VLAN 就连不通）。
+          对面那台上开的是它自己的口，两台别互相填成自己的地址 —— 那会量成「打在自己身上」。</p></div>` : ''}
+      ${serving ? `<table style="margin-top:12px"><tr><th></th><th></th></tr>
+        <tr><td class="dim">一共过了多少字节</td><td><b>${esc(v.servedSize || fsSize(v.servedBytes || 0))}</b>
+          <span class="dim">★ 这一格是「这口被人当炮使了多久」的唯一证据</span></td></tr>
+        <tr><td class="dim">此刻在跑</td><td>${st.active ? `<b class="warn">第 ${esc(st.active)} 路正在跑</b>` : '<span class="dim">没人连着</span>'}</td></tr>
+        <tr><td class="dim">字节闸 / 路数闸</td><td>${esc(fsSize(v.maxBytes || 0))} / ${esc(v.maxSessions || 0)} 路
+          <span class="dim">· 每路最长 5 分钟</span></td></tr>
+        </table>
+        <div style="margin-top:12px"><label class="dim">最近跑过哪几路（每 3 秒自己刷新）</label>
+          <div id="th-ledger">${thruLedger(st.recent)}</div></div>` : ''}
+      ${!serving && v.recent && v.recent.length ? `<div style="margin-top:12px">
+        <label class="dim">最后跑过的那几路（口停了，账还在 —— 刚跑砸的那一路就靠这一列认）</label>
+        <div id="th-ledger">${thruLedger(v.recent)}</div></div>` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+
+  const refresh = async (quiet) => {
+    const r = await call('net.throughput.status');
+    if (!r.ok) {
+      if (!quiet) out.innerHTML = `<div class="empty">看不了状态：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    paint(r.verdict, r.values || {});
+    if (r.verdict === 'thru-serving') {
+      if (thruTimer) clearInterval(thruTimer);
+      thruTimer = setInterval(() => refresh(true), 3000);
+    } else if (thruTimer) {
+      clearInterval(thruTimer);
+      thruTimer = null;
+    }
+  };
+
+  card.querySelector('#th-go').onclick = async () => {
+    const args = {};
+    const iface = card.querySelector('#th-iface').value.trim();
+    const addrs = card.querySelector('#th-addrs').value.split(/[\s,、]+/).filter(Boolean);
+    const port = card.querySelector('#th-port').value.trim();
+    const max = card.querySelector('#th-max').value.trim();
+    const sess = card.querySelector('#th-sess').value.trim();
+    if (iface) { args.iface = iface; }
+    if (addrs.length) { args.addrs = addrs; }
+    if (port) { args.port = Number(port); }
+    // 界面上按 GiB 收，换成字节交给后端去夹（这里替它猜一个号等于人没同意过的闸）
+    if (max) { args.maxBytes = Math.round(Number(max) * 1024 * 1024 * 1024); }
+    if (sess) { args.maxSessions = Number(sess); }
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">等你点批准…（取消的话一个端口都不开）</div>';
+    const r = await call('net.throughput.serve', args);
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">没有开起来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    paint(r.verdict, r.values || {});
+    if (thruTimer) clearInterval(thruTimer);
+    thruTimer = setInterval(() => refresh(true), 3000);
+  };
+  card.querySelector('#th-refresh').onclick = () => refresh(true);
+  card.querySelector('#th-stop').onclick = async () => {
+    btnStop.disabled = true;
+    out.innerHTML = '<div class="empty">等你点批准…（取消就还开着）</div>';
+    const r = await call('net.throughput.stop');
+    btnStop.disabled = false;
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">停不下来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    if (thruTimer) { clearInterval(thruTimer); thruTimer = null; }
+    paint(r.verdict, r.values || {});
+  };
+  refresh(true);   // 只读一次状态，不动系统：进页面就要看得见「现在开着没有」
+  return card;
+}
+
+function thruTestCard() {
+  const card = $(`<div class="card">
+    <h2>打一次对测 <span id="tx-top"></span></h2>
+    <p class="hint">连到<strong>另一台</strong>开着对测口的 NetKit，量「这两台之间此刻能吃下多少」。
+      ★ 这一发会把这条链路推到接近满好几秒：现场正跑着摄像头、PLC 轮询的时候别打，
+      所以它要人点头。
+      ★ 对端填本机自己的地址会单独判成「打在自己身上」—— 那个数几百 G 也很正常，
+      量的却是这台机器的协议栈，跟链路一点关系都没有。</p>
+    <div class="row">
+      <div style="flex:1 1 240px"><label>对面那台的地址</label>
+        <input id="tx-host" placeholder="192.168.1.30 或 192.168.1.30:5201"></div>
+      <div style="flex:0 0 100px"><label>端口</label>
+        <input id="tx-port" placeholder="5201"></div>
+      <div style="flex:0 0 170px"><label>方向</label>
+        <select id="tx-mode">
+          <option value="both">两向各一轮（默认）</option>
+          <option value="up">本机往外打</option>
+          <option value="down">本机收</option>
+        </select></div>
+      <div style="flex:0 0 110px"><label>每向几秒（1–10）</label>
+        <input id="tx-secs" placeholder="默认 3"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn danger" id="tx-go">打一次对测</button></div>
+    </div>
+    <div id="tx-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#tx-out');
+  const top = card.querySelector('#tx-top');
+  const go = card.querySelector('#tx-go');
+
+  // note 是后端那句账（跑砸的那几档，值里根本没有 up/down，话全在 note 上）
+  const paint = (verdict, v, note) => {
+    const [title, cls] = thruSay(verdict, v);
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+    const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+    const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+    const say = note || v.verdictReason || '后端没给这句话。';
+    const dirRows = [thruDirRow('往外打', v.up), thruChartRow('往外打', v.up),
+      thruDirRow('收', v.down), thruChartRow('收', v.down)].join('');
+    // ★ 这张表全是这里写死的句子（一个字节都不是对面发来的），所以不进 esc ——
+    //   它带的就是「下一步去动哪一头」，界面上必须看得见。
+    const hint = {
+      'thru-loopback': '★ 这一发打在自己身上：把数拿去说「链路行/不行」都是错的，'
+        + '要在<strong>另一台</strong>上开对测口再来问一次。',
+      'thru-window-limited': '想问出更高的数：换多路并发分别打（这一条连接的窗口就是这么多，链路还没饱和）。',
+      'thru-truncated': '对面那台的字节闸开小了。在那台上把「一路最多」放大再打一次，才是这条链路的真数。',
+      'thru-bufferbloat': '带宽这一项是够的，卡在中间那台的队列上：去看路上那台的限速/队列配置，别再往两端找。',
+      'thru-dropped': '先把「这条链路在吞数据」这件事查掉（网线、协商速率、中间那台丢包），快慢的数等账对上再看。',
+      'thru-filtered': '这一条先去查防火墙/ACL：连机器在不在都不知道，别去重启那台。',
+      'thru-closed': '那台机器是活的，只是没开对测口 —— 去那台上点一下「开对测口」。',
+      'thru-proto': '端口填错或那台上跑着别的服务（iperf3 也会落在这一格）。两端要填同一个号。',
+      'thru-busy': '对面的口同时跑的路数满了：等几秒再问，或去那台上把没在用的会话停掉。',
+      'thru-timeout': '连上了却没问到话：先看那台上是不是正有人在打流，再怀疑中间设备。',
+    }[verdict];
+
+    out.innerHTML = v && (v.up || v.down) ? `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(say)}</div>
+      ${hint ? `<div style="margin-top:8px;font-size:13px">${hint}</div>` : ''}
+      ${v.fault ? `<p class="hint">断在哪：${esc(v.fault)}</p>` : ''}
+      <table style="margin-top:12px">
+        <tr><th></th><th>本机这侧</th><th>对面那侧</th><th>两端账</th><th>内核那本账</th></tr>
+        ${dirRows}
+      </table>
+      <p class="hint">两列各是一份账：<strong>「本机这侧」是我数到的，「对面那侧」是对方数到的</strong>。
+        发送侧写完而接收侧收得少，说明东西堆在本机的发送缓冲里，链路其实没吃下那么多。
+        ★ 对面回执里写了它自己的字节闸：${esc(v.peerMaxSize || fsSize(v.peerMaxBytes || 0))}${v.peerMaxBytes ? '' : '（没问到）'}。
+        ${v.seconds ? `${esc(v.seconds)} 秒/向，模式 ${esc(v.mode === 'both' ? '两向各一轮' : v.mode)}。` : ''}</p>
+      ${thruRTT(v)}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>` : `
+      <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+        ${esc(note || v.verdictReason || '这一发没跑成，下面带的是已经拿到的东西。')}</div>
+      ${hint ? `<div style="margin-top:8px;font-size:13px">${hint}</div>` : ''}
+      ${v.fault ? `<p class="hint">断在哪：${esc(v.fault)}</p>` : ''}
+      ${v.addr ? `<p class="hint">问的是 <code>${esc(v.addr)}</code>。★ 这一格说的是「连到哪儿没成」，不是链路慢。</p>` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+
+  go.onclick = async () => {
+    const host = card.querySelector('#tx-host').value.trim();
+    if (!host) {
+      out.innerHTML = '<div class="empty">先填对面那台的地址 —— 就是它开对测口时报出来的那几个地址之一。</div>';
+      return;
+    }
+    const args = { host, mode: card.querySelector('#tx-mode').value };
+    const port = card.querySelector('#tx-port').value.trim();
+    const secs = card.querySelector('#tx-secs').value.trim();
+    if (port) { args.port = Number(port); }
+    if (secs) { args.seconds = Number(secs); }
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">等你点批准…（这一发会把链路占住几秒，取消就什么都不打）</div>';
+    go.disabled = true;
+    const r = await call('net.throughput.test', args);
+    go.disabled = false;
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">没打成：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    paint(r.verdict, r.values || {}, r.note);
+  };
+  card.querySelector('#tx-host').onkeydown = (e) => { if (e.key === 'Enter') go.click(); };
+  out.innerHTML = '<div class="empty">对面那台先开对测口（它屏幕上就是上面那张卡），'
+    + '把它报出来的地址填进来。★ 别填这台自己的地址。</div>';
+  return card;
+}
+
 
 /*
  * ── 按症状排查（net.troubleshoot）──
