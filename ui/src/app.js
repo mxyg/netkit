@@ -51,7 +51,9 @@ const PAGES = [
   { g: '通不通', id: 'connect', name: 'ping 与端口', render: renderConnect },
   { g: '通不通', id: 'path', name: '路径与质量', render: renderPath },
   { g: '通不通', id: 'name', name: '域名与时间', render: renderName },
+
   { g: '快不快', id: 'thru', name: '两台机器对测', render: renderThru },
+  { g: '快不快', id: 'speed', name: '出去公网有多快', render: renderSpeed },
 
   { g: '谁在网里', id: 'scan', name: '网段上有哪些地址', render: renderScan },
   { g: '谁在网里', id: 'device', name: '设备是谁', render: renderDevice },
@@ -6418,6 +6420,7 @@ function fileshareCard() {
   refresh(true);   // 只读一次状态，不动系统：进页面就要看得见「现在开着没有」
   return card;
 }
+
 /*
  * ── 两台机器对测（net.throughput.*）──
  *
@@ -6853,6 +6856,240 @@ function thruTestCard() {
   return card;
 }
 
+/*
+ * ── 出去公网有多快（net.speed.test）──
+ *
+ * ★★ 这一页回答的是「出去公网关没关、有多快」，跟上面那张对测不重复：
+ *   对测量的是内圈（这两台之间），它量不到出口那条路；
+ *   而浏览器只会说「加载失败」，不会说它当时走的是 v4 还是 v6。
+ *
+ * ★★ 界面上没有、也不许有「一键测速」：这一张不预设任何测速服务器。
+ *   填了目标才动，没填就判 speed-no-target，一个包都不替你发 ——
+ *   这个软件不替用户去碰别人家的机器。
+ *
+ * ★ 两栈的数并排放，不平均：绑名字去连时栈由系统挑，
+ *   现场最常见的「v6 路由不通所以整体慢」正好被平均掉。
+ */
+
+const SPEED_CODE = {
+  'speed-no-target': ['没给目标', ''],
+  'speed-local-target': ['量的是内网，不是公网', 'warn'],
+  'speed-unreachable': ['一次都没连上', 'bad'],
+  'speed-flaky': ['这条路本身在抖', 'bad'],
+  'speed-bad-status': ['目标回的不是数据', 'bad'],
+  'speed-cut-short': ['搬到一半断了', 'bad'],
+  'speed-capped': ['这个数是下界', 'warn'],
+  'speed-latency-only': ['只量到往返', 'warn'],
+  'speed-one-sided': ['只量到一头', 'warn'],
+  'speed-single-family': ['只有一条栈量到', 'warn'],
+  'speed-ok': ['量到了', 'ok'],
+};
+
+// 每一头收尾的原因。★ 「读完了」和「到点收的」给出同一个数，前者是实测后者是下界，
+//   界面必须分开写，不然人拿下界去对运营商的合同。
+const SPEED_END = {
+  'complete': ['搬完了', 'ok'],
+  'time-cap': ['秒数到点收的', 'warn'],
+  'byte-cap': ['字节闸到点收的', 'warn'],
+  'cut': ['中途断了', 'bad'],
+  'failed': ['没搬成', 'bad'],
+};
+
+const SPEED_ERR = {
+  'refused': ['那一口关着', 'bad'],
+  'timeout': ['一声不响', 'bad'],
+  'tls': ['TLS 没谈成', 'bad'],
+  'other': ['连着就没下文', 'bad'],
+};
+
+// 每栈的那句下一步 —— 判定不是错误，但每条都得告诉人下一步动哪一头。
+const SPEED_WAY = {
+  'speed-no-target': '填一个<strong>公网上</strong>能下载的地址（http/https）再问；只想问往返就填一个 host。',
+  'speed-local-target': '★ 这个数不能拿去答「出去公网关没关」。把目标换成公网上的一个地址；'
+    + '确实要量内网那一跳，就勾上下面那个开关，但那是一台机器到另一台机器的数。',
+  'speed-unreachable': '先别问快慢：用「ping 与端口」那张卡看那个 IP 在不在、那个端口开不开。'
+    + '关着与一声不响是两种病，值里那两栏已经分开了。',
+  'speed-flaky': '连得上但有几发没通：去看出口设备和链路（拔一下网线、换一个口），'
+    + '速率那一栏只能当下限。',
+  'speed-bad-status': '目标回的是错误页不是数据，这一趟的数不代表链路 —— 先把那个地址本身弄对'
+    + '（它可能要点登录、可能过期了、可能压根不给直接下载）。',
+  'speed-cut-short': '搬到一半断了：这多半就是现场要找的那个病。去看路上谁在掐长连接'
+    + '（NAT 超时、防火墙会话、SSL 中间设备）。',
+  'speed-capped': '这一趟是被秒数或字节闸收的，不是搬完了 —— 想看到顶，把秒数和上限一起加大再问一次。',
+  'speed-latency-only': '只填了 host，所以只量到往返。要知道快慢，再填一个能下载的地址。',
+  'speed-one-sided': '另一头没测到：要么没填那一头的地址，要么填了但它自己没通 —— 值里那一栏是空的还是 failed，一眼看得见。',
+  'speed-single-family': '没测到那条栈不是坏了，是这个名字没写那一栈的记录。'
+    + '如果现场本来就该有 v6，去「双栈体检」那张卡看这台机器的 v6 出不出得去。',
+};
+
+function renderSpeed(root) {
+  root.appendChild(speedCard());
+}
+
+function speedCard() {
+  const card = $(`<div class="card">
+    <h2>量一次公网 <span id="sp-top"></span></h2>
+    <p class="hint">往<strong>你填的那个地址</strong>量四件事：下载多快、上传多快、往返多少毫秒、往返抖不抖。
+      IPv4 与 IPv6 各钉一条栈单独量，两本账并排放 ——
+      ★ 绑名字去连时栈由系统挑，混在一个数里，「v6 不通所以整体慢」就会被平均掉。
+      ★ 这里<strong>不预设任何测速服务器</strong>：没填目标就判「没给目标」，一个包都不替你发。
+      下载读到的正文直接丢掉（不落盘、不上传给任何人）；上传发的是<strong>纯填充字节</strong>，
+      不含本机任何内容，但对面可能把它存下来 —— 所以这一张要点批准。</p>
+    <div class="row">
+      <div style="flex:1 1 260px"><label>下载地址（量下载与往返）</label>
+        <input id="sp-url" placeholder="https://下载.example/文件.zip"></div>
+      <div style="flex:1 1 200px"><label>上传地址（收 POST 的，选填）</label>
+        <input id="sp-ul" placeholder="https://same.example/upload"></div>
+      <div style="flex:1 1 160px"><label>或者只填一个 host（只量往返）</label>
+        <input id="sp-host" placeholder="example.com 或 203.0.113.9:443"></div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:0 0 130px"><label>量哪条栈</label>
+        <select id="sp-fam">
+          <option value="auto">v4 与 v6 各一遍（默认）</option>
+          <option value="v4">只量 IPv4</option>
+          <option value="v6">只量 IPv6</option>
+        </select></div>
+      <div style="flex:0 0 110px"><label>每头几秒（1–30）</label>
+        <input id="sp-secs" placeholder="默认 5"></div>
+      <div style="flex:0 0 120px"><label>每头上限 MiB</label>
+        <input id="sp-max" placeholder="默认 64"></div>
+      <div style="flex:0 0 120px"><label>往返打几发</label>
+        <input id="sp-conns" placeholder="默认 10"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn danger" id="sp-go">量一次</button></div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <label class="dim" style="display:flex;gap:6px;align-items:center;font-size:13px">
+        <input type="checkbox" id="sp-priv" style="width:auto"> 目标是内网/本机地址时也照量
+        <span class="dim">（默认不发：拿内网的数答「公网关没关」是错的，默认往现场设备打几十 MiB 更是错的）</span>
+      </label>
+    </div>
+    <div id="sp-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#sp-out');
+  const top = card.querySelector('#sp-top');
+  const go = card.querySelector('#sp-go');
+
+  go.onclick = async () => {
+    const args = {};
+    const grab = (id, key) => {
+      const s = card.querySelector(id).value.trim();
+      if (s) { args[key] = s; }
+    };
+    grab('#sp-url', 'url');
+    grab('#sp-ul', 'uploadUrl');
+    grab('#sp-host', 'host');
+    args.family = card.querySelector('#sp-fam').value;
+    const secs = card.querySelector('#sp-secs').value.trim();
+    const max = card.querySelector('#sp-max').value.trim();
+    const conns = card.querySelector('#sp-conns').value.trim();
+    if (secs) { args.seconds = Number(secs); }
+    if (max) { args.maxMiB = Number(max); }
+    if (conns) { args.connects = Number(conns); }
+    if (card.querySelector('#sp-priv').checked) { args.allowPrivate = true; }
+
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">等你点批准…（批准框里逐条写着往哪儿发多少；取消就一个包都不发）</div>';
+    go.disabled = true;
+    const r = await call('net.speed.test', args);
+    go.disabled = false;
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">没量成：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    speedPaint(r.verdict, r.values || {}, r.note, card);
+  };
+  out.innerHTML = '<div class="empty">填一个公网上能下载的地址 —— 或者只填一个 host，那只量往返。'
+    + '<strong>别填内网地址</strong>：默认那一趟一个字节都不发。</div>';
+  return card;
+}
+
+function speedPaint(verdict, v, note, card) {
+  const sides = v.sides || [];
+  // ★ 同一个码有两种现场：内网那台**真量了**（勾了开关），和压根**一个字节都没发**（默认）。
+  //	标题说「量的是内网」而表里什么都没有，人就来回翻那个开关 —— 这两句得分开说。
+  const ranAny = sides.some((s) => !s.skipped);
+  let [title, cls] = SPEED_CODE[verdict] || [verdict || '没给判定', ''];
+  let way = SPEED_WAY[verdict];
+  if (verdict === 'speed-local-target' && !ranAny) {
+    title = '目标是内网，一个字节都没发';
+    way = '这一趟照默认收了手，所以<strong>没有数</strong>（不是量出来是 0）。要答「出去公网关没关」，'
+      + '把目标换成公网上的一个地址；确实要量本机到这一台，勾上下面那个开关再问一次。';
+  }
+  // ★ 「只有一条栈量到」听着像另一条量出了别的数；ran==0 那一档是两条都没发，标题得先说没数。
+  if (verdict === 'speed-single-family' && !ranAny) {
+    title = '那条栈没地址，一个连接都没发';
+  }
+  const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+  const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+  card.querySelector('#sp-top').innerHTML = title
+    ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+  const say = note || v.verdictReason || '后端没给这句话。';
+  card.querySelector('#sp-out').innerHTML = `
+    <div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+      ${esc(say)}</div>
+    ${way ? `<div style="margin-top:8px;font-size:13px">${way}</div>` : ''}
+    <p class="hint">问的是 <code>${esc(v.target || '—')}</code> 端口 ${esc(v.port || '—')}
+      · ${esc(v.family === 'auto' ? 'v4 与 v6 各一遍' : v.family || '—')}
+      · 每头最长 ${esc(v.seconds)} 秒 / ${esc(v.maxMiB)} MiB · 往返 ${esc(v.connects)} 发。
+      ★ 秒数那道闸只管搬数据那一段，建连与 TLS 握手另算。</p>
+    ${sides.length ? `<table style="margin-top:8px">
+      <tr><th>栈</th><th>落到的地址</th><th>往返</th><th>下载</th><th>上传</th></tr>
+      ${sides.map(speedSideRow).join('')}</table>` : ''}
+    <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+      <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+}
+
+function speedSideRow(s) {
+  const fam = s.family === 'v4' ? 'IPv4' : s.family === 'v6' ? 'IPv6' : esc(s.family);
+  if (s.skipped === 'no-address') {
+    return `<tr><td><b>${fam}</b></td><td colspan="4"><span class="dim">这个名字在那条栈里没有地址`
+      + ' —— 那一栈没量到，不是量出 0。</span></td></tr>';
+  }
+  if (s.skipped === 'local') {
+    return `<tr><td><b>${fam}</b></td><td><code>${esc(s.addr)}</code></td>
+      <td colspan="3"><span class="warn">解出来是内网/本机地址，默认一个字节都没发</span></td></tr>`;
+  }
+  const addr = `<code>${esc(s.addr)}</code>${s.private ? ' <span class="warn">内网</span>' : ''}`;
+  const lat = s.latency;
+  let latCell = '<span class="dim">没问到</span>';
+  if (lat) {
+    const f = (n) => (typeof n === 'number' ? esc(n.toFixed(2)) : '—');
+    const tries = `<div class="dim">${esc(lat.connected)}/${esc(lat.sent)} 发连上`
+      + `${lat.refused ? ` · <span class="bad">拒 ${esc(lat.refused)}</span>` : ''}`
+      + `${lat.timedOut ? ` · <span class="bad">没声 ${esc(lat.timedOut)}</span>` : ''}`
+      + `${lat.untried ? ` · 提前收表没发 ${esc(lat.untried)}` : ''}</div>`;
+    if (!lat.connected) {
+      // ★ 一发都没连上时不许摆一排 0.00：那是「没问到」，摆成数就有人拿 0 ms 去说「这条路很快」。
+      latCell = '<span class="bad">一发都没连上，没有往返可报</span>' + tries;
+    } else {
+      const bad = lat.sent > lat.connected;
+      latCell = `<b>${f(lat.medMs)}</b> ms <span class="dim">中位</span>
+        <div class="dim">最快 ${f(lat.minMs)} · 平均 ${f(lat.avgMs)} · P95 ${f(lat.p95Ms)} · 最慢 ${f(lat.maxMs)}</div>
+        <div class="dim">抖动 ${f(lat.jitterMs)} ms</div>${tries}
+        ${bad ? '<div class="bad">这几发没通本身就是结论：这条路在抖</div>' : ''}`;
+    }
+  }
+  return `<tr><td><b>${fam}</b></td><td>${addr}</td><td>${latCell}</td>
+    <td>${speedXfer(s.download)}</td><td>${speedXfer(s.upload)}</td></tr>`;
+}
+
+function speedXfer(x) {
+  if (!x) return '<span class="dim">没给这一头的地址</span>';
+  const [ew, ec] = SPEED_END[x.end] || [x.end || '没说', ''];
+  const [kw, kc] = x.errKind ? (SPEED_ERR[x.errKind] || [x.errKind, '']) : ['', ''];
+  const mbps = typeof x.mbps === 'number' ? `<b>${esc(x.mbps.toFixed(1))}</b> Mbps` : '—';
+  const f = (n) => (typeof n === 'number' ? esc(n) : '—');
+  return `${mbps} <span class="${ec}">${esc(ew)}</span>
+    <div class="dim">${esc(fsSize(x.bytes || 0))} / ${f(x.ms)} ms
+      ${typeof x.ttfbMs === 'number' ? ` · 等首字节 ${esc(x.ttfbMs.toFixed(2))} ms` : ''}
+      ${x.contentLength ? ` · 它说这份 ${esc(fsSize(x.contentLength))}` : ''}
+      ${x.status ? ` · 回 ${f(x.status)}` : ''}</div>
+    ${kw ? `<div class="${kc}">${esc(kw)}</div>` : ''}
+    ${x.error ? `<div class="dim">${esc(x.error)}</div>` : ''}`;
+}
 
 /*
  * ── 按症状排查（net.troubleshoot）──
