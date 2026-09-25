@@ -55,6 +55,7 @@ const PAGES = [
   { g: '快不快', id: 'thru', name: '两台机器对测', render: renderThru },
   { g: '快不快', id: 'speed', name: '出去公网有多快', render: renderSpeed },
   { g: '快不快', id: 'quality', name: '盯一段时间', render: renderQuality },
+  { g: '快不快', id: 'bandwidth', name: '谁在吃流量', render: renderBandwidth },
 
   { g: '谁在网里', id: 'scan', name: '网段上有哪些地址', render: renderScan },
   { g: '谁在网里', id: 'device', name: '设备是谁', render: renderDevice },
@@ -7545,6 +7546,236 @@ function qualityReportCard() {
     card.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
   return card;
+}
+
+/*
+ * ── 谁在吃流量（net.bandwidth.top）──
+ *
+ * ★★ 这一张摆的是**两份口径**，不是一个大数拆成两半：网卡那一栏问的是
+ *   「这条链路过了多少包」（链路层，含包头、广播，回环自己收一遍算两遍），
+ *   进程那一栏问的是「哪个进程自己的套接字收发了多少」（传输层）。
+ *   所以这里绝不做减法、也不画「占了总量的百分之几」—— 一旦画出来，
+ *   「回环上 500 Mbps」会被读成「网被吃满了」，而那条网一根线都没动。
+ *   两栏各自排自己的名次，各自标自己的单位，人对的是哪一栏一目了然。
+ *
+ * ★ 这一张不发任何包，纯读本机内核计数；给的是进程名与 PID，**不给命令行、
+ *   不给对端地址**（命令行里常有口令和 token，而这份结果会整份发给 AI）。
+ *
+ * ★★ 「数不到进程」在这张卡上是三种不同的现场（Windows 整台数不到、
+ *   Linux 非管理员只数到一部分、macOS 数得全），每种下一步不一样：
+ *   换工具、提权、还是直接点名 —— 所以判定码有六个，这里一个都不合并。
+ */
+
+const BANDWIDTH_STATE = {
+  'bandwidth-busy': ['有进程在吃', 'warn'],
+  'bandwidth-idle': ['这一段没人吃', 'ok'],
+  'bandwidth-not-mine': ['过的包不是本机要发的', 'bad'],
+  'bandwidth-link-only': ['只数得到网卡', 'warn'],
+  'bandwidth-partial': ['只数到一部分进程', 'warn'],
+  'bandwidth-no-source': ['这台机器数不了', 'bad'],
+};
+
+// 每一种判定的下一步 —— 只补后端那句里没有的东西（往哪儿点、换哪张卡）。
+const BANDWIDTH_WAY = {
+  'bandwidth-busy': '要腾下来就停点名那个进程（拿那个 PID 去做）；★ 停之前先确认它是不是'
+    + '某个服务的守护进程，父进程拉起的停父的没用。想抓「偶尔冒一下」那股，把窗口拉到 10~30 秒再数一次。',
+  'bandwidth-idle': '这一栏答的是「刚才这一段」。要留长时间的血迹去「盯一段时间」那一页，'
+    + '这里数完就散了、什么都没留。',
+  'bandwidth-not-mine': '★ 下一步不在「本机哪个进程」：先问谁在借这台机器走 —— '
+    + '「网卡与路由」看有没有开共享/桥接/NAT，「网段上有哪些地址」看是不是有人在往它身上打。',
+  'bandwidth-link-only': '这一栏只答「这条链路忙不忙」，不点名。要落到具体是谁：'
+    + '「本机端口与文件共享」看现在是谁在听、谁连着（不量字节），'
+    + '「两台机器对测」量这两台之间此刻能吃下多少 —— 后端那句下一步（提权那类）才是拿回进程名单的正路。',
+  'bandwidth-partial': '用管理员权限再问一次才算数；看不见的那些里才可能藏着主角。',
+  'bandwidth-no-source': '这台机器上连每块网卡过了多少字节都读不到，什么都不结论。'
+    + '要查请先用系统自带的工具看着（活动监视器 / 资源监视器 / <code>cat /proc/net/dev</code>）。',
+};
+
+const BW_KIND = {
+  link: ['网卡', ''],
+  loopback: ['本机回环', 'dim'],
+  tunnel: ['隧道口', 'dim'],
+  unreadable: ['这一段读不到', 'warn'],
+};
+
+const BW_ATTR = {
+  full: ['进程数得全', 'ok'],
+  partial: ['只数到一部分', 'warn'],
+  none: ['数不到进程', 'warn'],
+};
+
+function renderBandwidth(root) {
+  root.appendChild(bandwidthCard());
+}
+
+function bandwidthCard() {
+  const card = $(`<div class="card">
+    <h2>数一会儿，看谁在吃 <span id="bw-top"></span></h2>
+    <p class="hint">数一段（默认 3 秒），同时给两份口径：<strong>每块网卡在这段里过了多少</strong>
+      （链路层，答「这条路满没满」）和 <strong>每个进程自己收发了多少</strong>
+      （套接字层，答「该停谁」）。★ 这两个数<strong>不相减、也不换算成百分比</strong> ——
+      网卡含包头与广播，回环上本机跟自己说话还要算两遍，减出来的「剩多少」是假数。
+      纯读本机内核计数，<strong>一个包都不发</strong>；只给进程名与 PID，不给命令行和对端地址。</p>
+    <div class="row">
+      <div style="flex:0 0 130px"><label>数几秒（1–30）</label>
+        <input id="bw-win" placeholder="默认 3"></div>
+      <div style="flex:0 0 130px"><label>进程列几条</label>
+        <input id="bw-topn" placeholder="默认 10"></div>
+      <div style="flex:0 0 auto"><label>&nbsp;</label>
+        <button class="btn" id="bw-go">数一会儿</button></div>
+    </div>
+    <div id="bw-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#bw-out');
+  const top = card.querySelector('#bw-top');
+  const go = card.querySelector('#bw-go');
+  const win = card.querySelector('#bw-win');
+  const topn = card.querySelector('#bw-topn');
+
+  const run = async () => {
+    const args = {};
+    const w = win.value.trim();
+    const n = topn.value.trim();
+    if (w) { args.windowSeconds = Number(w); }
+    if (n) { args.top = Number(n); }
+    top.innerHTML = '';
+    go.disabled = true;
+    out.innerHTML = '<div class="empty">正在数<span class="dim">（这一页只等这一段窗口，不发包、不写盘）</span>…</div>';
+    const r = await call('net.bandwidth.top', args);
+    go.disabled = false;
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">没数成：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    bandwidthPaint(r.verdict, r.values || {}, r.note);
+  };
+  go.onclick = run;
+  [win, topn].forEach((el) => { el.onkeydown = (e) => { if (e.key === 'Enter') run(); }; });
+  out.innerHTML = '<div class="empty">按默认的 3 秒数一次就够看「现在谁在吃」。'
+    + '<strong>要找那种偶尔冒一下的</strong>：把秒数拉到 10~30 再数（窗口越长越不会被背景抖动骗到，'
+    + '但也会把那一下摊薄）。</div>';
+  return card;
+}
+
+const bwMb = (x) => (typeof x === 'number' ? esc(x.toFixed(2)) : '—');
+// 条长只是「跟这一栏里最忙的那条比」，不参与任何结论 —— 数一律是后端给的。
+const bwBar = (v, max, cls) => {
+  const pct = max > 0 && v > 0 ? Math.max(1.5, Math.min(100, (v / max) * 100)) : 0;
+  return `<div class="bwbar ${cls || ''}" style="width:${pct.toFixed(1)}%"></div>`;
+};
+
+function bandwidthPaint(verdict, v, note) {
+  const top = document.getElementById('bw-top');
+  const out = document.getElementById('bw-out');
+  const [title, cls] = BANDWIDTH_STATE[verdict] || [verdict || '没给判定', ''];
+  if (top) {
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+  }
+  if (!out) return;
+
+  const say = note || '后端没给这句话。';
+  const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--gold-bg)';
+  const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--gold-dim)';
+  const box = `<div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px">
+      ${esc(say)}</div>
+    ${BANDWIDTH_WAY[verdict] ? `<div style="margin-top:8px;font-size:13px">${BANDWIDTH_WAY[verdict]}</div>` : ''}`;
+
+  // 「数不了」这一档连计数都读不到，底下任何一栏、任何一个合计都是空 ——
+  // 摆两张空表等于把「什么都不结论」演成「表在这，自己看」。只留结论和原因。
+  if (verdict === 'bandwidth-no-source') {
+    out.innerHTML = `${box}
+      <p class="hint">这一段窗口 <strong>${esc(v.windowSec ?? '—')} 秒</strong>，
+        原因：<code>${esc(v.reason || '（后端没给原因）')}</code>。
+        ★ 没有表不是因为「什么都没发生」，是因为两个口径一个都没量到。</p>
+    <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+      <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+    return;
+  }
+
+  const ifaces = v.interfaces || [];
+  const procs = v.processes || [];
+  const busy = (x) => (Number(x.rxBytes) || 0) + (Number(x.txBytes) || 0);
+  const named = (x) => x.egress || x.defaultRoute || x.kind === 'unreadable';
+  // ★ 这一段完全没过东西、又不是出口/读不到的口，折成一行：一台 macOS 有 20 多块
+  //   内核口，全列出来时真正在动的那两条被埋在最下面 —— 而这一栏要答的就是「哪条在动」。
+  //   名字一个都不藏（照列），原始结果里也全在。
+  const silent = ifaces.filter((x) => busy(x) === 0 && !named(x));
+  const shown = ifaces.filter((x) => busy(x) > 0 || named(x));
+  // ★ 进结论的那些口（counts）排在前面，回环与隧道压到下面 —— 后端是按字节数排的，
+  //   本机自己跟自己说话能刷出几千 Mbps，让它骑在出口那行上面，「没人吃」这一档
+  //   看上去就像反着说。这里只换先后，不改任何一个数。
+  shown.sort((a, b) => (a.counts === false ? 1 : 0) - (b.counts === false ? 1 : 0));
+  // 条长只按**进结论的那些口**定标：回环与隧道本来就不进出网总量，
+  // 让它们当标尺会把唯一那块在动的出口压成看不见的一条线。
+  const iMax = shown.reduce((a, x) => Math.max(a, x.counts === false ? 0 : busy(x)), 0);
+  const pMax = procs.reduce((a, x) => Math.max(a, busy(x)), 0);
+  const attr = BW_ATTR[v.attribution] || [v.attribution || '没说', ''];
+
+  const iRows = shown.map((x) => {
+    const [kw, kc] = BW_KIND[x.kind] || [x.kind || '—', ''];
+    const mark = x.egress ? '<span class="ok">出口</span> ' : '';
+    const dr = x.defaultRoute ? '<span class="dim">（系统说出口是它）</span>' : '';
+    const dim = x.counts === false ? ' style="opacity:.62"' : '';
+    const bar = x.counts === false ? '' : bwBar(busy(x), iMax);
+    const ubar = x.counts === false ? '' : bwBar(busy(x), iMax, 'up');
+    return `<tr${dim}>
+      <td><code>${esc(x.name)}</code> ${mark}${dr}<div class="dim ${kc}">${esc(kw)}</div></td>
+      <td>${bar}<b>${bwMb(x.rxMbps)}</b> <span class="dim">/ ${esc(fsSize(x.rxBytes || 0))}</span></td>
+      <td>${ubar}<b>${bwMb(x.txMbps)}</b> <span class="dim">/ ${esc(fsSize(x.txBytes || 0))}</span></td>
+    </tr>`;
+  }).join('');
+
+  const pRows = procs.length ? procs.map((x) => `<tr>
+      <td><b>${esc(x.process || '（没名字）')}</b><div class="dim">PID ${esc(x.pid ?? '—')}</div></td>
+      <td>${bwBar(busy(x), pMax)}<b>${bwMb(x.rxMbps)}</b> <span class="dim">/ ${esc(fsSize(x.rxBytes || 0))}</span></td>
+      <td>${bwBar(busy(x), pMax, 'up')}<b>${bwMb(x.txMbps)}</b> <span class="dim">/ ${esc(fsSize(x.txBytes || 0))}</span></td>
+    </tr>`).join('')
+    : `<tr><td colspan="3"><span class="warn">这一栏没数</span>
+      <span class="dim"> —— ${esc(v.attributionNote || '这个平台上按进程数网络字节这条路走不通')}。
+      ★ 没有这一栏不等于没人在吃。</span></td></tr>`;
+
+  const html = `
+    ${box}
+    <p class="hint">数了 <strong>${esc(v.windowSec ?? '—')} 秒</strong>（实际取数用了 ${esc(v.measuredMs ?? '—')} 毫秒，
+      速率按这段算）· 出口网卡 <code>${esc(v.egress || '—')}</code>
+      · 网卡侧合计 下 <b>${bwMb(v.linkRxMbps)}</b> / 上 <b>${bwMb(v.linkTxMbps)}</b> Mbps
+      · 进程侧合计 <span class="pill ${attr[1]}">${esc(attr[0])}</span>
+      下 <b>${bwMb(v.processRxMbps)}</b> / 上 <b>${bwMb(v.processTxMbps)}</b> Mbps
+      ${typeof v.quietBytesPerSecond === 'number'
+        ? `· 安静线 ${esc(fsSize(v.quietBytesPerSecond))}/秒（低于它就当没在动）` : ''}。
+      ★ 两个「合计」口径不同，本来就不该相等。</p>
+    <div class="row" style="gap:18px;align-items:flex-start;margin-top:10px">
+      <div style="flex:1 1 320px">
+        <label>网卡（链路口径 · 答「这条路忙不忙」）</label>
+        <table>
+          <tr><th>哪块口</th><th>收 Mbps</th><th>发 Mbps</th></tr>${iRows}
+        </table>
+        ${silent.length ? `<p class="hint">这一段没过东西的口还有 ${esc(silent.length)} 块：${esc(silent.map((x) => x.name).join('、'))}。
+          <span class="dim">它们只是这一段没动，不是不存在 —— 全列在这儿会把在动的那两条埋掉，
+          原始结果里一块都不少。</span></p>` : ''}
+        <p class="hint">「出口」那行就是上面结论按的那块口。
+          <strong>回环与隧道不进出网总量</strong>：本机跟自己说话的字节不算过网，
+          隧道口上到的包物理口会再数一遍，两块一起加就是双倍。
+          ${ifaces.some((x) => x.kind === 'loopback') ? `回环这一段合计 ${esc(fsSize(v.loopbackTotalBytes || 0))}，单独列着。` : ''}
+          ${ifaces.some((x) => x.kind === 'tunnel') ? `隧道口合计 ${esc(fsSize(v.tunnelTotalBytes || 0))}。` : ''}
+          ${ifaces.some((x) => x.kind === 'unreadable') ? '<span class="warn">有口标着「这一段读不到」：它不是没过东西，是计数被清零了（接口重建或重启过）。</span>' : ''}</p>
+      </div>
+      <div style="flex:1 1 320px">
+        <label>进程（套接字口径 · 答「该停谁」）</label>
+        <table>
+          <tr><th>谁</th><th>收 Mbps</th><th>发 Mbps</th></tr>${pRows}
+        </table>
+        <p class="hint">按收发合计排的名，同名的多个进程不合并（一个软件开几个进程是常事，
+          合并就看不出是哪一路）。
+          ${v.truncated ? `<span class="warn">只列了前 ${esc(v.processCountShown ?? '—')} 条，一共数到 ${esc(v.processCount ?? '—')} 条 —— 要看得更全把条数加大。</span>` : ''}
+          ${v.attributionNote ? `<span class="dim">${esc(v.attributionNote)}</span>` : ''}
+          ${v.attributionNext ? `<span class="dim">下一步：${esc(v.attributionNext)}</span>` : ''}</p>
+      </div>
+    </div>
+    <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+      <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  out.innerHTML = html;
 }
 
 /*

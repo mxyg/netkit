@@ -209,6 +209,13 @@ td { padding: 8px 10px; border-bottom: 1px solid var(--line-soft); }
 /* ★ 新接入的设备：用绿（"正常、刚发生"），不用金 —— 金要留给"正在进行中"那件事 */
 tr.fresh td { background: var(--green-bg); }
 
+/* 「谁在吃流量」那一格的长短条：只是跟同一栏里最忙的那条比，
+   条子本身不带数 —— 数在旁边的 Mbps 上，那才是后端给的。 */
+.bwbar { height: 3px; border-radius: 2px; background: var(--green-dim);
+         margin-bottom: 3px; min-width: 0; }
+.bwbar.up { background: var(--gold-dim); }
+td:has(> .bwbar) { white-space: nowrap; }
+
 /* ── 状态片 ── */
 
 .pill { display: inline-block; padding: 2px 9px; border-radius: 99px; font-size: 12px;
@@ -242,6 +249,7 @@ td.bad { color: var(--red-text); }
    判定句里挑出来的那一点跟叙述一个颜色，就等于没说 —— 颜色和胶囊那三档保持一致。 */
 .bad { color: var(--red-text); }
 .warn { color: var(--gold); }
+.ok { color: var(--green-text); }
 
 /* ── 确认弹框：责任那段话要完整摆出来，native confirm() 放不下 ── */
 

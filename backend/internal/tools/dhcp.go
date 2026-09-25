@@ -563,6 +563,8 @@ func RestoreOnStart(log *slog.Logger) {
 	}
 	// 文件共享同理：端口随进程释放，没有要还原的东西，但账要了结（见 fileshare.go）
 	restoreFileShare(log)
+	// 持续质量监测同理：采集器随进程没了，但留痕文件一律不动（见 quality.go）
+	restoreQualityWatch(log)
 }
 
 // ── 小工具 ──
