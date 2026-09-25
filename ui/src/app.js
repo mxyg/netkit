@@ -3724,9 +3724,8 @@ async function renderScan(root) {
 // ★ 「视频流」原来自己占一页，孤零零一张卡，看着像给视频软件开的后门。
 //   它答的其实是「这个取流地址上到底有没有一路流、以什么规格在播」——
 //   问的是现场那台摄像头，所以和识别设备、听广播归在一组（「谁在网里」）。
-// ★ 一组里最多四页、一页里最多五张：取流这一叠（ONVIF / RTSP / HLS，
-//   后面还有 RTMP 与 GB28181）已经自成一路问题，硬并回「设备是谁」
-//   就是第六张卡 —— 那张卡一放，这一页又滚到底找不着北了。
+// ★ 一组里最多四页、一页里最多五张：取流这一叠（ONVIF / RTSP / HLS / RTMP / GB28181）
+//   到这儿正好五张，各问一件事，没有第六张的位置 —— 再加流相关的工具就得先拆页，别往这页塞。
 
 async function renderDevice(root) {
   root.appendChild(deviceIdentifyCard());
@@ -3736,12 +3735,14 @@ async function renderDevice(root) {
 
 // 三张卡是一条流水线，不是三个并列的工具：
 // 只有设备 IP → ONVIF 问出取流地址 → RTSP 验这路流到没到本机 → HLS 问平台那份清单还写着什么
-// → RTMP 问反方向那一句：推上去的东西到没到服务器。
+// → RTMP 问反方向那一句：推上去的东西到没到服务器
+// → GB28181 问信令那一层：这台在不在平台的名册上（在播与否前面四张已经答过）。
 async function renderStream(root) {
   root.appendChild(onvifCard());
   root.appendChild(rtspCard());
   root.appendChild(hlsCard());
   root.appendChild(rtmpCard());
+  root.appendChild(gbCard());
 }
 
 // ONVIF 这一张排在「取流探测」前面，不是随手放的：
@@ -4407,6 +4408,342 @@ function rtmpResult(r) {
     ? `<p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>` : '';
   return `<table>${cells.join('')}</table>${note}`
     + (advice ? adviceBox(cls, esc(advice)) : '')
+    + `<details style="margin-top:10px"><summary class="dim">原始结果</summary>`
+    + `<pre>${esc(JSON.stringify(r.raw || r.values || {}, null, 2))}</pre></details>`;
+}
+
+// GB_CODE 覆盖两条问法的判定码：media.gb28181.probe（问它）与 media.gb28181.register（本机注册一趟）。
+//
+// ★ 「口是关的」「口开着没人答」「那个口不说 SIP」必须各占一档 —— 现场为这三句话
+//   各跑过一整趟：换端口、查防火墙、找平台加白名单，下一步完全不一样。
+//   合成一句「没回应」，那三天工就白跑。
+const GB_CODE = {
+  'gb28181-port-closed': ['这个信令口是关的', 'bad',
+    '对面主机在，但这个 UDP 口没人接（它回了不可达）。先核对地址与端口抄对没有，'
+    + '再看那台上 SIP 服务起没起来。★ 这一档和「开着没人答」不是一回事，别去查防火墙。'],
+  'gb28181-silent': ['口开着，一个字节都没回', 'bad',
+    '发出去了（而且重发过），到点没回音。要么中间有东西吃掉它（防火墙、交换机 ACL、平台白名单），'
+    + '要么它压根不理这一句。★ 还有一种：它从**另一个端口**回话，这一问的套接字只收对端那一对地址，'
+    + '那种表现也是超时 —— 换个端口再问一次看看。'],
+  'gb28181-not-sip': ['那个口接了东西，却不说 SIP', 'bad',
+    '口上有服务在答话，但那不是 SIP 报文（HTTP、TLS 都会这样）。★ 5061 常常挂的是 TLS 上的 SIP，'
+    + '这一问只按 UDP 问 —— 那个端口要换成对端的明文 SIP 口再问。'],
+  'gb28181-sip-unreadable': ['看着是 SIP，可这条报文读不成句', 'bad',
+    '起始行对，后面断了。多半是中间那台（SIP 网关、ALG）改写了报文，或者它的固件发的不是标准 CRLF。'
+    + '★ 这一档别去查设备配置，先查中间有没有那台改包的东西。'],
+  'gb28181-auth-required': ['它要先看凭据才答', 'warn',
+    '这个口认 SIP，而且它在按国标收设备。下一步是带上编号与口令走右边那颗「本机注册一趟」，'
+    + '不是去查网络。'],
+  'gb28181-denied': ['它不认这个编号，或不接这一句', 'bad',
+    '回了 403/404/405/501 这一类。先核编号（20 位，错一格就是另一台设备），'
+    + '再看那台上有没有把本机授权进去。问通道表不成的话，改走注册那一条，让它自己来问。'],
+  'gb28181-busy': ['它在，可这一刻腾不出手', 'warn',
+    '回了 480/486/500/503/504。它在，服务也在，是这一刻忙。★ 不要连着重试，'
+    + '先去那台机器上看它在忙什么（并发满、正在重启、内部出错）。'],
+  'gb28181-alive': ['它是一个 SIP / 国标信令口', 'ok',
+    'OPTIONS 答了。★ 这只回答「它在、它说 SIP」，设备自述与通道表这次没问 —— '
+    + '别拿这一条当「设备正常」。勾上上面的问法再问一次。'],
+  'gb28181-responsive': ['问到的它都答了', 'ok',
+    '信令这一层是通的，而且它把内容答出来了。通道数、自述字段、在线状态都在下面的账里。'],
+  'gb28181-query-silent': ['OPTIONS 它答了，某一问它不答', 'warn',
+    '★ 这一条最要紧的一句话：网络是通的（OPTIONS 回得来）。它不答这一问，多半是不认这个查询 —— '
+    + '来路编号不对、或者这项能力没开。先核「平台侧编号」填的是它配的那个。'],
+  'gb28181-empty-body': ['它接了这句，却不给正文', 'warn',
+    '回了 200，正文是空的：这句它接了但没答内容。要么是固件把这一类查询当形式应答，'
+    + '要么是它要求先注册才答。下一步走「本机注册一趟」。'],
+  'gb28181-bad-body': ['它答了，可那份正文读不成', 'bad',
+    '正文不是能读下来的 MANSCDP。有的固件在这一句上发的是别的内容类型，那种要按它发的算，'
+    + '不能当没答。★ 中间有 ALG 改包也会是这个表现。'],
+  'gb28181-catalog-empty': ['它在线，可通道是空的', 'warn',
+    '通道表答了、这一页数到 0 条 —— 现场那句「平台说设备在线、通道是空的」就死在这一格。'
+    + '先看是不是只问了第一页（用下面的分页参数再问一次），或这台把通道挂在别的编号下。'],
+  'gb28181-cut-short': ['这次的预算到点了，没问完', 'warn',
+    '★ 这一档说的是我们自己：有一问是被这次的时间掐断的，不是它不答。'
+    + '把「一步超时」放宽、或少勾几样再问一次。别拿这一条去判断它有没有这项能力。'],
+  'gb28181-registered': ['注册上了', 'ok',
+    '它给了 200，这条注册被收下。★ 「收下」不等于「它把这台当成能点播的设备」—— '
+    + '要看它有没有回过头来问，那一段的账在下面。'],
+  'gb28181-registered-accepted': ['注册上了，它还会回过头来问', 'ok',
+    '这是「那台平台真把这台当设备」最硬的证据：它主动问了通道表，或者发了点播。'
+    + '★ 我们不应答它（这台不做真设备，编不出也不该编一路通道），所以它那几问是没答的。'],
+  'gb28181-registered-unauthenticated': ['注册上了，可这一趟没要凭据', 'warn',
+    '第一发 REGISTER 就直接 200。★ 这是一条安全事实：那道门没收口令，任何一台机器报个编号就能挂上去。'],
+  'gb28181-challenge-missing': ['它回 401，却没把挑战带上', 'bad',
+    '要求认证却没给 WWW-Authenticate，本机算不出该签什么，只能干等。'
+    + '这是那一头的实现问题（或中间把这条头改掉了），不是口令错。'],
+  'gb28181-credential-rejected': ['带了口令，它还是回 401', 'bad',
+    '口令不对，或者摘要用的 realm / 算法与那台配的不是一回事。★ 现场最常见的一种错：'
+    + '设备里填的认证域和平台 401 给的那个不一样 —— 看下面「用的域」那一栏两边各是什么。'],
+};
+
+// GB_ASK 是每一问的落点。★ 「被掐断」和「它不答」必须两个词，
+// 前者是我们的预算问题，后者才是它的毛病。
+const GB_ASK = {
+  'ok': ['答了', 'ok'],
+  'silent': ['没答', 'bad'],
+  'status': ['回了状态码', 'warn'],
+  'transport': ['连收发都没成', 'bad'],
+  'empty-body': ['接了不给正文', 'warn'],
+  'bad-body': ['正文读不成', 'bad'],
+  'cut-short': ['这次没等够', 'warn'],
+};
+
+// 账里那一格写的是协议里的拼法（Catalog / DeviceInfo），不是参数里那三种小写名。
+// ★ 两边都收：这里只挑中文，认不出来的原样露出来，不拿「未知」把一条真实的落点盖掉。
+const GB_CMD_CN = {
+  deviceInfo: '设备自述', deviceStatus: '在线状态', catalog: '通道表',
+  DeviceInfo: '设备自述', DeviceStatus: '在线状态', Catalog: '通道表',
+};
+
+// gbCard 是这条流水线的最后一张，问的是**信令这一层**。
+//
+// ★ 它和上面四张的分工：ONVIF/RTSP/HLS/RTMP 问的是「这路流到没到」，这一张问的是
+//   「这台设备在不在国标平台的名册上」。金宇建安那一路「设备接不上平台」的账，
+//   只有这一张能拆开 —— 而且全程不解码、不放播放器、不发 INVITE（点播会真占一路码流）。
+// ★ 两颗按钮一张卡：这一页到这儿已经是第五个问题，再拆一张就破了「一页不超过五张」。
+//   两条问法用的本来就是同一批地址与编号，分开填两遍反而更容易填成互相不对的两套。
+function gbCard() {
+  const card = $(`<div class="card">
+    <h2>问一路国标（GB28181）信令 <span id="gb-top"></span></h2>
+    <p class="hint">拆「这台设备接不上国标平台」这句话。左边那颗<b>只读</b>：先问 OPTIONS 看这个口在不在行当里，
+      再按需要问设备自述 / 在线状态 / 通道表。<b>全程不解码、不放播放器，也不发点播</b>
+      （点播会真的占住一路码流，那是改动）。<br>
+      右边那颗是<b>会改东西的</b>：本机扮成一台设备往平台注册一趟，看它收不收、收完会不会回头来问 ——
+      ★ 填真设备的编号会<b>顶掉那条真注册</b>，那台相机会当场掉线，所以要你点头、并且记进改动账本。
+      问完立刻发注销（Expires:0）把这条收回来，注销成没成也照实记。口令只进那一次摘要计算，
+      不进结果、不进日志、不进账本、批准框那句话里也没有它。</p>
+    <div class="row">
+      <div style="flex:1 1 190px"><label>对端地址（问它 = 那台设备；注册 = 那台平台）</label>
+        <input id="gb-host" placeholder="192.168.1.64"></div>
+      <div style="flex:0 0 110px"><label>SIP 信令口</label><input id="gb-port" placeholder="5060"></div>
+      <div style="flex:1 1 210px"><label>那台设备的 20 位编号</label>
+        <input id="gb-dev" placeholder="34020000001110000001"></div>
+      <div style="flex:1 1 210px"><label>平台侧那一段 20 位编号</label>
+        <input id="gb-plat" placeholder="34020000002000000001"></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:1 1 auto;min-width:0"><label>OPTIONS 通了接着问哪几样（一颗都不勾 = 只问它在不在）</label>
+        <div style="display:flex;gap:14px;flex-wrap:wrap;padding-top:4px">
+          <label style="display:flex;gap:5px;align-items:center;font-size:13px">
+            <input type="checkbox" class="gb-ask" value="deviceInfo">设备自述</label>
+          <label style="display:flex;gap:5px;align-items:center;font-size:13px">
+            <input type="checkbox" class="gb-ask" value="deviceStatus">在线状态</label>
+          <label style="display:flex;gap:5px;align-items:center;font-size:13px">
+            <input type="checkbox" class="gb-ask" value="catalog">通道表</label>
+        </div></div>
+      <div style="flex:0 0 130px"><label>一步超时 ms</label><input id="gb-t" placeholder="3000"></div>
+    </div>
+    <p class="hint" style="margin-top:6px">★ 「平台侧那一段编号」在两颗按钮上各有用处，都必填得看具体情况：
+      勾了上面任何一问就得填（设备按它配好的那个平台编号核对来路，没报上名字的表现是它一声不吭 ——
+      那不是网络不通）；注册那一趟不填就按设备编号前 10 位推所属域，用的哪一种结果里会写清。</p>
+    <details style="margin-top:8px"><summary class="dim">通道表分页、注册时长与口令、注册后听多久</summary>
+      <div class="row" style="margin-top:8px">
+        <div><label>通道表从第几条开始问</label><input id="gb-cs" placeholder="留空 = 全量"></div>
+        <div><label>这一页最多问几条</label><input id="gb-cc" placeholder="留空 = 全量"></div>
+        <div><label>注册时长秒（30-3600）</label><input id="gb-exp" placeholder="60"></div>
+        <div><label>注册成功后听多久（0 = 不听）</label><input id="gb-watch" placeholder="3000"></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <div><label>注册口令（不会被记下来）</label>
+          <input id="gb-pass" type="password" autocomplete="new-password"></div>
+        <div><label>认证域 realm（留空就照它 401 给的那个算）</label>
+          <input id="gb-realm" autocomplete="off"></div>
+      </div>
+      <p class="hint" style="margin-top:6px">★ 只问一页就按「它一共几路」下结论是把账混了 ——
+        设备自己声明的 SumNum 与这一页数到的条数在结果里分开给。
+        realm 那一栏留空才是对的：现场最常见的一种错就是设备配的 realm 与平台给的不是一个，
+        填了它才知道两边各是什么。</p>
+    </details>
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn primary" id="gb-ask-b">问它（只读）</button>
+      <button class="btn danger" id="gb-reg-b">本机注册一趟（会改对面）</button>
+    </div>
+    <div id="gb-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#gb-out');
+  const top = card.querySelector('#gb-top');
+  const say = (html) => { top.innerHTML = ''; out.innerHTML = html; };
+  const common = () => {
+    const a = { host: card.querySelector('#gb-host').value.trim() };
+    const port = Number(card.querySelector('#gb-port').value.trim());
+    const dev = card.querySelector('#gb-dev').value.trim();
+    const plat = card.querySelector('#gb-plat').value.trim();
+    const t = Number(card.querySelector('#gb-t').value.trim());
+    if (port) a.port = port;
+    if (dev) a.deviceId = dev;
+    if (plat) a.platformId = plat;
+    if (t) a.timeoutMs = t;
+    return a;
+  };
+
+  card.querySelector('#gb-ask-b').onclick = async () => {
+    const args = common();
+    if (!args.host) { say('<div class="empty">先写给哪个地址：那台设备或平台的 IP。</div>'); return; }
+    const asks = [...card.querySelectorAll('.gb-ask')].filter((x) => x.checked).map((x) => x.value);
+    if (asks.length) args.ask = asks;
+    const cs = Number(card.querySelector('#gb-cs').value.trim());
+    const cc = Number(card.querySelector('#gb-cc').value.trim());
+    if (cs) args.catalogStart = cs;
+    if (cc) args.catalogCount = cc;
+    say('<div class="empty">正在问…（OPTIONS 加上勾的那几问，每问最多等几秒）</div>');
+    const r = await call('media.gb28181.probe', args);
+    if (!r.ok) { say(`<div class="empty">问不了：${esc(r.message || r.error)}</div>`); return; }
+    top.innerHTML = gbPill(r.verdict);
+    out.innerHTML = gbProbeResult(r);
+  };
+
+  card.querySelector('#gb-reg-b').onclick = async () => {
+    const args = common();
+    if (!args.host || !args.deviceId) {
+      say('<div class="empty">这一趟要两个值：平台的地址，和拿哪个编号去报名字。</div>');
+      return;
+    }
+    const pass = card.querySelector('#gb-pass').value;
+    if (pass) args.password = pass;
+    const realm = card.querySelector('#gb-realm').value.trim();
+    if (realm) args.realm = realm;
+    const exp = Number(card.querySelector('#gb-exp').value.trim());
+    if (exp) args.expires = exp;
+    const w = card.querySelector('#gb-watch').value.trim();
+    if (w !== '') args.watchMs = Number(w);
+    say('<div class="empty">等你点批准…（取消的话一个包都不发）<br>'
+      + '批准之后：REGISTER → 401 挑战 → 带摘要重发 → 收 200，再听几秒看它回不回头问，最后发注销。</div>');
+    const r = await call('media.gb28181.register', args);
+    card.querySelector('#gb-pass').value = '';   // 口令不留在输入框里
+    if (!r.ok) { say(`<div class="empty">没走：${esc(r.message || r.error)}</div>`); return; }
+    top.innerHTML = gbPill(r.verdict);
+    out.innerHTML = gbRegisterResult(r);
+  };
+  return card;
+}
+
+function gbPill(code) {
+  const raw = GB_CODE[code];
+  if (!raw) return `<span class="pill">${esc(code || '没给判定')}</span>`;
+  return `<span class="pill ${raw[1]}">${esc(raw[0])}</span>`;
+}
+
+function gbWords(v, key) {
+  const list = v[key];
+  return Array.isArray(list) && list.length ? list.map(esc).join('、') : '';
+}
+
+function gbProbeResult(r) {
+  const v = r.values || {};
+  const dim = (x) => `<span class="dim">${x}</span>`;
+  const cells = [tCell('问的哪一台', `<code>${esc(v.peer || '')}</code> ${dim('UDP')}`
+    + (v.device ? ` · ${dim('那台编号')} <code>${esc(v.device)}</code>` : '')
+    + (v.domain ? ` · ${dim('平台侧编号')} <code>${esc(v.domain)}</code>` : '')
+    + `<br>${dim('本机这一头')} <code>${esc(v.local || '')}</code>`)];
+  const said = [];
+  if (v.optionsMs !== undefined) said.push(`OPTIONS 回了 ${esc(v.optionsMs)} 毫秒`);
+  if (v.optionsSent) said.push(`发出去 ${esc(v.optionsSent)} 发`);
+  if (v.optionsInterims) said.push(`中途收到 ${esc(v.optionsInterims)} 条临时应答（100/180 那一类）`);
+  if (v.status) said.push(`它回的状态 ${esc(v.status)}`);
+  const allow = gbWords(v, 'allow');
+  if (allow) said.push(`它报的能力 ${allow}`);
+  if (v.userAgent) said.push(`它自报 ${esc(v.userAgent)}`);
+  if (v.server) said.push(`Server ${esc(v.server)}`);
+  if (v.bodyBytes !== undefined) said.push(`正文 ${esc(v.bodyBytes)} 字节`);
+  if (said.length) cells.push(tCell('它答的', said.join(' · ')));
+  const queries = Array.isArray(v.queries) ? v.queries : [];
+  if (queries.length) {
+    cells.push(tCell('每一问的账', queries.map((q) => {
+      const st = GB_ASK[q.outcome] || [esc(q.outcome || ''), ''];
+      const bits = [`<span class="pill ${st[1]}">${st[0]}</span> ${esc(GB_CMD_CN[q.cmdType] || q.cmdType)}`];
+      if (q.sent) bits.push(`发 ${esc(q.sent)} 次`);
+      if (q.ms !== undefined) bits.push(`${esc(q.ms)} 毫秒`);
+      if (q.status) bits.push(`回了 ${esc(q.status)}`);
+      if (q.items !== undefined) bits.push(`数到 ${esc(q.items)} 条`);
+      if (q.sumNum !== undefined) bits.push(`它自己声明 ${esc(q.sumNum)} 条`);
+      if (q.answersThisQuery === false) bits.push(dim('★ 正文里的 CmdType/SN 与这一问对不上'));
+      if (q.nonUTF8) bits.push(dim('★ 正文里有非 UTF-8 字节'));
+      if ((q.channelIds || []).length) {
+        bits.push(dim(`编号：${q.channelIds.slice(0, 6).map(esc).join('、')}`
+          + (q.channelIds.length > 6 ? ` 等 ${q.channelIds.length} 个` : '')));
+      }
+      if (q.channelsWithoutId) bits.push(dim(`★ 有 ${esc(q.channelsWithoutId)} 条条目没带编号`));
+      if ((q.repeatedKeys || []).length) bits.push(dim(`同名键出现多次：${q.repeatedKeys.map(esc).join('、')}`));
+      if ((q.oddShape || []).length) bits.push(dim(`形状上也可能只是字段包装的那一层：${q.oddShape.map(esc).join('、')}`));
+      const fields = q.fields && Object.keys(q.fields).length
+        ? `<br>${dim(Object.entries(q.fields).map(([k, x]) => `${esc(k)}=${esc(x)}`).join(' · '))}` : '';
+      return `<div style="margin-bottom:6px">${bits.join(' · ')}${fields}`
+        + (q.detail ? `<br>${dim(esc(q.detail))}` : '') + '</div>';
+    }).join('')));
+  }
+  for (const k of ['queryOutcome', 'kind']) {
+    if (v[k]) cells.push(tCell(dim('落点'), esc(String(v[k]))));
+  }
+  if (v.detail) cells.push(tCell('原文那一错', dim(esc(v.detail))));
+  return gbTail(r, cells);
+}
+
+function gbRegisterResult(r) {
+  const v = r.values || {};
+  const dim = (x) => `<span class="dim">${x}</span>`;
+  const cells = [tCell('往哪台注册', `<code>${esc(v.peer || '')}</code> ${dim('UDP')}`
+    + ` · ${dim('报名字用')} <code>${esc(v.device || '')}</code>`
+    + `<br>${dim('本机这一头')} <code>${esc(v.local || '')}</code>`
+    + `<br>${dim('请求行里的域')} <code>${esc(v.domain || '')}</code>`
+    + (v.domainSource ? ` ${dim(`（从 ${esc(v.domainSource)} 来的）`)}` : ''))];
+  const auth = [];
+  if (v.hasPassword) auth.push('带了口令（内容不会被记下来）');
+  else auth.push('没填口令，按空口令走的一趟');
+  if (v.authenticated === true) auth.push('它先回 401 出了挑战，本机按 RFC 2617 算了摘要');
+  if (v.authenticated === false) auth.push('第一发就直接 200：它没要凭据');
+  if (v.realm) auth.push(`它给的域 <code>${esc(v.realm)}</code>`);
+  if (v.realmDiffers) auth.push(`本机按填的那个算的：<code>${esc(v.realmGiven)}</code> ★ 两边不是一个`);
+  if (v.qop) auth.push(`qop ${esc(v.qop)}`);
+  if (v.firstStatus) auth.push(`第一发回的是 ${esc(v.firstStatus)}`);
+  cells.push(tCell('认证这一路', auth.join(' · ')));
+  const acc = [];
+  if (v.status) acc.push(`最后回的是 ${esc(v.status)}`);
+  if (v.expiresAccepted !== undefined) {
+    acc.push(v.expiresAccepted === Number(v.expires)
+      ? `注册时长 ${esc(v.expiresAccepted)} 秒（和要的一样）`
+      : `<b>它只给了 ${esc(v.expiresAccepted)} 秒</b>（要的是 ${esc(v.expires)}）`
+      + `<br>${dim('★ 「每隔一分钟就掉线、平台上一会儿有一会儿没有」这一类毛病，根子常常在这一格')}`);
+  }
+  if (v.toTag) acc.push(dim('200 带了 tag（这一趟对话算立住了）'));
+  if (v.gotTrying) acc.push(dim('中途收到 100 Trying'));
+  if (v.serverAgent) acc.push(dim(`它自报 ${esc(v.serverAgent)}`));
+  cells.push(tCell('它收不收', acc.length ? acc.join(' · ') : dim('没走到这一格')));
+  // ★ 后面两栏只在真注册上之后才成立：没注册上还写「它一句都没回头来问」「注销没成、
+  //   这条注册会留在平台上」，等于凭空报出一条压根没发生的改动 —— 现场人会拿着这句话
+  //   去平台上找一个不存在的在线设备。
+  if (v.registered) {
+    const back = [];
+    if (v.watchMs) back.push(`注册后又听了 ${esc(v.watchMs)} 毫秒`);
+    else back.push(dim('这一趟没听它回话（监听窗口关着）'));
+    const reqs = gbWords(v, 'platformRequests');
+    const cmds = gbWords(v, 'platformCmdTypes');
+    if (reqs) back.push(`它回过头来问了：${reqs}${cmds ? `（问的是 ${cmds}）` : ''}`);
+    else back.push(dim('它一句都没回头来问 —— 注册收下不等于它把这台当成能点播的设备'));
+    if (v.platformInvite) back.push('<b>★ 它肯发点播 —— 这才是真把这台当能取流的设备</b>');
+    if (v.inviteSDP) back.push(`<br>${dim('点播正文：' + esc(v.inviteSDP))}`
+      + `<br>${dim('★ 那份正文照实留着，本机没去接那一路码流')}`);
+    cells.push(tCell('它回头问了吗', back.join(' · ')));
+    const cut = [];
+    cut.push(v.deregistered ? '注销发了，它答了 2xx —— 那台平台上不会留着这台'
+      : `<b>注销那一发没成</b>：这条注册会留在那台平台上，最长到它应允的时长才自己过期`);
+    if (v.deregisterTries) cut.push(`一共发了 ${esc(v.deregisterTries)} 发`);
+    if (v.deregisterDetail) cut.push(dim(esc(v.deregisterDetail)));
+    cells.push(tCell('收回来没有', cut.join(' · ')));
+  } else {
+    cells.push(tCell('它回头问了吗', dim('没走到这一格 —— 注册没成，那台平台上不会多出这台')));
+    cells.push(tCell('收回来没有', dim('没有要收回的东西：这一趟没注册上')));
+  }
+  if (v.detail) cells.push(tCell('原文那一错', dim(esc(v.detail))));
+  return gbTail(r, cells);
+}
+
+// gbTail 把后端那句判定带上。★ 界面不算账、也不改写：note 是后端从同一份账里长出来的，
+// 这里只负责把它排好；没译成中文的码原样露出来，不编一句人话顶上。
+function gbTail(r, cells) {
+  const raw = GB_CODE[r.verdict] || ['', '', ''];
+  const note = r.note ? `<p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>` : '';
+  return `<table>${cells.join('')}</table>${note}`
+    + (raw[2] ? adviceBox(raw[1], esc(raw[2])) : '')
     + `<details style="margin-top:10px"><summary class="dim">原始结果</summary>`
     + `<pre>${esc(JSON.stringify(r.raw || r.values || {}, null, 2))}</pre></details>`;
 }
