@@ -163,6 +163,29 @@ func (c *Client) dialLocked() (net.PacketConn, *net.UDPAddr, error) {
 	if c.conn != nil {
 		return c.conn, c.addr, nil
 	}
+	// ★ 口的协议栈**跟着设备那一头定**，不交给 Go 的默认值。
+	//
+	//	Go 对「绑 wildcard」开的是 `[::]:port` 双栈口：问 IPv4 设备时，
+	//	请求得把目的地址写成 v4 映射地址发出去，设备的回包再从 v6 口按映射收进来。
+	//	这条跨栈的路就是偶发 snmp-no-reply 落下的地方：改之前那一版整包跑下来，
+	//	两万九千条请求里回方向丢了 18 条、复跑一次一万六千条丢 3 条，
+	//	**发出去的那两三万条一条没少**；丢的那一刻口是活的、收件队列是空的
+	//	（拿 SO_NREAD 问过内核）—— 包没进到这个口。
+	//
+	//	★ 两条没定性，写在这里免得后人把这段当成已证：
+	//	① 单独把这条跨栈路拎出来跑二十四万次一问一答，一次都不丢 —— 只在整包并发下出，
+	//	   所以是这台机器的内核在负载下偶尔不给，机制我们查不下去了；
+	//	② 「顺着设备那一栈开就一次不丢」只是**结构上成立**（AF_INET 口收不到 v6 那一路，
+	//	   映射这条路压根不存在），改后那一版没有在一台安静的机器上重跑过同样的一万六千条，
+	//	   所以这个数不许被引用成「修好了丢包」。
+	//
+	//	即便如此这一改还是要做：真管理器也没像 Go 那样开的，多绕一层内核里说不清的路
+	//	没有半点好处。顺带把「本机指定地址」和「设备地址」两栈对不上的情况当场拦掉 ——
+	//	那种问本来就问不通，放任它起口时拿到的却是 Go 那句
+	//	「listen udp4 [::1]:0: address ::1: non-IPv4 address」，界面上只会翻译成「设备没回话」，
+	//	把矛头指向错的那一头。
+	net4 := c.addr.IP.To4() != nil
+	netName := famNet(net4)
 	la := &net.UDPAddr{}
 	if c.LocalAddr != "" {
 		var err error
@@ -170,13 +193,40 @@ func (c *Client) dialLocked() (net.PacketConn, *net.UDPAddr, error) {
 		if err != nil {
 			return nil, nil, fmt.Errorf("snmp: 本机没有 %s 这个地址（%v）", c.LocalAddr, err)
 		}
+		if la.IP == nil {
+			return nil, nil, fmt.Errorf("snmp: 本机地址 %q 解不出对应的协议栈", c.LocalAddr)
+		}
+		if (la.IP.To4() != nil) != net4 {
+			return nil, nil, fmt.Errorf("snmp: 设备 %s 是 %s，本机指定的 %s 却是 %s —— 两栈对不上，这一问本来就问不通，先把它问成地址写错了",
+				c.Addr, famWord(net4), c.LocalAddr, famWord(!net4))
+		}
 	}
-	conn, err := net.ListenUDP("udp", la)
+	conn, err := net.ListenUDP(netName, la)
 	if err != nil {
 		return nil, nil, fmt.Errorf("snmp: 起不了本地端口：%w", err)
 	}
 	c.conn = conn
 	return conn, c.addr, nil
+}
+
+// famNet 给出该协议栈的监听网络名：udp4 / udp6。
+//
+// ★ 为什么不能用 "udp" 加一个 v4 的 wildcard 地址：Go 会把 0.0.0.0 也当成 ::
+//
+//	开成 v6 双栈口（实测：绑 net.IPv4zero 报回来的是 [::]:port），
+//	那条跨栈的路正是我们要绕开的。写死 udp4 才拿得到真正的 AF_INET 口。
+func famNet(v4 bool) string {
+	if v4 {
+		return "udp4"
+	}
+	return "udp6"
+}
+
+func famWord(v4 bool) string {
+	if v4 {
+		return "IPv4"
+	}
+	return "IPv6"
 }
 
 // Close 放掉连接。
