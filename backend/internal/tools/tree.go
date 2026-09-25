@@ -165,8 +165,21 @@ var treeCauses = map[string]bool{
 	"cause-onvif-no-media":    true, // 身份问到了，媒体那一路问不出
 	"cause-onvif-silent":      true, // 端口开着却不回 ONVIF
 	"cause-onvif-unreachable": true, // 80 连不上：ONVIF 没开，或者根本不在 80
-	"cause-egress-blocked":    true, // 路到得了出口那台机器，却连不上它那个口：拦在中间
-	"cause-wrong-scheme":      true, // 明文口写成 https（或反过来），改个前缀就好
+	// 手里那一路是**平台给的 HLS 地址**：中间隔着一层平台，问的不再是「设备肯不肯给流」，
+	// 而是「这份清单此刻还写着什么」。★ 这一批里最值钱的是 stalled。
+	"cause-hls-ok":              true, // 清单在往前挪、分片取得到 —— 这一路是活的
+	"cause-hls-stalled":         true, // 清单还在，窗口一片没换：源头早就不推了
+	"cause-hls-segment-missing": true, // 清单点着的分片，源上没有
+	"cause-hls-empty":           true, // 清单是空的：还没推上来
+	"cause-hls-target-over":     true, // 分片实测比承诺的长：能播，但一直在缓冲
+	"cause-hls-auth":            true, // 平台要账号才给清单
+	"cause-hls-not-found":       true, // 这个路径上没有这路清单
+	"cause-hls-not-hls":         true, // 回来的不是清单
+	"cause-hls-unreach":         true, // 连不上平台的这个口
+	"cause-hls-timeout":         true, // 连上了，到点没回话
+
+	"cause-egress-blocked": true, // 路到得了出口那台机器，却连不上它那个口：拦在中间
+	"cause-wrong-scheme":   true, // 明文口写成 https（或反过来），改个前缀就好
 }
 
 // IsTreeCause 问一个码是不是登记过的根因码（测试用）。

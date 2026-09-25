@@ -187,6 +187,7 @@ func everythingOK() map[string][]string {
 		"net.mtu.path":        {mtuCodeLocal},
 		"media.rtsp.probe":    {verdictStreamOK},
 		"media.onvif.info":    {verdictONVIFOK},
+		"media.hls.probe":     {verdictHLSOK},
 	}
 }
 
@@ -956,6 +957,218 @@ func TestTreeDeviceSkipsOnvifWhenURLGiven(t *testing.T) {
 	wantStatus(t, st, "stream", treeAsked)
 }
 
+// ── 手里那一路是平台给的 HLS 地址（http 那一族）──
+
+// ★ 前缀把「验流」分成两问：http 那一路只问平台清单，绝不能再拿它去问 RTSP ——
+// 那一问只会回一句「这个端口回的不是 RTSP」，把「平台那份清单没在往前挪」读成端口坏了。
+func TestTreeDeviceHTTPURLAsksPlatformNotRTSP(t *testing.T) {
+	tracker := fakeTools(t, everythingOK(), map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+		"media.hls.probe": {"segmentCount": 6.0, "windowSec": 18.0, "windowAdvanced": true},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		URL: "http://192.0.2.31/live/cam1.m3u8"})
+	st := stepsOf(t, v)
+	wantStatus(t, st, "hls", treeAsked)
+	wantStatus(t, st, "stream", treeSkipped) // ★ 停在清单那一问了，不该再问 RTSP
+	if tracker["media.rtsp.probe"].calls != 0 {
+		t.Errorf("拿着 http 地址去问了 RTSP，%d 次", tracker["media.rtsp.probe"].calls)
+	}
+	if v.Code != "cause-hls-ok" {
+		t.Fatalf("顶层 = %s，想要 cause-hls-ok", v.Code)
+	}
+	got := tracker["media.hls.probe"].args[0]["url"]
+	if got != "http://192.0.2.31/live/cam1.m3u8" {
+		t.Errorf("没把平台给的地址原样发出去：%v", got)
+	}
+	if f := st["hls"].Facts; f["segmentCount"] == nil || f["windowAdvanced"] == nil {
+		t.Errorf("停在清单这一问上，却拿不出「窗口挪了没有、有几片」：%v", f)
+	}
+}
+
+// 什么都没填就跑「没画面」这一棵：每一步都必须是「缺信息，没问出去」。
+//
+// ★ 尤其不许落成 failed —— 工具没报错，是我们没东西可问；
+// 那两问（平台清单 / 直连取流）拿 need 卡住这一条，少了它就成了「发了一句空地址、读成工具坏了」。
+func TestTreeDeviceNothingFilledAsksNothing(t *testing.T) {
+	tracker := fakeTools(t, everythingOK(), nil)
+	v := runTree(t, treeArgs{Symptom: symDeviceDown})
+	st := stepsOf(t, v)
+	for _, id := range []string{"onvif", "hls", "stream"} {
+		s := st[id]
+		if s.Status != treeNotAsked || !strings.Contains(s.Note, "缺") {
+			t.Errorf("%s = %s / %q，想要 not-asked 且写明缺哪一栏", id, s.Status, s.Note)
+		}
+	}
+	if tracker["media.hls.probe"].calls != 0 || tracker["media.rtsp.probe"].calls != 0 {
+		t.Error("没地址也把取流那两问问出去了")
+	}
+	// ★ 这一棵的第一问（解析）本来就带着默认域名，所以 asked 不是 0；
+	// 但取流那两问一次都没问成，顶层就不许落成任何一个 cause-*。
+	if strings.HasPrefix(v.Code, "cause-") {
+		t.Errorf("没问过取流却定了根因：%s", v.Code)
+	}
+}
+
+// 前缀大小写不算数：从 Windows 上复制出来的地址常常是 HTTPS:// 那种写法。
+// ★ 拿它当「不是 http 那一族」，两问就都不问，这一路白查一场。
+func TestTreeDeviceStreamSchemeIsCaseInsensitive(t *testing.T) {
+	for _, u := range []string{
+		"HTTPS://192.0.2.31/live/cam1.m3u8",
+		"Http://192.0.2.31/live/cam1.m3u8",
+	} {
+		tracker := fakeTools(t, everythingOK(), map[string]map[string]any{
+			"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+			"net.ports.scan":  {"open": 1},
+		})
+		v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31", URL: u})
+		wantStatus(t, stepsOf(t, v), "hls", treeAsked)
+		if tracker["media.rtsp.probe"].calls != 0 {
+			t.Errorf("%s 被当成非 http 那一族，转去问了 RTSP", u)
+		}
+	}
+	tracker := fakeTools(t, everythingOK(), map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		URL: "RTSP://192.0.2.31:554/live"})
+	wantStatus(t, stepsOf(t, v), "hls", treeNotAsked)
+	wantStatus(t, stepsOf(t, v), "stream", treeAsked)
+	if tracker["media.hls.probe"].calls != 0 {
+		t.Error("大写前缀的 rtsp 地址被当成清单去问了平台")
+	}
+}
+
+// 清单那一问**问不成**（工具报错）时，不许顺手拿这个 http 地址去问 RTSP。
+//
+// ★★ 那一问会老老实实回一句「这个端口回的不是 RTSP」，于是我们把它当成一次判定、
+// 停在「端口号或协议不对」上 —— 那是把我们没问成读成了网络这么答，
+// 而真正的答案（平台清单那一问没问出去）被盖掉了。
+func TestTreeDeviceHLSFailureDoesNotFallIntoRTSP(t *testing.T) {
+	tracker := fakeTools(t, everythingOK(), map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+	})
+	treeCalls["media.hls.probe"] = fake(nil, ots.Errf(ots.ErrInternal, "这台机器上问不出去"))
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		URL: "http://192.0.2.31/live/cam1.m3u8"})
+	st := stepsOf(t, v)
+	if s := st["hls"]; s.Status != treeFailed {
+		t.Errorf("清单那一问 = %s，想要 failed（不能读成「问了没问题」）", s.Status)
+	}
+	wantStatus(t, st, "stream", treeNotAsked)
+	if tracker["media.rtsp.probe"].calls != 0 {
+		t.Error("清单没问成，就拿 http 地址去问了 RTSP")
+	}
+	if strings.HasPrefix(v.Code, "cause-stream") || v.Code == "cause-port-not-rtsp" {
+		t.Errorf("一次都没问过流，却定了个流的根因：%s", v.Code)
+	}
+	if v.Code != treeNoCause {
+		t.Errorf("顶层 = %s，想要 %s —— 唯一没问成的那一步要露在人眼里", v.Code, treeNoCause)
+	}
+}
+
+// 很多平台的清单地址根本没有 .m3u8 后缀（后面还挂着一串签名参数）。
+// ★ 拿后缀当门槛会让这一问整个跳过，而「它回的根本不是清单」正是这一问给得出的答案。
+func TestTreeDeviceHLSDoesNotDemandM3U8Suffix(t *testing.T) {
+	tracker := fakeTools(t, everythingOK(), map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		URL: "https://192.0.2.31:8443/live/cam1?sign=9f2c"})
+	wantStatus(t, stepsOf(t, v), "hls", treeAsked)
+	if tracker["media.hls.probe"].calls != 1 {
+		t.Fatalf("没后缀就没问平台清单：%d 次", tracker["media.hls.probe"].calls)
+	}
+	if a := tracker["media.hls.probe"].args[0]; a["url"] != "https://192.0.2.31:8443/live/cam1?sign=9f2c" {
+		t.Errorf("发出去的地址被改过了：%v", a["url"])
+	}
+}
+
+// 反过来：rtsp 地址不该去问平台清单，但那一格要写明「为什么没问」。
+func TestTreeDeviceRTSPURLSkipsHLSWithAReason(t *testing.T) {
+	tracker := fakeTools(t, everythingOK(), map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		URL: "rtsp://192.0.2.31:554/live"})
+	st := stepsOf(t, v)
+	wantStatus(t, st, "hls", treeNotAsked)
+	if !strings.Contains(st["hls"].Note, "不是 http") {
+		t.Errorf("没写出为什么没问平台清单：%q", st["hls"].Note)
+	}
+	wantStatus(t, st, "stream", treeAsked)
+	if tracker["media.hls.probe"].calls != 0 {
+		t.Error("拿着 rtsp 地址去问了平台清单")
+	}
+	if v.Code != "cause-stream-ok" {
+		t.Fatalf("顶层 = %s，想要 cause-stream-ok", v.Code)
+	}
+}
+
+// 清单那一问的十种落点：★ 每一档都停在它自己给的判定上。
+// 放它走到 RTSP 那一问只会得到「缺参数，没问出去」，再落一句「每一步都正常」——
+// 那是把我们问不出来的那一格算成没毛病。
+func TestTreeDeviceHLSStopsByItsOwnAnswer(t *testing.T) {
+	for _, tc := range []struct{ code, want string }{
+		{verdictHLSOK, "cause-hls-ok"},
+		{verdictHLSStalled, "cause-hls-stalled"},
+		{verdictHLSSegMiss, "cause-hls-segment-missing"},
+		{verdictHLSEmpty, "cause-hls-empty"},
+		{verdictHLSTargetOver, "cause-hls-target-over"},
+		{verdictHLSAuth, "cause-hls-auth"},
+		{verdictHLSNotFound, "cause-hls-not-found"},
+		{verdictHLSNotHLS, "cause-hls-not-hls"},
+		{verdictHLSUnreach, "cause-hls-unreach"},
+		{verdictHLSTimeout, "cause-hls-timeout"},
+	} {
+		codes := everythingOK()
+		codes["media.hls.probe"] = []string{tc.code}
+		tracker := fakeTools(t, codes, map[string]map[string]any{
+			"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+			"net.ports.scan":  {"open": 1},
+		})
+		v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+			URL: "http://192.0.2.31/live/cam1.m3u8"})
+		if v.Code != tc.want {
+			t.Errorf("清单回 %s，顶层却停在 %s，想要 %s", tc.code, v.Code, tc.want)
+		}
+		if c := stepsOf(t, v)["hls"].Code; c != tc.code {
+			t.Errorf("那一步自己的判定没记下来：%v", c)
+		}
+		if tracker["media.rtsp.probe"].calls != 0 {
+			t.Errorf("清单已经答过了，又去问了 RTSP")
+		}
+	}
+}
+
+// 快问那一档把观看窗口压到两秒：树是连着走好几大步的，多等那两秒半是白等。
+// ★ 压完仍然要带上账号 —— 平台的清单常常也要登录，不带就等于问出一句 401。
+func TestTreeDeviceHLSQuickShrinksWatchButKeepsAccount(t *testing.T) {
+	tracker := fakeTools(t, everythingOK(), map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		URL: "http://192.0.2.31/live/cam1.m3u8", Quick: true,
+		Username: "plat", Password: "Str0ng_Passw0rd"})
+	a := tracker["media.hls.probe"].args[0]
+	if n, _ := a["watchMs"].(float64); n != 2000 {
+		t.Errorf("快问那一档没压观看窗口：%v", a["watchMs"])
+	}
+	if a["username"] != "plat" || a["password"] != "Str0ng_Passw0rd" {
+		t.Errorf("清单那一问没带上账号（平台多数要登录）：%v", a)
+	}
+	blob := fmt.Sprint(v.Values)
+	if strings.Contains(blob, "Str0ng_Passw0rd") {
+		t.Errorf("口令漏进结果了：%s", blob)
+	}
+}
+
 // ── 顶层码 ──
 
 // 这条路每步都正常时，必须说「症状不在我们问的里面」，不许说「网络正常」。
@@ -1423,6 +1636,7 @@ var toolValues = map[string][]string{
 	"net.mtu.path":        {"pathMtu", "suggestion", "egress", "egressUnknown", "carriesAtLeast", "localMtuLimited", "steps", "warning", "dfVerified"},
 	"media.rtsp.probe":    {"codec", "width", "height", "trackCount", "status", "transport", "rtp", "measured", "measureNote"},
 	"media.onvif.info":    {"manufacturer", "model", "profileCount", "mediaUri", "steps"},
+	"media.hls.probe":     {"httpStatus", "segmentCount", "windowSec", "windowAdvanced", "mediaSequence", "bitrateKbps", "variants", "isLive", "sampled"},
 }
 
 func TestTreeShowsPathsExist(t *testing.T) {

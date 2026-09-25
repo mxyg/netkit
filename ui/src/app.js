@@ -54,7 +54,8 @@ const PAGES = [
   { g: '通不通', id: 'service', name: '网站与证书', render: renderService },
 
   { g: '谁在网里', id: 'scan', name: '网段上有哪些地址', render: renderScan },
-  { g: '谁在网里', id: 'device', name: '设备与取流', render: renderDevice },
+  { g: '谁在网里', id: 'device', name: '设备是谁', render: renderDevice },
+  { g: '谁在网里', id: 'stream', name: '摄像头取流', render: renderStream },
   { g: '谁在网里', id: 'switch', name: '交换机（SNMP）', render: renderSwitch },
 
   { g: '出问题了', id: 'checkup', name: '一键体检与诊断包', render: renderCheckup },
@@ -1390,7 +1391,7 @@ const HTTP_CODE = {
   'http-timeout': ['整条请求超时', 'bad',
     '哪一段没走完看下面的分段：耗时是 0 的那一段就是没走到的那一段。'],
   'not-http': ['这个端口回的不是 HTTP', 'warn',
-    '多半是 RTSP、RTMP 或设备自己的私有协议 —— 取流用「设备与取流」那一页探。'],
+    '多半是 RTSP、RTMP 或设备自己的私有协议 —— 取流用「摄像头取流」那一页探。'],
   'wrong-scheme': ['协议前缀写反了', 'warn',
     '★ 这不是故障：把地址开头的 http / https 换成另一个就能通。省得去查一个根本没坏的服务。'],
   'tls-handshake-failed': ['TLS 握手被对方拒了', 'bad',
@@ -3709,19 +3710,27 @@ async function renderScan(root) {
   root.appendChild(neighborsCard());
 }
 
-// ── 设备与取流 ──
+// ── 设备是谁 / 摄像头取流 ──
 //
 // ★ 「视频流」原来自己占一页，孤零零一张卡，看着像给视频软件开的后门。
 //   它答的其实是「这个取流地址上到底有没有一路流、以什么规格在播」——
-//   和识别设备、听广播是同一个问题（现场那台摄像头在不在、说的什么话），
-//   所以并到这一页。后面 ONVIF / GB28181 的探测也归这里。
+//   问的是现场那台摄像头，所以和识别设备、听广播归在一组（「谁在网里」）。
+// ★ 一组里最多四页、一页里最多五张：取流这一叠（ONVIF / RTSP / HLS，
+//   后面还有 RTMP 与 GB28181）已经自成一路问题，硬并回「设备是谁」
+//   就是第六张卡 —— 那张卡一放，这一页又滚到底找不着北了。
 
 async function renderDevice(root) {
   root.appendChild(deviceIdentifyCard());
   root.appendChild(discoverCard());
+  root.appendChild(wolCard());
+}
+
+// 三张卡是一条流水线，不是三个并列的工具：
+// 只有设备 IP → ONVIF 问出取流地址 → RTSP 验这路流到没到本机 → HLS 问平台那份清单还写着什么。
+async function renderStream(root) {
   root.appendChild(onvifCard());
   root.appendChild(rtspCard());
-  root.appendChild(wolCard());
+  root.appendChild(hlsCard());
 }
 
 // ONVIF 这一张排在「取流探测」前面，不是随手放的：
@@ -3966,12 +3975,231 @@ const RTSP_CODE = {
     '★ 连不上先别改密码。去「ping 与端口」那页探一下这个端在不在：端口在而 RTSP 不通，是服务的问题；端口就不在，先确认地址、网段和中间隔没隔路由。'],
 };
 
+// hlsCard 排在「取流探测」后面，顺序就是现场的动作顺序：
+// 先问设备要地址（ONVIF）→ 验这路流到没到本机（RTSP）→ 最后问平台那份清单此刻还写着什么（这一张）。
+function hlsCard() {
+  const card = $(`<div class="card">
+    <h2>拉一路 HLS（m3u8） <span id="hl-top"></span></h2>
+    <p class="hint">问平台<b>这份清单此刻还在不在往前加片子</b>。★ 它和上面那张「取流探测」问的不是同一件事：
+      RTSP 量的是码流到没到本机，这一路中间隔着一层平台 —— 盒子说没画面，
+      有一种毛病是清单还在、里面的分片却早就不加了。同样不解码、不放画面、不改任何东西。</p>
+    <div style="display:flex;gap:12px;align-items:flex-end">
+      <div style="flex:1"><label>清单地址</label>
+        <input id="hl-u" placeholder="http://192.168.1.20:80/hls/cam1/index.m3u8"></div>
+      <div style="flex:0 0 190px"><label>隔多久再看一次清单</label><select id="hl-w">
+        <option value="4000">四秒（默认）</option>
+        <option value="8000">八秒 —— 切片周期长的平台</option>
+        <option value="15000">十五秒 —— 慢到可疑</option>
+        <option value="0">不看，只拉一次（点播）</option>
+      </select></div>
+      <div style="flex:0 0 130px"><label>抽查几片</label><select id="hl-s">
+        <option value="2">两片（默认）</option>
+        <option value="3">三片</option>
+        <option value="1">只看最新那片</option>
+        <option value="0">不取分片</option>
+      </select></div>
+    </div>
+    <details style="margin-top:8px"><summary class="dim">这台要账号（Basic）/ 一次请求的超时</summary>
+      <div class="row" style="margin-top:8px">
+        <div><label>账号</label><input id="hl-usr" autocomplete="off"></div>
+        <div><label>口令</label><input id="hl-pw" type="password" autocomplete="off"></div>
+        <div style="flex:0 0 160px"><label>单次超时 ms</label><input id="hl-t" placeholder="5000"></div>
+      </div>
+      <p class="hint" style="margin-top:6px">地址里已经带了账号（http://user:pass@host/…）就别填这两个，
+        ★ 口令只进请求头，不进结果、不进日志。</p>
+    </details>
+    <div style="margin-top:12px"><button class="btn primary" id="hl-b">拉一遍</button></div>
+    <div id="hl-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#hl-out');
+  const top = card.querySelector('#hl-top');
+  card.querySelector('#hl-b').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">正在拉清单…（隔几秒再拉一次对照，稍等）</div>';
+    const args = { url: card.querySelector('#hl-u').value.trim() };
+    const w = Number(card.querySelector('#hl-w').value);
+    const s = Number(card.querySelector('#hl-s').value);
+    args.watchMs = w;
+    args.sampleSegments = s;
+    const usr = card.querySelector('#hl-usr').value.trim();
+    const pw = card.querySelector('#hl-pw').value;
+    if (usr) args.username = usr;
+    if (pw) args.password = pw;
+    const t = Number(card.querySelector('#hl-t').value);
+    if (t) args.timeoutMs = t;
+    const r = await call('media.hls.probe', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const d = hlsDisplay(r);
+    top.innerHTML = `<span class="pill ${d.cls}">${esc(d.title)}</span>`;
+    out.innerHTML = hlsResult(r);
+  };
+  return card;
+}
+
+// hlsDisplay 把「判定码」和「这一次真的问了什么」合成界面要说的那一句。
+//
+// ★ 顶部那颗胶囊和结果表必须走同一个口径：`hls-ok` 那句「这一路是活的」里含着
+//   分片取得到、窗口在往前加两件事 —— 抽查填 0 就一片没碰，观看窗口填 0 就没看第二遍，
+//   这时候照码说绿话，等于把我们没问的两格算成没毛病。和后端那句账同一条线（见 hlsOKNote）。
+function hlsDisplay(r) {
+  const v = r.values || {};
+  const raw = HLS_CODE[r.verdict] || [r.verdict, '', ''];
+  if (r.verdict !== 'hls-ok') return { title: raw[0], cls: raw[1], advice: raw[2] };
+  if (v.isLive === false) {
+    return {
+      title: '录完的这一段读得到', cls: 'ok',
+      advice: '★ 清单末尾写着这一段录完了，所以「窗口在不在往前加」本来就不适用 —— 这一句说的是'
+        + '分片取得到、清单点得出的东西都在。播放不到去查别的：清单里的地址、签名有没有过期、播放器那一头。',
+    };
+  }
+  const sawSeg = (v.sampled || []).length > 0;
+  const sawWindow = v.windowAdvanced !== undefined;
+  if (sawSeg && sawWindow) return { title: raw[0], cls: raw[1], advice: raw[2] };
+  const missing = [];
+  const tips = [];
+  if (!sawSeg) {
+    missing.push('一片分片都没取过');
+    tips.push('把「抽查几片」换成两片再问一次');
+  }
+  if (!sawWindow) {
+    missing.push('没看第二遍，说不了它在不在往前加');
+    tips.push('把「隔多久再看一次清单」换成四秒再问一次');
+  }
+  return {
+    title: '清单读得到，但' + missing.join('、'),
+    cls: '',
+    advice: '★ 这一句只验到「清单此刻读得到」，上面没说的两格还算没排除：'
+      + tips.join('、') + '。',
+  };
+}
+
+// hlsResult 把一次探测摊开。★ 每一格都留了「为什么没有这一格」的位置：
+// 空着和填了 0 是两种结论（没去看窗口 ≠ 看了没动，没取分片 ≠ 分片取不到）。
+function hlsResult(r) {
+  const v = r.values || {};
+  const { cls, advice } = hlsDisplay(r);
+  const dim = (x) => `<span class="dim">${x}</span>`;
+  const cells = [tCell('问的地址', `<code>${esc(v.url || '')}</code>`
+    + (v.finalURL ? ` · ${dim('最后落在')} <code>${esc(v.finalURL)}</code>` : ''))];
+  // ★ closed（主机在、这个口没服务）与 filtered（一句都不答）是下一步走两条路的分界，
+  //   它连着不上时根本没有状态码 —— 那一格不能跟着状态码一起消失。
+  const said = [];
+  if (v.httpStatus) said.push(`HTTP ${esc(v.httpStatus)}`);
+  if (v.contentType) said.push(esc(v.contentType));
+  if (v.looksLike) said.push(dim(`内容看着像 ${esc(v.looksLike)}`));
+  if (v.reach) said.push(dim(v.reach === 'closed' ? '端口明确拒绝（主机在，这个口没服务）' : '没有任何回应'));
+  if (said.length) cells.push(tCell('它回的', said.join(' · ')));
+  if (v.master) {
+    const rows = (v.variants || []).map((x) => `<tr><td><code>${esc(x.uri || '')}</code></td>`
+      + `<td>${x.bandwidth ? esc((x.bandwidth / 1000).toFixed(0)) + ' kbps' : '—'}</td>`
+      + `<td>${esc(x.resolution || '—')}</td><td>${esc(x.codecs || '—')}</td></tr>`).join('');
+    cells.push(tCell('这是一份主清单', `里面列了 ${(v.variants || []).length} 路，★ 下面问的是带宽最高的那一路`
+      + `<table><tr><th>地址</th><th>带宽</th><th>分辨率</th><th>编码</th></tr>${rows}</table>`
+      + (v.variant ? `<div>替你看的是 <code>${esc(v.variant)}</code>${v.variantResolution ? ' · ' + esc(v.variantResolution) : ''}</div>` : '')));
+  }
+  const kind = v.isLive === undefined ? '' : (v.isLive ? '直播（还在往前加）' : '点播（这一段录完了）');
+  if (kind) {
+    cells.push(tCell('这份清单', [
+      kind,
+      `${v.segmentCount ?? 0} 片`,
+      v.windowSec ? `窗口共 ${esc(v.windowSec)} 秒` : dim('一片都没有，谈不上窗口'),
+      v.mediaSequence ? `序号从 ${esc(v.mediaSequence)} 起` : '',
+      v.targetDurationSec ? `写着每片最长 ${esc(v.targetDurationSec)} 秒` : dim('没写每片最长'),
+      v.hasInitSegment ? '带初始化段（fMP4 切的）' : '',
+      v.discontinuities ? dim(`中间有 ${esc(v.discontinuities)} 处时间戳断点`) : '',
+    ].filter(Boolean).join(' · ')));
+  }
+  if (v.longestSegmentSec) {
+    cells.push(tCell('最长的那一片', `${esc(v.longestSegmentSec)} 秒 —— 比清单承诺的长，播放器会在这里缓冲`));
+  }
+  const sampled = (v.sampled || []).map((x) => {
+    // ★ 先读 error 再读状态码：回 200/206 而正文是空的，那一条的毛病写在 error 里，
+    //   按状态码显示就成了「回 HTTP 206」—— 数字很好看，毛病却被盖住。
+    const got = x.ok ? `${(x.bytes || 0).toLocaleString()} 字节 · ${x.elapsedMs ?? 0} 毫秒`
+      : (x.error ? esc(x.error)
+        : (x.httpStatus ? `回 HTTP ${esc(x.httpStatus)}` : '没取到'));
+    return `<tr><td>${x.initSegment ? '初始化段' : ('第 ' + (x.seq ?? '?') + ' 片')}</td>`
+      + `<td>${x.durationSec ? esc(x.durationSec) + ' 秒' : '—'}</td>`
+      + `<td>${got}${x.truncated ? dim('（读满上限，没读完）') : ''}${x.byteRange ? dim(' · 段 ' + esc(x.byteRange)) : ''}</td>`
+      + `<td><code>${esc(x.uri || '')}</code></td></tr>`;
+  }).join('');
+  if (sampled) {
+    cells.push(tCell('抽查的分片',
+      `<table><tr><th>哪一片</th><th>标称时长</th><th>取回的</th><th>地址</th></tr>${sampled}</table>`));
+  }
+  if (v.missingSegment) {
+    cells.push(tCell('取不到的是哪一片', `<code>${esc(v.missingSegment)}</code>`
+      + ` ${dim('它回的是什么，写在上面「抽查的分片」那一格里')}`));
+  }
+  if (v.bitrateKbps) {
+    cells.push(tCell('实际码率', `${esc(v.bitrateKbps)} kbps · ${dim(esc(v.bitrateBasis || ''))}`
+      + (v.bitrateSkipped ? `<br>${dim(esc(v.bitrateSkipped))}` : '')));
+  } else if (v.sampled) {
+    cells.push(tCell('实际码率', dim('没算 —— 抽查的片没一片是「整片读完」的')));
+  }
+  if (v.windowAdvanced !== undefined) {
+    cells.push(tCell('窗口挪了没有', (v.windowAdvanced
+      ? `<b>挪了</b> · 等了 ${esc(v.watchedMs ?? 0)} 毫秒`
+      : `<b>一片没换</b> · 等了 ${esc(v.watchedMs ?? 0)} 毫秒`)
+      + (v.stuckOn ? ` · 一直停在 <code>${esc(v.stuckOn)}</code>` : '')
+      + (v.lastSegmentNow ? ` · 此刻最后一片是 <code>${esc(v.lastSegmentNow)}</code>` : '')));
+  } else if (v.isLive) {
+    cells.push(tCell('窗口挪了没有', dim('这一次没看（只拉了一次清单，说不了卡不卡）')));
+  }
+  if ((v.unknownTags || []).length) {
+    cells.push(tCell('认不出的标签', dim(`只留了名字，值没抄：${(v.unknownTags || []).map(esc).join('、')}`)));
+  }
+  if (typeof v.detail === 'string' && v.detail) cells.push(tCell('原文那一错', dim(esc(v.detail))));
+  // 判定本身是好的时候，note 就是那一格读数的复述，不再单占一行。
+  const note = r.note && r.verdict !== 'hls-ok'
+    ? `<p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>` : '';
+  return `<table>${cells.join('')}</table>${note}`
+    + (advice ? adviceBox(cls, esc(advice)) : '')
+    + `<details style="margin-top:10px"><summary class="dim">原始结果</summary>`
+    + `<pre>${esc(JSON.stringify(r.raw || v, null, 2))}</pre></details>`;
+}
+
+const HLS_CODE = {
+  'hls-ok': ['这一路是活的', 'ok',
+    '★ 清单拉得到、抽查的分片取回、窗口还在往前加 —— 平台这一头是好的。画面上还是没东西，'
+    + '那就不是源的问题：查播放器到平台之间那一段（它拉的地址是不是这一路、域名解析到哪、账号是谁的）。'],
+  'hls-stalled': ['清单还在，可窗口一片没换', 'bad',
+    '★ 这是这一路最值钱的一档：地址对、不报错、清单也还写着 —— 唯独不再往前加分片。'
+    + '说明推流那一早就不推了，而平台没把这路下线。去找推流端（设备、编码器、推流服务）看它还活不活，'
+    + '别在重启平台上绕圈 —— 重启完它还是拿到一份不动的清单。'],
+  'hls-segment-missing': ['清单点出来的分片取不到', 'bad',
+    '★ 清单和分片对不上号：多半是平台删得比写得快（窗口给播放器留得太短），或者源站和平台之间换了机器。'
+    + '分清回的是 404 还是没回话：404 是对不上号，没回话是分片还在写或者那条路被挡了。'],
+  'hls-empty-playlist': ['清单是空的', 'bad',
+    '★ 里面一片都没有 —— 这一路此刻根本没在推（刚点开播，或者已经掉线）。先确认推流端起来了再问一次；'
+    + '如果它一直空着而平台显示「在线」，那是平台的通道状态是假的，不是网络的问题。'],
+  'hls-target-over': ['分片比清单承诺的长', 'warn',
+    '★ 能播，但播放器会反复缓冲：清单写着每片最长几秒，实际有一片明显超过。'
+    + '多半是码率突然冲高，或者编码器的 GOP 比切片周期还长 —— 改切片周期或码率上限，不是改网络。'],
+  'hls-auth-required': ['要账号', 'warn',
+    '★ 401、403 不是坏了，是问到了、只是不给。注意清单和分片可能用两套凭据（分片走签名地址的那种更常见）：'
+    + '先把这份地址原样丢进浏览器看能不能下下来，再核对账号对这条通道有没有权限。'],
+  'hls-not-found': ['这个路径上没有清单', 'bad',
+    '★ 十有八九是流名写错。各平台是 /hls/流名/index.m3u8、/流名.m3u8、/live/流名/playlist.m3u8 这几套写法，'
+    + '回平台把这条通道的播放地址原样抄一遍，别手敲。'],
+  'hls-not-hls': ['回的不是清单', 'bad',
+    '★ 它答话了，答的不是 HLS：可能是设备自己的网页、一段裸流（FLV、MP4），或者这个口上说的压根不是 HTTP。'
+    + '结果里「内容看着像」那一格写了头几个字节认出的形状。RTSP、RTMP 那两路用上面几张卡去问。'],
+  'hls-unreachable': ['连不上', 'bad',
+    '★ 连不上先别改密码 —— 密码错不会导致连不上。端口明确回了拒绝，说明主机活着、这个口上没有服务，'
+    + '去核对端口号和平台进程；什么都没回，先回「ping 与端口」那页确认这台在不在、中间隔没隔路由。'],
+  'hls-timeout': ['连上了没回话', 'bad',
+    '★ 端口通了却不给清单：多半是平台那边压着一堆请求，或者它只放行内网某几段地址。'
+    + '把单次超时放宽到十秒再问一次；还是不通，就看那台服务器的负载和访问日志里有没有这一问 —— '
+    + '日志里没有，就是没到这里。'],
+};
+
 function subnetScanCard() {
   const card = $(`<div class="card">
     <h2>扫一个网段 <span id="nv"></span></h2>
     <p class="hint">问一遍<b>某个 IPv4 网段上现在有谁</b>。网段留空就扫本机自己所在的各段。
       ★ 只扫 IPv4：IPv6 一个 /64 有 1.8×10<sup>19</sup> 个地址，逐个问是问不完的，
-      v6 那一套在「设备与取流」那一页的「听谁在应答」里。</p>
+      v6 那一套在「设备是谁」那一页的「听谁在应答」里。</p>
     <div class="row">
       <div><label>网段（CIDR，留空 = 本机所在网段）</label><input id="nc" placeholder="192.168.1.0/24"></div>
       <div style="flex:0 0 150px"><label>只扫某块网卡</label><input id="ni" placeholder="en0 / 以太网"></div>
@@ -6046,6 +6274,7 @@ const TREE_CODE_OF = {
   trace: [TRACE_CODE], mtr: [MTR_CODE], clock: [TIME_CODE], tcp: [PROBE_CODE],
   ports: [SCAN_CODE], 'on-link': [SUBNET_CODE], tls: [CERT_CODE],
   http: [HTTP_CODE], mtu: [MTU_CODE], stream: [RTSP_CODE], onvif: [ONVIF_CODE],
+  hls: [HLS_CODE],
 };
 
 // 树里问到的那一步没给出话术时，只回落到码本身 —— 不许在这儿编一句人话顶上：
@@ -6254,6 +6483,48 @@ const TREE_CAUSE = {
   'cause-onvif-unreachable': ['ONVIF 那一问连都连不出去', 'warn',
     '默认 80 没人应 —— 各家会把 ONVIF 挪到 8899 / 2020 / 8080，或者只在 https 上。'
     + '★ 先进后台确认它开了 ONVIF、端口是多少；有取流地址的话直接填到高级的「网址」里，这一步就绕过去了。'],
+  // ── 「拉平台那份清单」那一步的十种落点（手里那一路是平台给的 m3u8）──
+  // ★ 这一批和上面那批的区别只有一句话：中间隔着一层平台。
+  //   设备肯给流 ≠ 平台这份清单还在往前挪，所以话术全在说「这一步查谁」。
+  'cause-hls-ok': ['平台这一路是活的，「没画面」在播放那一侧', 'warn',
+    '★ 清单在往前挪、抽查的分片取得到、码率也量得出来 —— 推流和平台这两段都没事。'
+    + '去查客户端：编码是 H.265 的话浏览器基本不放（换 H.264 那一路）、'
+    + '播放器切没切到这一路、平台到客户端那一段（CDN / 反向代理）有没有换地址。'],
+  'cause-hls-stalled': ['清单还写着，可窗口一片没往前挪', 'bad',
+    '★ 这一档最坑人：地址对、不报错、页面上看着一切正常，可连着两次拉的清单里'
+    + '那几片一模一样 —— 源头早就不往前推了，平台只是照着旧清单继续发。'
+    + '别在平台日志里找错，去推流那侧看编码器的码率曲线（多数已经掉到 0）；'
+    + '顺带确认这台是不是只有被人看时才出流（按需取流的设备一断观看就停推）。'],
+  'cause-hls-segment-missing': ['清单点名的分片，源上取不到', 'bad',
+    '清单是新的、分片却回 404 / 403 —— 平台内部对不上号。★ 多是清理策略与窗口对不齐：'
+    + '留的片数比清单承诺的少，或者分片落在多台节点上而存储没共享（问到 A 节点、'
+    + '清单是 B 节点写的）。先在平台上换一路地址再问一次，只有一路这样就是这一路的配置。'],
+  'cause-hls-empty': ['清单是空的，一条分片都没点', 'bad',
+    '★ 这一路此刻没有内容 —— 要么刚点开播还没推上来，要么设备到平台那一段断了。'
+    + '过十几秒再问一次：仍然空就去查推流端（它有没有在发），'
+    + '不空就是刚起来那一下没画面，不用改任何东西。'],
+  'cause-hls-target-over': ['能播，但每一片都比承诺的长', 'warn',
+    '清单写着「一片最多 N 秒」，实测那片比这还长。★ 起播没问题，'
+    + '播放器会反复缓冲、画面越播越往后拖 —— 现场读成「卡」而不是「坏」。'
+    + '这是编码端的 GOP / 切片间隔改了而平台没跟着改承诺值，两边对一遍。'],
+  'cause-hls-auth': ['平台要账号才给这份清单', 'warn',
+    '★ 401 / 403 是它答了、只是不放行，不是这一路坏了。'
+    + '清单地址常常带着有时效的签名参数（token 过期就是这一档）：地址要从页面上现抄，'
+    + '别把昨天那条存成书签。用固定账号访问就在本卡的高级里填，口令不进结果。'],
+  'cause-hls-not-found': ['这个路径上没有这路清单', 'bad',
+    '平台在、这个应用名下没有这条流。★ 流名 / 应用名对不上是主因，'
+    + '再确认这一路在平台上起没起（很多平台只在有人订阅时才生成清单，那是空清单不是 404）。'],
+  'cause-hls-not-hls': ['它答话了，答的不是清单', 'warn',
+    '★ 拿回来的东西认不出是 m3u8 —— 那个地址多半是网页、裸流（FLV / MP4）或别的服务，'
+    + '结果里 looksLike 那一栏说了它像什么。对上是 FLV 就去问 RTSP 或 HTTP-FLV 那一路，'
+    + '是一页网页说明抄地址抄到了后台页面上。'],
+  'cause-hls-unreach': ['连不上平台的那个口', 'bad',
+    '★ 先看结果里 reach 那一栏：closed 是机器在、这个口上没服务（端口或前缀错了）；'
+    + 'filtered 是它一句都不答（防火墙只放行了白名单）。这两种下一步完全不同，别并成「网络不通」。'],
+  'cause-hls-timeout': ['连上了，可它到点没回话', 'bad',
+    'TCP 是建起来了，问一句清单过去半天不回。★ 平台的清单接口挂住了：'
+    + '它自己在等上游、或者后端取流慢把接口一起拖死。换个时段再问一次，'
+    + '同时问一段平台上别的路 —— 别的路也这样就是平台，只有这一路就是这路。'],
   'cause-stream-auth': ['问到了，只是不让看', 'warn',
     '★ 401 不是设备坏了，是它答了并且认得这个请求。核对账号密码，再确认这个账号'
     + '对该通道有取流权限 —— 现场十次有八次是权限而不是密码。'],
@@ -6306,6 +6577,9 @@ const TREE_FACT = {
   width: '宽', height: '高', trackCount: '有几路轨', answers: '解出来的地址',
   manufacturer: '它自报是哪台', model: '型号', profileCount: '它自报几路码流',
   mediaUri: '问出来的取流地址',
+  // 平台清单那一步（media.hls.probe）给人看的几项
+  httpStatus: '它回的', segmentCount: '清单里有几片', windowSec: '窗口多长',
+  windowAdvanced: '窗口往前挪了', mediaSequence: '序号起点',
   pathMtu: '路上允许的包长', suggestion: '建议设成', mtu: '这块口的 MTU',
   lossAt: '丢在第几发',
   // 双栈那一步里 Happy Eyeballs 那几项
@@ -6316,7 +6590,9 @@ const TREE_FACT = {
 };
 
 // 布尔值在人话里必须带上「是谁给的」：direct=true 是「按表算着像直连」，不是「一定直连」。
-const TREE_YESNO = { direct: ['算直连', '不算直连'], goalSeen: ['见到了', '没见到'] };
+const TREE_YESNO = { direct: ['算直连', '不算直连'], goalSeen: ['见到了', '没见到'],
+  // 清单窗口那一格：★「一动不动」和「没问」是两件事，没问时后端根本不给这一栏。
+  windowAdvanced: ['往前挪了', '一片没换'] };
 
 function treeFactWord(k, v) {
   if (typeof v === 'boolean') {

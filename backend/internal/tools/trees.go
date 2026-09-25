@@ -253,6 +253,8 @@ var (
 		shows: []string{"values.manufacturer", "values.model", "values.profileCount", "values.mediaUri"}}
 
 	nRTSP = &treeNode{id: "stream", name: "问它肯不肯给流", tool: "media.rtsp.probe", need: []string{"url"},
+		when:   asksRTSP,
+		unless: "手里那个地址不是 rtsp:// 取流地址 —— 直连设备那一路这次问不着",
 		args: func(st *treeState) (map[string]any, error) {
 			m := map[string]any{"url": st.str("url")}
 			// 快问那一档把收流压到一秒半。★ 树是连着走几大步的，默认三秒 × 取流
@@ -271,7 +273,71 @@ var (
 		},
 		shows: []string{"values.status", "values.codec", "values.width",
 			"values.height", "values.trackCount", "values.transport", "values.rtp.bitrateKbps"}}
+
+	// nHLS 是同一问的另一半：手里那一路是**平台给**的（http 那一族的 m3u8）。
+	//
+	// ★★ 为什么不并到上面那一步：那一步只会说 RTSP，而「平台说这路没画面」中间隔着一层平台 ——
+	// 设备肯不肯给流，和平台这份清单此刻还写着什么，是两件事。
+	// 前缀分开两问，谁也不替谁；拿 http 地址去问 RTSP 只会得一句「端口回的不是 RTSP」。
+	nHLS = &treeNode{id: "hls", name: "拉平台那份清单", tool: "media.hls.probe",
+		need:   []string{"url"},
+		when:   asksHLS,
+		unless: "手里那个地址不是 http 那一族的清单地址 —— 平台清单这一问这次问不着",
+		args: func(st *treeState) (map[string]any, error) {
+			m := map[string]any{"url": st.str("url")}
+			// 树是连着走好几大步的，默认那四秒的观看窗口在这里就是让人多等两秒半。
+			// ★ 压到两秒仍然读得出「窗口挪了没有」—— 那一档的口径下限是一秒。
+			if st.args.Quick {
+				m["watchMs"] = 2000
+			}
+			// 账号只在发出去的那份参数里，进结果前由 redactTreeArgs 洗掉。
+			if u := st.args.Username; u != "" {
+				m["username"] = u
+			}
+			if p := st.args.Password; p != "" {
+				m["password"] = p
+			}
+			return m, nil
+		},
+		shows: []string{"values.httpStatus", "values.segmentCount", "values.windowSec",
+			"values.windowAdvanced", "values.mediaSequence", "values.bitrateKbps"}}
 )
+
+// streamScheme 一个取流地址用的是哪一族的前缀（小写，不含 ://）；认不出就给空。
+func streamScheme(u string) string {
+	i := strings.Index(u, "://")
+	if i <= 0 {
+		return ""
+	}
+	return strings.ToLower(u[:i])
+}
+
+// asksRTSP / asksHLS 把「验流」这一问按前缀分成两问。
+//
+// ★★ 判据只看前缀，不去挑路径里有没有 .m3u8：很多平台的清单地址根本没有扩展名
+//
+//	（/live/cam1/playlist，或者后面挂一串签名参数），拿扩展名当门槛会让这一问整个跳过，
+//	而「它回的根本不是清单」恰恰是这一问给得出的答案 —— 那是地址给错了，不是我们问不着。
+//
+// 地址整条都没填时返回 true，让 need 那一栏去说「缺 url」：拿「前缀不对」盖掉
+// 「压根没给地址」是假话 —— 那两条的下一步完全不同（一个是补参数，一个是换一族问法）。
+func asksRTSP(st *treeState) bool {
+	u := st.str("url")
+	if u == "" {
+		return true
+	}
+	s := streamScheme(u)
+	return s == "rtsp" || s == "rtsps"
+}
+
+func asksHLS(st *treeState) bool {
+	u := st.str("url")
+	if u == "" {
+		return true
+	}
+	s := streamScheme(u)
+	return s == "http" || s == "https"
+}
 
 // onvifStreamFor 把 ONVIF 问出来的取流地址翻译成下一步能直接发出去的那一句。
 //
@@ -978,14 +1044,29 @@ var planDeviceDown = &treePlan{symptom: symDeviceDown, steps: []planStep{
 			verdictONVIFNoRepl:    stop("cause-onvif-silent"),
 			verdictONVIFUnreach:   stop("cause-onvif-unreachable"),
 		},
-		// 问到了身份不等于下一步问得出去：ONVIF 也回 http 那一路的（各家都有），
-		//	而下一步只会说 RTSP。放它走过去只会得到「缺参数，没问出去」，
+		// 问到了身份不等于下一步问得出去：这一问只肯给 rtsp 那一路（onvifStreamFor 认这个前缀），
+		//	地址没落到事实里时，后面那两问都拼不出参数。放它们走过去只会得到「缺参数，没问出去」，
 		//	再落一句「每一步都正常」—— 那是把我们问不出来的那一格算成没毛病。
 		decide: func(st *treeState, code string, vals map[string]any) move {
 			if code == verdictONVIFOK && st.str("url") == "" {
 				return stop("cause-onvif-no-media")
 			}
-			return to("stream")
+			return to("hls")
+		},
+		other: to("hls")},
+	// 平台那一问：手里是 http(s) 地址才问得出去（前缀不对时这一步自己留「为什么没问」）。
+	{node: nHLS,
+		by: map[string]move{
+			verdictHLSOK:         stop("cause-hls-ok"),
+			verdictHLSStalled:    stop("cause-hls-stalled"),
+			verdictHLSSegMiss:    stop("cause-hls-segment-missing"),
+			verdictHLSEmpty:      stop("cause-hls-empty"),
+			verdictHLSTargetOver: stop("cause-hls-target-over"),
+			verdictHLSAuth:       stop("cause-hls-auth"),
+			verdictHLSNotFound:   stop("cause-hls-not-found"),
+			verdictHLSNotHLS:     stop("cause-hls-not-hls"),
+			verdictHLSUnreach:    stop("cause-hls-unreach"),
+			verdictHLSTimeout:    stop("cause-hls-timeout"),
 		},
 		other: to("stream")},
 	{node: nRTSP,
