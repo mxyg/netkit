@@ -1637,6 +1637,7 @@ var toolValues = map[string][]string{
 	"media.rtsp.probe":    {"codec", "width", "height", "trackCount", "status", "transport", "rtp", "measured", "measureNote"},
 	"media.onvif.info":    {"manufacturer", "model", "profileCount", "mediaUri", "steps"},
 	"media.hls.probe":     {"httpStatus", "segmentCount", "windowSec", "windowAdvanced", "mediaSequence", "bitrateKbps", "variants", "isLive", "sampled"},
+	"media.rtmp.probe":    {"connectCode", "connectReply", "playCode", "mediaBytes", "audioBytes", "videoBytes", "bitrateKbps", "keyFrames", "declaredWidth", "declaredHeight", "statusCodes", "reach", "looksLike", "stage", "handshakeMs", "server", "watchMs", "observedMs"},
 }
 
 func TestTreeShowsPathsExist(t *testing.T) {

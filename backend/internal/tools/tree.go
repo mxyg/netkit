@@ -177,6 +177,22 @@ var treeCauses = map[string]bool{
 	"cause-hls-not-hls":         true, // 回来的不是清单
 	"cause-hls-unreach":         true, // 连不上平台的这个口
 	"cause-hls-timeout":         true, // 连上了，到点没回话
+	// 手里那一路是**推上去的**（rtmp）：这一族问的是流到没到服务器，不是设备肯不肯给。
+	// ★ 最要紧的三条是 no-media / not-publishing / stream-absent ——
+	//
+	//	「服务器答应了可字节没来」「名字对可没人推」「压根没这个名字」下一步各不相同。
+	"cause-rtmp-ok":               true, // 在推：窗口里真收到媒体字节
+	"cause-rtmp-no-media":         true, // play 答应了却一个媒体字节都没到
+	"cause-rtmp-stream-absent":    true, // 这个名字上没有流：流名写错
+	"cause-rtmp-not-publishing":   true, // 名字认得，可此刻没人推
+	"cause-rtmp-app-only":         true, // 只问到应用认不认，这路在不在推没问
+	"cause-rtmp-app-rejected":     true, // connect 被拒（应用名不对 / 只肯收推流）
+	"cause-rtmp-auth":             true, // 被拒的理由是缺口令、key 或 token
+	"cause-rtmp-silent":           true, // 握手通了，命令发出去不回话
+	"cause-port-not-rtmp":         true, // 那个口接了 TCP 却不说 RTMP
+	"cause-rtmp-unreachable":      true, // TCP 就没连上
+	"cause-rtmp-handshake-silent": true, // 端口能连，握手那一句到点没回
+	"cause-rtmp-dropped":          true, // 问到一半它把连接断了
 
 	"cause-egress-blocked": true, // 路到得了出口那台机器，却连不上它那个口：拦在中间
 	"cause-wrong-scheme":   true, // 明文口写成 https（或反过来），改个前缀就好

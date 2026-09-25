@@ -24,7 +24,7 @@ import (
 // 注册进注册表的是它，装进排查路线的可选步骤也是它 ——
 // 否则新加一个工具忘了登记给路线，路线里就永远问不到它，而编译器不会提醒。
 var localTools = []ots.Tool{
-	interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, onvifInfoTool, neighborsTool, discoverTool, identifyTool,
+	interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, onvifInfoTool, hlsProbeTool, rtmpProbeTool, neighborsTool, discoverTool, identifyTool,
 	dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
 	fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
 	diagBundleTool, troubleshootTool,

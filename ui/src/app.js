@@ -3726,11 +3726,13 @@ async function renderDevice(root) {
 }
 
 // 三张卡是一条流水线，不是三个并列的工具：
-// 只有设备 IP → ONVIF 问出取流地址 → RTSP 验这路流到没到本机 → HLS 问平台那份清单还写着什么。
+// 只有设备 IP → ONVIF 问出取流地址 → RTSP 验这路流到没到本机 → HLS 问平台那份清单还写着什么
+// → RTMP 问反方向那一句：推上去的东西到没到服务器。
 async function renderStream(root) {
   root.appendChild(onvifCard());
   root.appendChild(rtspCard());
   root.appendChild(hlsCard());
+  root.appendChild(rtmpCard());
 }
 
 // ONVIF 这一张排在「取流探测」前面，不是随手放的：
@@ -4193,6 +4195,212 @@ const HLS_CODE = {
     + '把单次超时放宽到十秒再问一次；还是不通，就看那台服务器的负载和访问日志里有没有这一问 —— '
     + '日志里没有，就是没到这里。'],
 };
+
+// RTMP_CODE 是「推上去的那一路」的十二档。
+//
+// ★ 这一族的问题方向和上面几张卡是反的：RTSP / HLS 问的是「平台肯不肯把流给我」，
+//   这里问的是「推流端送上去的东西，到没到服务器」。所以最值钱的一档是
+//   rtmp-no-media —— 命令全通、状态码说好、码流却没过来，那一句「推流没到平台」说的就是它。
+const RTMP_CODE = {
+  'rtmp-ok': ['这路在推，码流真到了', 'ok',
+    '★ connect、createStream、play 三步全过，而且观测窗口里收到了媒体字节 —— 推流这一路是通的。'
+    + '看上面「实际码率」与推流端声明的差多少：差一半以上是链路上在丢或者服务器在限。'
+    + '平台还是没画面，问题在它后面那层（转分发、播放地址、播放器账号），用 HLS 那张卡接着往下问。'],
+  'rtmp-no-media': ['服务器说有这路，可一个媒体字节都没到', 'bad',
+    '★★ 命令全通、play 也答应了，唯独码流没过来 —— 「推流没到平台」在现场十有九就是这一档。'
+    + '先分清是「没推上来」还是「上来了却没转发给你」：在服务器本机问一次，本机有字节说明中间那道'
+    + '（NAT、防火墙、只放行命令口的策略）挡住了媒体；本机也没有，就是推流端在推一个空壳。'
+    + '★ 只给一秒窗口时，低帧率的事件触发流可能刚好一片都没落进来 —— 换成六秒再问一次，'
+    + '还是零字节才坐实「没推上来」。'],
+  'rtmp-stream-absent': ['这个名字上根本没有流', 'bad',
+    '★ 服务器直接回 StreamNotFound —— 和「有这路但没人推」是两回事，它是连找都没找到。'
+    + '核对流名：各家把参数算在名字里（?live=1、?key=xxx），少一段就是另一个流；'
+    + '也要确认推流端用的流名和平台这条通道的流名是同一个，别拿播放地址的流名去推。'],
+  'rtmp-stream-not-publishing': ['名字认得，可此刻没人往上面推', 'bad',
+    '★ 服务器知道这一路，但现在没人在推 —— 毛病在推流端那一头，不在这台服务器。'
+    + '去看相机 / OBS / 转推服务那台机器活不活、它的日志里有没有断线重连、它推的是不是这个地址。'
+    + '重启服务器没用：重启完还是没人推。'],
+  'rtmp-app-accepted': ['这台认这个应用，但「这路在不在推」没问', 'warn',
+    '★ 这一条不是好消息也不是坏消息：地址里没写流名，所以只问到 connect 那一步就停了。'
+    + '把地址补成 rtmp://主机/应用名/流名 再问一次 —— 差的那一段才是「有没有画面」的答案。'],
+  'rtmp-app-rejected': ['connect 被拒', 'bad',
+    '★ 握手做完了，可它不认这个应用。三种可能：应用名拼错（live / stream / openapi 各家不同）、'
+    + '这台只允许推不允许看、或者它按 vhost 分租户而这次没带。'
+    + '先抄平台给的原样地址；仍被拒就问平台「播放侧要不要单独开」。'],
+  'rtmp-auth-required': ['这台要凭据才给进', 'warn',
+    '★ 拒绝的理由写的是 key / token / 口令 —— 不是坏了，是问到了只是不给。'
+    + 'RTMP 的凭据有三种挂法：流名后面那段 ?key=、应用名那一段、或者 connect 参数里的 vhost。'
+    + '结果里「它说的那句」会指出是哪种，照那个位置补，别改地址前缀。'],
+  'rtmp-command-silent': ['握手通了，命令发出去到点不回话', 'bad',
+    '★★ 与「connect 被拒」下一步完全相反：被拒是它答了不给，沉默是它压根不答。'
+    + '多半是这台只肯收推流、对播放侧的命令直接丢弃，或者中间那台设备只放行握手那种小报文。'
+    + '换到服务器本机问一次：本机回话就是中间那道的问题。'],
+  'rtmp-not-rtmp': ['那个口接了 TCP，却不说 RTMP', 'bad',
+    '★ 端口开着、连接也建了，但对面回的不是 RTMP 握手 —— 结果里「看着像」那一格说了它像什么。'
+    + '常见的三种：1935 上跑的其实是 HTTP-FLV、端口号抄错撞上了 Web 管理页、'
+    + '或者这台只开了 TLS（要把前缀改成 rtmps://）。'],
+  'rtmp-unreachable': ['连不上那个口', 'bad',
+    '★ 先看 reach 那一栏：closed 是机器在、这个口上没服务（RTMP 服务没起，或端口不是 1935）；'
+    + 'filtered 是它一句都不答（防火墙只放行白名单 —— 相机与平台之间最常卡这一条）。'
+    + '这两种下一步完全不同，别并成「网络不通」。'],
+  'rtmp-timeout': ['端口能连上，可握手那一句到点没回', 'bad',
+    '★ TCP 建起来了，RTMP 握手却石沉大海 —— 这一档几乎不是「服务没起」（没起会直接拒），'
+    + '而是中间有东西只放行 TCP 三次握手、往下看都不看就丢，或者这台只对外地那几台地址答话。'
+    + '先去服务器本机问 127.0.0.1：本机通、外部不通，就是访问控制。'],
+  'rtmp-connection-lost': ['问到一半它把连接断了', 'bad',
+    '★ 连接建立、命令也发了，可它在答完之前就把连接关了。断之前问到什么是一道分界：'
+    + '收到 Play.Start 才断 —— 服务器不认这个客户端（版本、并发上限、单连接时长限制）；'
+    + 'connect 后面就断 —— 这台的白名单或频次限制把这一问踢了；什么都没收到就断 —— 中间那台在掐。'],
+};
+
+// rtmpCard 排在 HLS 后面，问的是这条流水线的**另一头**：
+// ★ 上面几张卡问的是「平台肯不肯把流给我」，这一张问的是「推流端送上去的东西到没到服务器」。
+//   两问的地址长得一样、落点完全相反，所以同页不同卡。
+function rtmpCard() {
+  const card = $(`<div class="card">
+    <h2>问一路 RTMP 推流 <span id="rm-top"></span></h2>
+    <p class="hint">问「相机 / OBS / 转推服务送上来的那一路，此刻到没到服务器」。这一问拆成五步：
+      端口通不通 → 是不是 RTMP 握手 → 应用认不认 → 这个流名上有没有流 → 有没有真的媒体字节过来
+      （在推的话顺手量出码率）。<b>只读</b>：只发 connect / createStream / play 三条命令，
+      ★ 绝不发 publish 那几条 —— 那是往别人服务器上挂一路流。口令与 key 只发出去，不进结果、不进日志。</p>
+    <div style="display:flex;gap:12px;align-items:flex-end">
+      <div style="flex:1"><label>推流地址（应用名是第一段，后面算流名）</label>
+        <input id="rm-u" placeholder="rtmp://192.168.1.20:1935/live/cam1"></div>
+      <div style="flex:0 0 190px"><label>收多久的媒体字节</label><select id="rm-w">
+        <option value="3000">三秒（默认）</option>
+        <option value="1000">一秒 —— 只确认在不在推</option>
+        <option value="6000">六秒 —— 低帧率的监控流</option>
+        <option value="10000">十秒 —— 事件触发的流</option>
+      </select></div>
+      <div style="flex:0 0 130px"><label>一步超时 ms</label><input id="rm-t" placeholder="5000"></div>
+    </div>
+    <details style="margin-top:8px"><summary class="dim">地址里没写全（应用名 / 流名分开填）、这台还要 vhost 或 key</summary>
+      <div class="row" style="margin-top:8px">
+        <div><label>应用名（填了覆盖地址里那一段）</label><input id="rm-app" placeholder="live"></div>
+        <div><label>流名（留空就只问「这台认不认这个应用」）</label><input id="rm-stream" placeholder="cam1"></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <div><label>vhost</label><input id="rm-vhost" autocomplete="off"></div>
+        <div><label>key / token</label><input id="rm-key" type="password" autocomplete="new-password"></div>
+      </div>
+      <p class="hint" style="margin-top:6px">★ 这两个值是发进 connect 命令里的，结果与日志里都不会出现 ——
+        但「这台要不要单独配 vhost」那一条信息会留下。地址里已经带了 ?key= 就别再填一遍。</p>
+    </details>
+    <div style="margin-top:12px"><button class="btn primary" id="rm-b">问一遍</button></div>
+    <div id="rm-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#rm-out');
+  const top = card.querySelector('#rm-top');
+  card.querySelector('#rm-b').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">正在问…（握手、三条命令，再收几秒码流，稍等）</div>';
+    const args = { url: card.querySelector('#rm-u').value.trim() };
+    const app = card.querySelector('#rm-app').value.trim();
+    const stream = card.querySelector('#rm-stream').value.trim();
+    if (app) args.app = app;
+    if (stream) args.stream = stream;
+    args.watchMs = Number(card.querySelector('#rm-w').value);
+    const t = Number(card.querySelector('#rm-t').value);
+    if (t) args.timeoutMs = t;
+    const cp = {};
+    const vhost = card.querySelector('#rm-vhost').value.trim();
+    const key = card.querySelector('#rm-key').value;
+    if (vhost) cp.vhost = vhost;
+    if (key) cp.key = key;
+    if (Object.keys(cp).length) args.connectParams = cp;
+    const r = await call('media.rtmp.probe', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
+    const d = rtmpDisplay(r);
+    top.innerHTML = `<span class="pill ${d.cls}">${esc(d.title)}</span>`;
+    out.innerHTML = rtmpResult(r);
+  };
+  return card;
+}
+
+// rtmpDisplay 把判定码翻成界面要说的那一句（标题、颜色、下一步的手）。
+//
+// ★ 窗口短于一秒那种「我们没问到」在卡片上就问不出来（最短给一秒），
+//   后端对这种问法直接在判定里写明，不在这里另起一套话。
+function rtmpDisplay(r) {
+  const raw = RTMP_CODE[r.verdict] || [r.verdict, '', ''];
+  return { title: raw[0], cls: raw[1], advice: raw[2] };
+}
+
+// rtmpSteps 五步流水线，每步只有三种说法：问到了 / 它不给 / 根本没问到。
+// ★★ 「没问到」必须自己占一格 —— 少问一步就给一句「都正常」，是这张卡最不能犯的错。
+function rtmpSteps(v, verdict) {
+  const mark = { on: '✓', bad: '✗', none: '—' };
+  const tail = { on: '', bad: '（它不给）', none: '（没问到）' };
+  const step = (label, st) => `<span class="dim" style="margin-right:12px">${mark[st]} ${label}${tail[st]}</span>`;
+  const tcp = v.stage === 'dial' ? 'bad' : 'on';
+  const hs = v.stage === 'handshake' ? 'bad' : (v.handshakeMs !== undefined ? 'on' : 'none');
+  const refused = v.connectLevel === 'error' || v.connectReply === '_error';
+  const app = refused ? 'bad' : (v.connectReply ? 'on' : 'none');
+  // 回包到了但不给这一路：状态码是「没有 / 没人推」时，这一步算它不给
+  const gone = ['rtmp-stream-absent', 'rtmp-stream-not-publishing', 'rtmp-no-media'].includes(verdict);
+  const play = !v.playCode ? 'none' : (gone ? 'bad' : 'on');
+  const media = v.mediaBytes === undefined ? 'none' : (Number(v.mediaBytes) > 0 ? 'on' : 'bad');
+  return step('端口', tcp) + step('握手', hs) + step('应用', app) + step('这一路', play) + step('码流', media);
+}
+
+function rtmpResult(r) {
+  const v = r.values || {};
+  const { cls, advice } = rtmpDisplay(r);
+  const dim = (x) => `<span class="dim">${x}</span>`;
+  const cells = [tCell('问的地址', `<code>${esc(v.url || '')}</code>`
+    + (v.app ? ` · ${dim('应用')} ${esc(v.app)}` : '')
+    + (v.stream ? ` · ${dim('流名')} <code>${esc(v.stream)}</code>` : '')
+    + (v.ignoredUserinfo ? `<br>${dim('★ 地址里写了 user:pass —— RTMP 没有 Basic 这一说，这一问没带上它')}` : '')
+    + (v.streamHasQuery ? `<br>${dim('★ 流名后面那段参数（已打码）是跟着 play 一起发出去的')}` : ''))];
+  cells.push(tCell('问到哪一步', rtmpSteps(v, r.verdict)));
+  const said = [];
+  if (v.handshakeMs !== undefined) said.push(`握手 ${esc(v.handshakeMs)} 毫秒`);
+  if (v.server) said.push(`它自报 ${esc(v.server)}`);
+  if (v.connectReply) said.push(`connect 回的是 ${esc(v.connectReply)}${v.connectCode ? ' · ' + esc(v.connectCode) : ''}`);
+  if (v.playCode) said.push(`play 回的是 ${esc(v.playCode)}`);
+  if (v.stage) said.push(dim(`停在「${esc(v.stage)}」这一步`));
+  if (v.reach) said.push(dim(v.reach === 'closed' ? '端口明确拒绝（主机在，这个口没服务）' : '没有任何回应'));
+  if (v.looksLike) said.push(dim(`那一段看着像 ${esc(v.looksLike)}`));
+  if (v.firstBytes) said.push(dim(`头几个字节 ${esc(v.firstBytes)}`));
+  if (said.length) cells.push(tCell('它答的', said.join(' · ')));
+  if ((v.statusCodes || []).length) {
+    cells.push(tCell('这一路上收到过的状态', (v.statusCodes || []).map(esc).join(' · ')));
+  }
+  if (v.mediaBytes !== undefined) {
+    cells.push(tCell('窗口里到的码流', [
+      `${(v.mediaBytes || 0).toLocaleString()} 字节`,
+      `音频 ${(v.audioBytes || 0).toLocaleString()} · 视频 ${(v.videoBytes || 0).toLocaleString()}`,
+      `${v.messages ?? 0} 条消息`,
+      v.keyFrames ? `${esc(v.keyFrames)} 个关键帧` : dim('一个关键帧都没数到'),
+      `等了 ${esc(v.observedMs ?? 0)} / ${esc(v.watchMs ?? 0)} 毫秒`,
+    ].filter(Boolean).join(' · ')
+      + (v.observedShort ? `<br>${dim('★ 没等满窗口（它提前断了），这个码率的分母比要的那几秒短')}` : '')));
+  }
+  if (v.bitrateKbps) {
+    cells.push(tCell('实际码率', `${esc(v.bitrateKbps)} kbps · ${dim(esc(v.bitrateBasis || ''))}`));
+  }
+  const declared = [];
+  if (v.declaredWidth) declared.push(`${esc(v.declaredWidth)}×${esc(v.declaredHeight ?? '?')}`);
+  if (v.declaredFps) declared.push(`${esc(v.declaredFps)} 帧/秒`);
+  if (v.declaredVideoCodec) declared.push(esc(v.declaredVideoCodec));
+  if (v.declaredVideoKbps) declared.push(`视频 ${esc(v.declaredVideoKbps)} kbps`);
+  if (v.declaredAudioKbps) declared.push(`音频 ${esc(v.declaredAudioKbps)} kbps`);
+  if (declared.length) {
+    cells.push(tCell('推流端自己声明的', declared.join(' · ')
+      + (v.bitrateKbps && v.declaredVideoKbps && Number(v.bitrateKbps) * 2 < Number(v.declaredVideoKbps)
+        ? `<br>${dim('★ 实测不到声明的一半 —— 到了，但没按它说的速率过来')}` : '')));
+  }
+  for (const [k, label] of [['connectDetail', '它说的那句'], ['playDetail', '它对这一路说的那句'],
+    ['detail', '原文那一错']]) {
+    if (v[k]) cells.push(tCell(label, dim(esc(v[k]))));
+  }
+  const note = r.note && r.verdict !== 'rtmp-ok'
+    ? `<p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>` : '';
+  return `<table>${cells.join('')}</table>${note}`
+    + (advice ? adviceBox(cls, esc(advice)) : '')
+    + `<details style="margin-top:10px"><summary class="dim">原始结果</summary>`
+    + `<pre>${esc(JSON.stringify(r.raw || r.values || {}, null, 2))}</pre></details>`;
+}
 
 function subnetScanCard() {
   const card = $(`<div class="card">
@@ -6274,7 +6482,7 @@ const TREE_CODE_OF = {
   trace: [TRACE_CODE], mtr: [MTR_CODE], clock: [TIME_CODE], tcp: [PROBE_CODE],
   ports: [SCAN_CODE], 'on-link': [SUBNET_CODE], tls: [CERT_CODE],
   http: [HTTP_CODE], mtu: [MTU_CODE], stream: [RTSP_CODE], onvif: [ONVIF_CODE],
-  hls: [HLS_CODE],
+  hls: [HLS_CODE], rtmp: [RTMP_CODE],
 };
 
 // 树里问到的那一步没给出话术时，只回落到码本身 —— 不许在这儿编一句人话顶上：
@@ -6525,6 +6733,54 @@ const TREE_CAUSE = {
     'TCP 是建起来了，问一句清单过去半天不回。★ 平台的清单接口挂住了：'
     + '它自己在等上游、或者后端取流慢把接口一起拖死。换个时段再问一次，'
     + '同时问一段平台上别的路 —— 别的路也这样就是平台，只有这一路就是这路。'],
+  'cause-rtmp-ok': ['推上来这一路是好的，字节真到了服务器', 'ok',
+    '★ 这一问的落点是「服务器已经收到码流了」—— 那么画面上没有，毛病在它后面那一层：'
+    + '平台的转发 / 分发（HLS、WebRTC 那几路是各自起的）、播放端用的地址与账号、'
+    + '或者域名解析到的不是这台。顺带看结果里声明码率与实测码率差多少，差一半是链路在丢。'],
+  'cause-rtmp-no-media': ['服务器说有这路、play 也答应了，可一个媒体字节都没到', 'bad',
+    '★★ 这是 RTMP 这一问最值钱的一档，也是最容易被读成「正常」的一档：命令全部通、'
+    + '状态码是 Play.Start，唯独码流没过来。十有八九是推流端与服务器之间的中间那道 NAT / 防火墙'
+    + '只放行了 1935 上的命令，媒体从另一个口或者另一条连接走（SRS、nginx-rtmp 都有这种配法）。'
+    + '先让推流端在服务器本机跑一次：本机有字节 = 中间那道挡了，本机也没有 = 推流端在推空壳。'],
+  'cause-rtmp-stream-absent': ['这个名字上根本没有流', 'bad',
+    '★ 服务器直接回 StreamNotFound —— 它连找都没找到，和「找到了但没人推」是两回事。'
+    + '核对推流地址与播放地址上的流名：各家服务器带参数（?live=1、?key=）时那一段也算名字的一部分，'
+    + '少一段就是另一个流。'],
+  'cause-rtmp-not-publishing': ['名字认得，可此刻没人往上面推', 'bad',
+    '★ 服务器知道这一路（配置里写着、或者以前推过），现在没人在推 —— 问题在推流端那一头，'
+    + '不在服务器。看相机 / OBS / 转推服务那台机器活没活、它的推流日志有没有断线重连，'
+    + '再看它推的是不是这个地址。别在服务器上重启：重启完还是没人推。'],
+  'cause-rtmp-app-only': ['只问到「这台认不认这个应用」，这路在不在推根本没问', 'warn',
+    '★ 这一条不是好消息也不是坏消息：地址里没写流名，所以探测只发到 connect 那一步就停了。'
+    + '把地址补成 rtmp://主机/应用名/流名 再问一次，才问得出「这一路此刻有没有码流」。'],
+  'cause-rtmp-app-rejected': ['connect 被拒 —— 应用名不对，或这台只肯收推流', 'bad',
+    '★ 握手做完了，可它不认这个应用。三种可能：应用名拼错（live、stream、openapi 各家不同）、'
+    + '这台服务器只允许推不允许看（很多 nginx-rtmp 默认就这样）、或者它按 vhost 分租户而这次没带。'
+    + '先抄平台给的原样地址，别手敲；仍被拒就问平台要「播放侧要不要单独开」。'],
+  'cause-rtmp-auth': ['这台要凭据才给进', 'warn',
+    '★ 拒绝的理由写的是 key / token / 口令不对 —— 不是坏了，是问到了只是不给。'
+    + 'RTMP 的凭据有三种落点：挂在流名后面的 ?key=、挂在应用名上、或者进 connect 参数里的 vhost。'
+    + '结果里「拒绝原文」那一格说了它要哪一种，照那个位置补。'],
+  'cause-rtmp-silent': ['握手通了，命令发出去到点不回话', 'bad',
+    '★★ 这一档和「connect 被拒」的下一步完全相反：被拒是它答了「不给」，沉默是它压根不答。'
+    + '多半是这台只肯收推流、对播放侧的命令直接丢弃（不少只做单向转推的服务器就这样），'
+    + '或者中间那台设备只放行了握手那种小报文。换到服务器本机问一次，本机有回话就是中间那道。'],
+  'cause-port-not-rtmp': ['那个口接了 TCP，却不说 RTMP', 'bad',
+    '★ 端口是开的、连接也建了，但对面回的不是 RTMP 握手 —— 结果里 looksLike 那一栏说了它像什么。'
+    + '最常见的三种：1935 上配的其实是 HTTP-FLV（那就用 HLS / HTTP 那一张卡去问）、'
+    + '端口号抄错撞上了 Web 管理页、或者这台只开了 TLS（rtmps://）。'],
+  'cause-rtmp-unreachable': ['连不上推流服务器的那个口', 'bad',
+    '★ 先看结果里 reach 那一栏：closed 是机器在、这个口上没服务（RTMP 服务没起，或者端口不是 1935）；'
+    + 'filtered 是它一句都不答（防火墙只放行了白名单，相机与平台之间最常卡这一条）。'
+    + '这两种下一步完全不同，别并成「网络不通」。'],
+  'cause-rtmp-handshake-silent': ['端口能连上，可握手那一句到点没回', 'bad',
+    '★ TCP 建起来了，RTMP 握手却石沉大海 —— 这一档几乎不是「服务没起」（没起会直接拒），'
+    + '而是中间有东西只放行 TCP 三次握手、往下看都不看就丢，或者这台只对外地那几台地址答话。'
+    + '先去服务器本机问 127.0.0.1：本机通、外部不通，就是访问控制而不是推流端。'],
+  'cause-rtmp-dropped': ['问到一半它把连接断了', 'bad',
+    '★ 连接建立、命令也发了，可它在答完之前就把连接关了。结果里「断之前问到什么」那一格是分界的依据：'
+    + '收到 Play.Start 才断 —— 服务器不认这个客户端（版本、并发数、单连接时长限制）；'
+    + 'connect 后面就断 —— 这台的白名单 / 频次限制把这一问踢了；什么都没收到就断 —— 中间那台设备在掐。'],
   'cause-stream-auth': ['问到了，只是不让看', 'warn',
     '★ 401 不是设备坏了，是它答了并且认得这个请求。核对账号密码，再确认这个账号'
     + '对该通道有取流权限 —— 现场十次有八次是权限而不是密码。'],

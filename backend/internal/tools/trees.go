@@ -301,7 +301,43 @@ var (
 		},
 		shows: []string{"values.httpStatus", "values.segmentCount", "values.windowSec",
 			"values.windowAdvanced", "values.mediaSequence", "values.bitrateKbps"}}
+
+	// nRTMP 是「验流」这一问的第三族：手里那一路是**推上去**的（相机 / OBS / 平台转推）。
+	//
+	// ★★ 为什么不并到 RTSP 那一步：那一步问的是「摄像机肯不肯把流给出来」，
+	// 而 RTMP 这一路问的是「推上去的流到没到服务器」—— 方向相反，落点也相反：
+	// RTSP 问到没流通常是通道号写错，RTMP 问到没流通常是推流端压根没上来。
+	// 拿 RTSP 的问法去问 1935 只会得一句「那个口不说 RTSP」。
+	nRTMP = &treeNode{id: "rtmp", name: "问推流到没到服务器", tool: "media.rtmp.probe",
+		need:   []string{"url"},
+		when:   asksRTMP,
+		unless: "手里那个地址不是 rtmp 那一族 —— 推流到没到这一问这次问不着",
+		args: func(st *treeState) (map[string]any, error) {
+			m := map[string]any{"url": st.str("url")}
+			// 树是连着走好几大步的：默认那三秒的观测窗口在这里压到两秒。
+			// ★ 两秒仍然是问得出「有没有媒体字节」的口径下限，再短就要开始说「别下结论」了。
+			if st.args.Quick {
+				m["watchMs"] = 2000
+			}
+			return m, nil
+		},
+		shows: []string{"values.connectCode", "values.playCode", "values.mediaBytes",
+			"values.bitrateKbps", "values.declaredWidth", "values.declaredHeight"}}
 )
+
+// asksRTMP 认 rtmp 与 rtmps 两个前缀。
+//
+// ★ 地址整条没填时返回 false：这三族里 RTMP 不是默认那一问 ——
+//
+//	没填地址的现场十有九是取流（RTSP），把 RTMP 摆在前头只会白问一句「没给地址」。
+func asksRTMP(st *treeState) bool {
+	u := st.str("url")
+	if u == "" {
+		return false
+	}
+	s := streamScheme(u)
+	return s == "rtmp" || s == "rtmps"
+}
 
 // streamScheme 一个取流地址用的是哪一族的前缀（小写，不含 ://）；认不出就给空。
 func streamScheme(u string) string {
@@ -1067,6 +1103,23 @@ var planDeviceDown = &treePlan{symptom: symDeviceDown, steps: []planStep{
 			verdictHLSNotHLS:     stop("cause-hls-not-hls"),
 			verdictHLSUnreach:    stop("cause-hls-unreach"),
 			verdictHLSTimeout:    stop("cause-hls-timeout"),
+		},
+		other: to("rtmp")},
+	// 推流那一路：手里是 rtmp 地址才问得出去（前缀不对时这一步自己留「为什么没问」）。
+	{node: nRTMP,
+		by: map[string]move{
+			verdictRTMPOk:            stop("cause-rtmp-ok"),
+			verdictRTMPNoMedia:       stop("cause-rtmp-no-media"),
+			verdictRTMPStreamAbsent:  stop("cause-rtmp-stream-absent"),
+			verdictRTMPNotPublishing: stop("cause-rtmp-not-publishing"),
+			verdictRTMPAppAccepted:   stop("cause-rtmp-app-only"),
+			verdictRTMPAppRejected:   stop("cause-rtmp-app-rejected"),
+			verdictRTMPAuth:          stop("cause-rtmp-auth"),
+			verdictRTMPCmdSilent:     stop("cause-rtmp-silent"),
+			verdictRTMPNotRTMP:       stop("cause-port-not-rtmp"),
+			verdictRTMPUnreachable:   stop("cause-rtmp-unreachable"),
+			verdictRTMPTimeout:       stop("cause-rtmp-handshake-silent"),
+			verdictRTMPDropped:       stop("cause-rtmp-dropped"),
 		},
 		other: to("stream")},
 	{node: nRTSP,
