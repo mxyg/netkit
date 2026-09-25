@@ -3871,8 +3871,16 @@ function rtspCard() {
     <p class="hint">问一个 RTSP 地址「这里有一路流吗」。读的是它的应答（SDP），
       ★ 不解码、不放画面、不装任何播放器 —— 所以它答的是「设备肯不肯给流、给的是什么规格」，
       图像本身好不好看不归它管。</p>
-    <label>取流地址</label>
-    <input id="rt-u" placeholder="rtsp://192.168.1.64:554/cam/realmonitor?channel=1&subtype=0">
+    <div style="display:flex;gap:12px;align-items:flex-end">
+      <div style="flex:1"><label>取流地址</label>
+        <input id="rt-u" placeholder="rtsp://192.168.1.64:554/cam/realmonitor?channel=1&subtype=0"></div>
+      <div style="flex:0 0 160px"><label>实收听多久</label><select id="rt-w">
+        <option value="3000">三秒（默认）</option>
+        <option value="6000">六秒 —— 起流慢的设备</option>
+        <option value="10000">十秒 —— 慢到可疑</option>
+        <option value="0">不听，只问参数</option>
+      </select></div>
+    </div>
     <div style="margin-top:12px"><button class="btn primary" id="rt-b">探测</button></div>
     <div id="rt-out" style="margin-top:14px"></div>
   </div>`);
@@ -3882,7 +3890,8 @@ function rtspCard() {
     top.innerHTML = '';
     out.innerHTML = '<div class="empty">探测中…</div>';
     const u = card.querySelector('#rt-u').value.trim();
-    const r = await call('media.rtsp.probe', { url: u });
+    const w = Number(card.querySelector('#rt-w').value);
+    const r = await call('media.rtsp.probe', { url: u, measureMs: w });
     if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message)}</div>`; return; }
     const [title, cls, advice] = RTSP_CODE[r.verdict] || [r.verdict, '', ''];
     top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
@@ -3897,9 +3906,42 @@ function rtspCard() {
       ${tCell('问的地址', `<code>${esc(v.url || u)}</code>`)}
       ${tCell('连的端', `<code>${esc(v.target || '')}</code>${v.status ? ` · 应答 ${v.status}` : ''}`)}
       ${rows ? `<tr><th>轨</th><th>编码</th><th>规格（分辨率 / 帧率）</th></tr>${rows}` : tCell('轨', '<span class="dim">应答里没有媒体描述</span>')}
-    </table>${note}${advice ? adviceBox(cls, esc(advice)) : ''}`;
+    </table>${rtpBlock(v)}${note}${advice ? adviceBox(cls, esc(advice)) : ''}`;
   };
   return card;
+}
+
+// 实收那一格和上面那张「规格表」是两问：那张是设备**说**它打算发什么，
+// 这一格是这几秒里盒子里**真到了**什么。★ 没量到就只留一句为什么，
+// 绝不能拿一个 0 顶上去 —— 「没收到」和「收到 0 码率」是两个不同的下一步。
+function rtpBlock(v) {
+  const r = v.rtp;
+  if (!r) {
+    const why = v.measureNote || (v.measured === false ? '这一次没收流' : '');
+    // 「换了路子」这一句量没量到都得露：只在有读数时才显示，
+    // 就把「UDP 没谈成」那一格悄悄抹掉了，而那正是下一步要看的。
+    const switched = v.transportNote ? `<p class="dim" style="margin:6px 0 0">${esc(v.transportNote)}</p>` : '';
+    return why ? `<p class="dim" style="margin:10px 0 0">实际收到：${esc(why)}</p>${switched}` : '';
+  }
+  const has = (x) => x !== undefined && x !== null && x !== 0;
+  const loss = has(r.lostPackets)
+    ? `${r.lostPackets} 包（${r.lossPercent}%）`
+    : (r.lossNote ? `<span class="dim">${esc(r.lossNote)}</span>` : '一个没丢');
+  const cells = [
+    ['收流走的口子', (v.transport === 'udp' ? 'UDP' : 'TCP 交织') + ` · ${r.measuredMs} 毫秒里到了 ${r.packets} 包`],
+    ['实际码率', has(r.bitrateKbps) ? `${r.bitrateKbps} kbps（只按载荷字节算）` : '<span class="dim">窗口太短，没算</span>'],
+    ['到达帧率', has(r.receivedFps) ? `${r.receivedFps} fps（数的是 marker 位，一帧的最后一包）` : '<span class="dim">没算</span>'],
+    ['丢包', loss],
+    ['乱序 / 重复', `${r.reordered || 0} / ${r.duplicates || 0}`],
+    ['关键帧', has(r.keyframes) ? `${r.keyframes} 张` + (has(r.keyframeEveryMs) ? ` · 隔 ${r.keyframeEveryMs} 毫秒一张` : '')
+      : '<span class="dim">这路编码认不出关键帧，只数了包</span>'],
+  ];
+  const why = (v.measureNote || r.rateNote || '')
+    ? `<p class="dim" style="margin:6px 0 0">${esc(v.measureNote || r.rateNote)}</p>` : '';
+  const other = (r.measureNotes || []).map((x) => `<p class="dim" style="margin:6px 0 0">${esc(x)}</p>`).join('');
+  const switched = v.transportNote ? `<p class="dim" style="margin:6px 0 0">${esc(v.transportNote)}</p>` : '';
+  return `<p class="hint" style="margin:14px 0 4px">实际收到 —— 这一段是量出来的，不是设备说的</p>
+    <table>${cells.map(([k, val]) => tCell(k, val)).join('')}</table>${why}${switched}${other}`;
 }
 
 const RTSP_CODE = {
@@ -3907,6 +3949,12 @@ const RTSP_CODE = {
     '★ 设备肯给流，上面这些轨就是它能给的全部规格。接进平台前对一下编码和分辨率是不是要的那路码流——主码流/子码流常常只差路径里的一位数字。'],
   'stream-no-media': ['回了 200，但一轨媒体都没有', 'bad',
     '★ 连上、认证都过了，这条路径上却没配出码流 —— 不是下游的问题。去设备那侧看这个通道有没有启用（很多相机加完通道默认不开子码流），再把路径里的通道号 / 码流类型对一遍。'],
+  'stream-no-data': ['它答应给流，可一个包都没来', 'bad',
+    '★ 轨是有的、账号是过了、PLAY 也回了 200 —— 前面那几步全都对，唯独码流没到本机。'
+    + '先确认这台设备让不让第二路取流（多数型号只开一路，平台正在拉流时它就这么答）；'
+    + '再分清是哪一路没通：走 UDP 时收流用的是本机一批临时偶数口，'
+    + '隔了 NAT 或防火墙只看已知服务口，包就回不来 —— 换 TCP 交织再问一次，'
+    + 'TCP 那一路要能收到，就是那批 UDP 口被挡了，不是设备没发。'],
   'auth-required': ['要账号密码', 'warn',
     '★ 401 不是设备坏了，是问到了、只是不让看。先核对账号密码，再确认这个账号有没有该通道的取流权限（NVR 上不同用户开的通道不一样）。'],
   'not-found': ['这个路径没有流', 'bad',
@@ -5972,6 +6020,12 @@ const TREE_CAUSE = {
     '连上、认证都过了，DESCRIBE 的应答里一条媒体轨都没有 —— 这不是「拉不到画面」，'
     + '是设备上那一通道根本没出码流。去设备那侧确认通道已启用、码流（主/子）已配置，'
     + '再换一条路径问一次。'],
+  'cause-stream-no-data': ['它答应给流，可一个包都没来', 'bad',
+    '★ 轨有、账号过、PLAY 也回了 200 —— 前面几步全对，唯独码流没到本机。'
+    + '先确认这台让不让第二路取流（多数型号只开一路，平台正在拉时它就这么答）；'
+    + '再分清是哪一路没通：走 UDP 时收流用的是本机一批临时偶数口，'
+    + '隔了 NAT 或防火墙只看已知服务口，包就回不来 —— 换 TCP 交织再问一次，'
+    + 'TCP 收得到就是那批 UDP 口被挡，不是设备没发。'],
   'cause-stream-ok': ['流在播，「没画面」是那头的显示侧', 'warn',
     '★ 这一条的作用是把人从设备前叫走：它肯给流、编码和分辨率都对。'
     + '查客户端的解码能力、播放器那边收没收到、或者平台有没有把这路转发出去。'],
@@ -5994,6 +6048,7 @@ const TREE_FACT = {
   family: '地址族', hopsSeen: '见到几跳', engine: '用什么测的',
   lossHop: '丢包从第几跳起', latencyHop: '变慢从第几跳起', goalSeen: '见到终点',
   roundsDone: '跑完几轮', target: '问的是', open: '开着的口', closed: '关着的口',
+  transport: '收流走的口子', bitrateKbps: '实际码率',
   filtered: '一个都没回', scanned: '扫了几个口', openPorts: '开着的端口清单',
   subnets: '扫的网段', alive: '在有几台', asked: '问了几个地址', hosts: '清单',
   notAfter: '到期时间', notBefore: '生效时间', issuer: '签发者', subject: '证书上的名字',

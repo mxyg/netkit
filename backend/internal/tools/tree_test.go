@@ -1421,7 +1421,7 @@ var toolValues = map[string][]string{
 	"net.http.probe":      {"status", "timings", "url"},
 	"net.time.check":      {"offsetMs", "checkedWith", "agreeSources", "attribution"},
 	"net.mtu.path":        {"pathMtu", "suggestion", "egress", "egressUnknown", "carriesAtLeast", "localMtuLimited", "steps", "warning", "dfVerified"},
-	"media.rtsp.probe":    {"codec", "width", "height", "trackCount", "status"},
+	"media.rtsp.probe":    {"codec", "width", "height", "trackCount", "status", "transport", "rtp", "measured", "measureNote"},
 	"media.onvif.info":    {"manufacturer", "model", "profileCount", "mediaUri", "steps"},
 }
 
@@ -1579,6 +1579,40 @@ func TestTreeStreamHasNoMediaTrack(t *testing.T) {
 	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31", URL: "rtsp://192.0.2.31/live"})
 	if v.Code != "cause-stream-broken" {
 		t.Fatalf("顶层 = %s，想要 cause-stream-broken", v.Code)
+	}
+}
+
+// ★ 「设备肯给流」和「设备肯给流但码流没来」是两个不同的下一步：
+// 前者去看下游显示，后者去查这台让不让第二路取流、以及收流的 UDP 口回不回得来。
+func TestTreeStreamAnswersButNoData(t *testing.T) {
+	codes := everythingOK()
+	codes["media.rtsp.probe"] = []string{verdictStreamNoData}
+	fakeTools(t, codes, map[string]map[string]any{
+		"net.dns.query":    answers("192.0.2.31"),
+		"net.subnet.scan":  hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":   {"open": 1},
+		"media.rtsp.probe": {"status": "200", "transport": "udp", "measured": false},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31", URL: "rtsp://192.0.2.31/live"})
+	if v.Code != "cause-stream-no-data" {
+		t.Fatalf("顶层 = %s，想要 cause-stream-no-data；推理路径：%v", v.Code, stepsOf(t, v))
+	}
+}
+
+// 快问那一档不许把收流整段跳掉：跳掉了就没有「答应了却没发」这一档可停。
+func TestTreeStreamMeasuresEvenWhenQuick(t *testing.T) {
+	codes := everythingOK()
+	tracker := fakeTools(t, codes, map[string]map[string]any{
+		"net.dns.query":    answers("192.0.2.31"),
+		"net.subnet.scan":  hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":   {"open": 1},
+		"media.rtsp.probe": {"status": "200", "transport": "udp", "measured": true},
+	})
+	runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31", URL: "rtsp://192.0.2.31/live", Quick: true})
+	got := tracker["media.rtsp.probe"].args[0]
+	if fmt.Sprint(got["measureMs"]) != "1500" {
+		sent, _ := json.Marshal(got)
+		t.Errorf("快问那一档把收流压成多少不对：%s", sent)
 	}
 }
 

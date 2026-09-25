@@ -156,6 +156,7 @@ var treeCauses = map[string]bool{
 	"cause-stream-missing":    true, // 设备答了，但这个通道上没有这路流
 	"cause-stream-broken":     true, // 认证都过了，应答里却没一条媒体轨：那路流在设备上没配出来
 	"cause-stream-ok":         true, // 流在播 —— 「没画面」是那头的显示侧
+	"cause-stream-no-data":    true, // PLAY 答应了，一段时间里一个 RTP 包都没来
 	// 「我只有这台设备，取流地址是多少」—— ONVIF 那一问的六种落点各有各的下一步
 	"cause-onvif-no-profile":  true, // 媒体服务答得清楚：一条码流都没配
 	"cause-onvif-auth":        true, // 设备要账号才肯说地址

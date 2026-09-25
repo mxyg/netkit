@@ -255,6 +255,11 @@ var (
 	nRTSP = &treeNode{id: "stream", name: "问它肯不肯给流", tool: "media.rtsp.probe", need: []string{"url"},
 		args: func(st *treeState) (map[string]any, error) {
 			m := map[string]any{"url": st.str("url")}
+			// 快问那一档把收流压到一秒半。★ 树是连着走几大步的，默认三秒 × 取流
+			// 会让人在旁边干等；一秒半仍够折算码率（口径下限是 0.2 秒的窗口）。
+			if st.args.Quick {
+				m["measureMs"] = 1500
+			}
 			// 账号只在发出去的那份参数里，进结果前由 redactTreeArgs 洗掉。
 			if u := st.args.Username; u != "" {
 				m["username"] = u
@@ -265,7 +270,7 @@ var (
 			return m, nil
 		},
 		shows: []string{"values.status", "values.codec", "values.width",
-			"values.height", "values.trackCount"}}
+			"values.height", "values.trackCount", "values.transport", "values.rtp.bitrateKbps"}}
 )
 
 // onvifStreamFor 把 ONVIF 问出来的取流地址翻译成下一步能直接发出去的那一句。
@@ -985,8 +990,11 @@ var planDeviceDown = &treePlan{symptom: symDeviceDown, steps: []planStep{
 		other: to("stream")},
 	{node: nRTSP,
 		by: map[string]move{
-			verdictStreamOK:     stop("cause-stream-ok"), // ★ 流在播：那「没画面」是那头的显示侧，不是这台设备
-			verdictStreamNoMed:  stop("cause-stream-broken"),
+			verdictStreamOK:    stop("cause-stream-ok"), // ★ 流在播：那「没画面」是那头的显示侧，不是这台设备
+			verdictStreamNoMed: stop("cause-stream-broken"),
+			// 轨有、认证过、PLAY 也答应，包却一个没来 —— 这一档前面几步都问不出来，
+			// 只有真收一会儿才分得开「设备在播」和「设备让取流但没发」。
+			verdictStreamNoData: stop("cause-stream-no-data"),
 			verdictAuthRequired: stop("cause-stream-auth"),
 			verdictNotFound:     stop("cause-stream-missing"),
 			// 到这一步前面已经问过「这台活着吗」和「那个口静默还是有声」，所以这两个码各有归属：

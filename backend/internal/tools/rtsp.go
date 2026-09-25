@@ -29,11 +29,13 @@ import (
 //	stream-no-media 认证过了、也回了 200，可应答里没有一条媒体轨 —— 这路流没配出来
 //	auth-required   要认证，没给或给错了 —— 十有八九是密码错，不是网络问题
 //	not-found       连上了、认证过了，但这个路径没有流 —— 通道号/路径写错了
+//	stream-no-data  轨有、SETUP 与 PLAY 也都要到了，可一段时间里一个 RTP 包都没到
 //	no-response     TCP 连上了，RTSP 不回话 —— 对面开着端口但不是 RTSP，或者卡死了
 //	unreachable     连都连不上
 const (
 	verdictStreamOK     = "stream-ok"
 	verdictStreamNoMed  = "stream-no-media"
+	verdictStreamNoData = "stream-no-data"
 	verdictAuthRequired = "auth-required"
 	verdictNotFound     = "not-found"
 	verdictNoResponse   = "no-response"
@@ -43,10 +45,11 @@ const (
 var rtspProbeTool = ots.Tool{
 	Name:  "media.rtsp.probe",
 	Class: ots.ClassRead,
-	Summary: "探测一路 RTSP 流：拿编码格式、**分辨率**、帧率、通道数。" +
-		"走 OPTIONS/DESCRIBE 取 SDP，再解 H.264/H.265 的 SPS 得到真实分辨率 —— " +
-		"不依赖 ffmpeg，也不解码。支持 Basic 与 Digest 认证。" +
-		"★ 现场最常用的一条：判断相机实际出的是多大分辨率，" +
+	Summary: "探测一路 RTSP 流：拿编码格式、**分辨率**、帧率、通道数，" +
+		"再实际收一小段流，量出**实际码率、到达帧率、RTP 丢包、关键帧间隔**。" +
+		"走 DESCRIBE 取 SDP、解 H.264/H.265 的 SPS 得到真实分辨率，" +
+		"再 SETUP+PLAY 收几秒 RTP 数包 —— 不依赖 ffmpeg，也不解码。支持 Basic 与 Digest 认证。" +
+		"★ 现场最常用的一条：判断相机实际出的是多大分辨率、实际发没发、" +
 		"以及它和下游（盒子/平台）的预期对不对得上。",
 	Schema: json.RawMessage(`{
 	  "type": "object",
@@ -58,7 +61,9 @@ var rtspProbeTool = ots.Tool{
 	    "username": {"type": "string", "description": "用户名。地址里已经带了就不用填。"},
 	    "password": {"type": "string", "description": "密码。地址里已经带了就不用填。"},
 	    "timeoutMs": {"type": "integer", "minimum": 500, "maximum": 60000,
-	      "description": "超时毫秒数，默认 5000。"}
+	      "description": "一问一答的超时毫秒数，默认 5000。"},
+	    "measureMs": {"type": "integer", "minimum": 0, "maximum": 10000,
+	      "description": "收多久的流来量实际码率、到达帧率、丢包与关键帧间隔，默认 3000。填 0 只问参数、不收流（设备只允许一路取流、或者不想打断现网播放时用）。"}
 	  }
 	}`),
 	Invoke: probeRTSP,
@@ -69,6 +74,8 @@ type rtspArgs struct {
 	Username  string `json:"username,omitempty"`
 	Password  string `json:"password,omitempty"`
 	TimeoutMS int    `json:"timeoutMs,omitempty"`
+	// MeasureMS 是指针：没填（默认收 3 秒）和特意填 0（不收流）是两回事。
+	MeasureMS *int `json:"measureMs,omitempty"`
 }
 
 // track 一路媒体轨。
@@ -85,6 +92,11 @@ type track struct {
 	// ★ 解不出分辨率不等于整条探测失败 —— 流可能确实是通的，只是没给参数集。
 	//   这时候要如实说「没拿到」，不是编一个数。
 	ParamsNote string `json:"paramsNote,omitempty"`
+
+	// 下面三项是 SETUP+PLAY 收流要用的，不是给人看的那一份（小写开头 = 不进 JSON）。
+	ctl   string // a=control 的那一段，SETUP 的地址就拼在它身上
+	pt    string // 载荷类型，rtpmap/fmtp 都按它对齐
+	clock int    // SDP 给的时钟频率，收流折算关键帧间隔要用
 }
 
 func probeRTSP(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -127,11 +139,18 @@ func probeRTSP(ctx context.Context, raw json.RawMessage) (any, error) {
 		}
 	}
 
-	timeout := time.Duration(a.TimeoutMS) * time.Millisecond
-	if timeout <= 0 {
-		timeout = 5 * time.Second
+	signal := time.Duration(a.TimeoutMS) * time.Millisecond
+	if signal <= 0 {
+		signal = 5 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	window := rtspMeasureWindow(a.MeasureMS)
+	// ★ 收流那一段要单独给时间。拿原来「一问一答」的那个超时去卡三秒收包，
+	//   量到一半就被掐了，读数会退成「窗口太短，码率不算」。
+	total := signal
+	if window > 0 {
+		total = signal + window + 2*time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, total)
 	defer cancel()
 
 	values := map[string]any{"url": u.String(), "target": dial}
@@ -144,12 +163,14 @@ func probeRTSP(ctx context.Context, raw json.RawMessage) (any, error) {
 			Note: dial + " 连不上"}, nil
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	arm := func() { _ = conn.SetDeadline(time.Now().Add(signal)) }
+	arm()
 
 	br := bufio.NewReader(conn)
 	seq := 0
+	var auth string
 	// 第一次 DESCRIBE：多半会拿到 401，从里面取认证挑战
-	status, hdr, body, err := rtspDo(conn, br, "DESCRIBE", u.String(), &seq, "")
+	status, hdr, body, err := rtspDo(conn, br, "DESCRIBE", u.String(), &seq, auth)
 	if err != nil {
 		values["detail"] = err.Error()
 		return ots.Verdict{Code: verdictNoResponse, Values: values,
@@ -162,12 +183,14 @@ func probeRTSP(ctx context.Context, raw json.RawMessage) (any, error) {
 			return ots.Verdict{Code: verdictAuthRequired, Values: values,
 				Note: "需要用户名密码"}, nil
 		}
-		auth, aerr := authHeader(chal, user, pass, "DESCRIBE", u.String())
+		var aerr error
+		auth, aerr = authHeader(chal, user, pass, "DESCRIBE", u.String())
 		if aerr != nil {
 			values["detail"] = aerr.Error()
 			return ots.Verdict{Code: verdictAuthRequired, Values: values,
 				Note: "看不懂对方要求的认证方式"}, nil
 		}
+		arm()
 		status, hdr, body, err = rtspDo(conn, br, "DESCRIBE", u.String(), &seq, auth)
 		if err != nil {
 			values["detail"] = err.Error()
@@ -189,7 +212,7 @@ func probeRTSP(ctx context.Context, raw json.RawMessage) (any, error) {
 		return ots.Unknown(values), nil
 	}
 
-	tracks := parseSDP(body)
+	tracks, sessionCtl := parseSDP(body)
 	values["tracks"] = tracks
 	if n := len(tracks); n > 0 {
 		values["trackCount"] = n
@@ -204,8 +227,41 @@ func probeRTSP(ctx context.Context, raw json.RawMessage) (any, error) {
 	if v := firstVideo(tracks); v != nil && v.Width > 0 {
 		values["width"], values["height"], values["codec"] = v.Width, v.Height, v.Codec
 	}
+	// 参数问完了，接着**实际收一小段**。★ 这两问不能并成一格：
+	// SDP 写着 25fps 说的是设备打算发什么，几秒里到了多少包才是盒子里真有的东西。
+	if window == 0 {
+		values["measured"] = false
+		values["measureNote"] = "这一问按你的选择没听码流，下面这些只来自流描述"
+	} else {
+		arm()
+		m := measureStream(ctx, conn, br, u.String(), auth, &seq, pickTrack(tracks), sessionCtl, signal, window)
+		if m.switched != "" {
+			values["transportNote"] = m.switched
+		}
+		switch {
+		case m.silent:
+			values["measured"] = false
+			values["transport"] = m.transport
+			return ots.Verdict{Code: verdictStreamNoData, Values: values, Note: m.note}, nil
+		case m.note != "":
+			values["measured"] = false
+			values["measureNote"] = m.note
+		default:
+			values["measured"] = true
+			values["transport"] = m.transport
+			values["rtp"] = m.reading
+		}
+	}
 	return ots.Verdict{Code: verdictStreamOK, Values: values,
 		Note: describeTracks(tracks)}, nil
+}
+
+// pickTrack 挑一路来收：优先视频，没有视频轨就收第一轨。
+func pickTrack(ts []track) *track {
+	if v := firstVideo(ts); v != nil {
+		return v
+	}
+	return &ts[0]
 }
 
 func firstVideo(ts []track) *track {
@@ -243,7 +299,8 @@ func describeTracks(ts []track) string {
 
 // ── RTSP 最小实现 ──
 
-func rtspDo(conn net.Conn, br *bufio.Reader, method, uri string, seq *int, auth string) (int, map[string]string, string, error) {
+// rtspDo 发一问读一答。extra 是这一问多出来的请求头（Transport、Session、Range）。
+func rtspDo(conn net.Conn, br *bufio.Reader, method, uri string, seq *int, auth string, extra ...string) (int, map[string]string, string, error) {
 	*seq++
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%s %s RTSP/1.0\r\n", method, uri)
@@ -254,6 +311,9 @@ func rtspDo(conn net.Conn, br *bufio.Reader, method, uri string, seq *int, auth 
 	}
 	if auth != "" {
 		fmt.Fprintf(&sb, "Authorization: %s\r\n", auth)
+	}
+	for _, h := range extra {
+		fmt.Fprintf(&sb, "%s\r\n", h)
 	}
 	sb.WriteString("\r\n")
 	if _, err := conn.Write([]byte(sb.String())); err != nil {
@@ -411,25 +471,25 @@ func randHex(n int) string {
 
 // parseSDP 解 SDP，拿每一路轨的编码和分辨率。
 //
+// parseSDP 解 SDP，拿每一路轨的编码、分辨率，另外把会话级的 a=control 一并带出来
+// （收流时 SETUP 的地址要拿它拼）。
+//
 // ★ 分辨率不在 SDP 的字段里，而是藏在 fmtp 的 sprop-parameter-sets（H.264）
 // 或 sprop-sps（H.265）里 —— 那是 base64 过的 SPS，解开它才有真实分辨率。
 // 这就是我们不需要 ffmpeg 的原因：答案本来就在描述里。
-func parseSDP(sdp string) []track {
+func parseSDP(sdp string) ([]track, string) {
 	var tracks []track
 	var cur *track
+	var sessionCtl string
 	rtpmap := map[string]string{} // payload type → codec
 	fmtp := map[string]string{}   // payload type → 参数
-	var order []int               // tracks 的下标顺序，配合 payload
 
 	flush := func() {
 		if cur != nil {
 			tracks = append(tracks, *cur)
-			order = append(order, len(tracks)-1)
 			cur = nil
 		}
 	}
-	var curPT string
-	ptOf := map[int]string{}
 
 	for _, line := range strings.Split(sdp, "\n") {
 		line = strings.TrimRight(line, "\r")
@@ -441,11 +501,16 @@ func parseSDP(sdp string) []track {
 				continue
 			}
 			cur = &track{Kind: f[0]}
-			curPT = ""
 			if len(f) >= 4 {
-				curPT = f[3]
+				cur.pt = f[3]
 			}
-			ptOf[len(tracks)] = curPT
+		case strings.HasPrefix(line, "a=control:"):
+			v := strings.TrimSpace(strings.TrimPrefix(line, "a=control:"))
+			if cur == nil {
+				sessionCtl = v // 会话级那一条：它是各轨地址的前缀
+			} else {
+				cur.ctl = v
+			}
 		case strings.HasPrefix(line, "a=rtpmap:"):
 			v := strings.TrimPrefix(line, "a=rtpmap:")
 			f := strings.Fields(v)
@@ -462,9 +527,13 @@ func parseSDP(sdp string) []track {
 	flush()
 
 	for i := range tracks {
-		pt := ptOf[i]
+		pt := tracks[i].pt
 		if enc := rtpmap[pt]; enc != "" {
 			tracks[i].Codec = strings.ToLower(strings.SplitN(enc, "/", 2)[0])
+			// rtpmap 的第二段是时钟频率（H264/90000）—— 收流折算关键帧间隔只认它。
+			if f := strings.Split(enc, "/"); len(f) >= 2 {
+				tracks[i].clock, _ = strconv.Atoi(f[1])
+			}
 		}
 		if tracks[i].Kind != "video" {
 			continue
@@ -479,7 +548,7 @@ func parseSDP(sdp string) []track {
 		tracks[i].FPS, tracks[i].Profile, tracks[i].Level = p.FPS, p.Profile, p.Level
 		tracks[i].Interlaced = p.Interlaced
 	}
-	return tracks
+	return tracks, sessionCtl
 }
 
 // paramsFromFmtp 从 fmtp 参数里取出 SPS 并解析。
