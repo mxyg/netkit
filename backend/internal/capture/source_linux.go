@@ -329,33 +329,6 @@ func getsockoptBytes(fd, level, opt int, b []byte) (int, error) {
 	return int(n), nil
 }
 
-// sourceIfaces 把「要哪个口」落成口名列表。空 = 所有口
-// （含 lo：现场往往只有回环上的东西抓得到，比如本机服务自己连自己）。
-func sourceIfaces(want string) ([]string, error) {
-	ifs, err := net.Interfaces()
-	if err != nil {
-		return nil, fmt.Errorf("capture: 列不出网卡：%w", err)
-	}
-	if want == "" {
-		out := make([]string, 0, len(ifs))
-		for _, in := range ifs {
-			out = append(out, in.Name)
-		}
-		if len(out) == 0 {
-			return nil, fmt.Errorf("capture: 这台机器上一个口都列不出来")
-		}
-		return out, nil
-	}
-	for _, in := range ifs {
-		if in.Name == want {
-			return []string{want}, nil
-		}
-	}
-	// ★ 点名的口不存在时直接报，不许退化成「那就全抓」：
-	//   现场最常见的误判就是「抓了半天没有对方的包」，因为抓的是另一块网卡。
-	return nil, fmt.Errorf("capture: 这台机器上没有叫 %q 的口（%w）", want, ErrNoSuchInterface)
-}
-
 // ifaceIndexAndType 找口的序号与 ARPHRD 类型。
 // 类型走 ioctl(SIOCGIFHWADDR)：net 包把这一格藏起来了，而它决定了链路头怎么解 ——
 // 拿「有没有 MAC 地址」猜，tun 口就会被当成以太网，解出来的源地址是一段随机字节。

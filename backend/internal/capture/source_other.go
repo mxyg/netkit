@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 // 还没做采集档的平台走这里：能读写文件，不能现场抓。
 //

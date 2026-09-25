@@ -7,6 +7,7 @@ package capture
 import (
 	"errors"
 	"fmt"
+	"net"
 	"time"
 )
 
@@ -95,6 +96,35 @@ const DefaultBufferSize = 4 << 20
 // DefaultBlockRetire 是一块最多攒多久就交出去。
 // 100ms 是「界面看得出在动」和「系统调用不碎」之间的那一档。
 const DefaultBlockRetire = 100 * time.Millisecond
+
+// sourceIfaces 把「要哪个口」落成口名列表。空 = 所有口
+// （含 lo：现场往往只有回环上的东西抓得到，比如本机服务自己连自己）。
+// 放在平台中立这一份里：两档的「要哪个口」必须是同一句话，不然界面上同样的勾
+// 在两个平台上抓到的东西不一样，那种差别没人能从结果里看出来。
+func sourceIfaces(want string) ([]string, error) {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("capture: 列不出网卡：%w", err)
+	}
+	if want == "" {
+		out := make([]string, 0, len(ifs))
+		for _, in := range ifs {
+			out = append(out, in.Name)
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("capture: 这台机器上一个口都列不出来")
+		}
+		return out, nil
+	}
+	for _, in := range ifs {
+		if in.Name == want {
+			return []string{want}, nil
+		}
+	}
+	// ★ 点名的口不存在时直接报，不许退化成「那就全抓」：
+	//   现场最常见的误判就是「抓了半天没有对方的包」，因为抓的是另一块网卡。
+	return nil, fmt.Errorf("capture: 这台机器上没有叫 %q 的口（%w）", want, ErrNoSuchInterface)
+}
 
 // linkTypeOfARPHRD 把 Linux 的 ARPHRD_* 换成 pcapng 的链路类型号。
 // 认不出的如实返回 false：写错号不会报错，只会让上层把裸 IP 当以太网解，
