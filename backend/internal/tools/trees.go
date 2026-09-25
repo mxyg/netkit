@@ -8,6 +8,7 @@ package tools
 
 import (
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -221,6 +222,36 @@ var (
 		},
 		shows: []string{"values.offsetMs", "values.checkedWith", "values.agreeSources", "values.attribution"}}
 
+	// nOnvif 只在**手里没有取流地址**时问一次。现场卡的常常不是「流不通」，
+	// 而是「我只有这台设备的网页后台，地址是多少」—— ONVIF 问得出来，问出来就喂给下一步。
+	nOnvif = &treeNode{id: "onvif", name: "向设备问取流地址", tool: "media.onvif.info",
+		need:   []string{"addr"},
+		when:   func(st *treeState) bool { return st.str("url") == "" },
+		unless: "已经有取流地址了，不必再向设备问一次",
+		args: func(st *treeState) (map[string]any, error) {
+			host := st.str("addr")
+			if strings.ContainsRune(host, ':') {
+				host = "[" + host + "]" // IPv6 不包一层方括号，拼出来的地址谁都解不开
+			}
+			m := map[string]any{"url": "http://" + host}
+			// 账号只在发出去的那份参数里，进结果前由 redactTreeArgs 洗掉。
+			if u := st.args.Username; u != "" {
+				m["username"] = u
+			}
+			if pw := st.args.Password; pw != "" {
+				m["password"] = pw
+			}
+			return m, nil
+		},
+		take: func(st *treeState, vals map[string]any) {
+			if s, ok := digStr(vals, "values.mediaUri"); ok {
+				if u := onvifStreamFor(s); u != "" {
+					st.set("url", u)
+				}
+			}
+		},
+		shows: []string{"values.manufacturer", "values.model", "values.profileCount", "values.mediaUri"}}
+
 	nRTSP = &treeNode{id: "stream", name: "问它肯不肯给流", tool: "media.rtsp.probe", need: []string{"url"},
 		args: func(st *treeState) (map[string]any, error) {
 			m := map[string]any{"url": st.str("url")}
@@ -236,6 +267,22 @@ var (
 		shows: []string{"values.status", "values.codec", "values.width",
 			"values.height", "values.trackCount"}}
 )
+
+// onvifStreamFor 把 ONVIF 问出来的取流地址翻译成下一步能直接发出去的那一句。
+//
+// ★ 结果里的地址是**抹过口令**的（凭据不进结果是硬规矩），照原样喂给 RTSP
+//
+//	就等于拿「admin（口令已隐去）」当用户名去敲门 —— 设备回 401，
+//	我们把它读成「密码不对」，而密码本来就是调用方填对的那一份。
+//	所以这里把用户名整段摘掉，让下一步用调用方给的账号重问。
+func onvifStreamFor(uri string) string {
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "rtsp" {
+		return ""
+	}
+	u.User = nil
+	return u.String()
+}
 
 // ── 取值小工具 ──
 
@@ -911,7 +958,29 @@ var planDeviceDown = &treePlan{symptom: symDeviceDown, steps: []planStep{
 			scanAllClosed:  stop("cause-device-no-service"),
 			scanNoResponse: stop("cause-service-filtered"),
 			scanNoRoute:    stop("cause-no-route-to-target"),
-			scanSomeOpen:   to("stream"),
+			scanSomeOpen:   to("onvif"),
+		},
+		other: to("onvif")},
+	// ★ 地址问不出来，下一步就没东西可问 —— 所以每一档都停在**这一问自己**给的
+	//	判定上，而不是走到「缺参数，没问出去」再落一句「每一步都正常」。
+	{node: nOnvif,
+		by: map[string]move{
+			verdictONVIFNoProfile: stop("cause-onvif-no-profile"),
+			verdictONVIFAuth:      stop("cause-onvif-auth"),
+			verdictONVIFNotOnvif:  stop("cause-port-not-onvif"),
+			verdictONVIFFault:     stop("cause-onvif-unsupported"),
+			verdictONVIFPartial:   stop("cause-onvif-no-media"),
+			verdictONVIFNoRepl:    stop("cause-onvif-silent"),
+			verdictONVIFUnreach:   stop("cause-onvif-unreachable"),
+		},
+		// 问到了身份不等于下一步问得出去：ONVIF 也回 http 那一路的（各家都有），
+		//	而下一步只会说 RTSP。放它走过去只会得到「缺参数，没问出去」，
+		//	再落一句「每一步都正常」—— 那是把我们问不出来的那一格算成没毛病。
+		decide: func(st *treeState, code string, vals map[string]any) move {
+			if code == verdictONVIFOK && st.str("url") == "" {
+				return stop("cause-onvif-no-media")
+			}
+			return to("stream")
 		},
 		other: to("stream")},
 	{node: nRTSP,

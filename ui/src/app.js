@@ -3718,9 +3718,152 @@ async function renderScan(root) {
 async function renderDevice(root) {
   root.appendChild(deviceIdentifyCard());
   root.appendChild(discoverCard());
+  root.appendChild(onvifCard());
   root.appendChild(rtspCard());
   root.appendChild(wolCard());
 }
+
+// ONVIF 这一张排在「取流探测」前面，不是随手放的：
+// ★ 现场手里往往只有这台设备的 IP，取流地址恰恰是要问出来的那一个。
+//   ONVIF 把「有几路流、每路什么规格、第一路的 rtsp:// 地址」答得出来，
+//   答完直接抄进下面那张卡去验流 —— 「没画面」的排查因此从问出地址开始，不是从猜地址开始。
+function onvifCard() {
+  const card = $(`<div class="card">
+    <h2>问一台 ONVIF 设备 <span id="ov-top"></span></h2>
+    <p class="hint">向设备发几问<b>只读</b>的 SOAP：它是谁、它自己说现在几点、服务挂在哪儿、
+      有几路码流、第一路的取流地址是多少。<b>不改它任何配置。</b>
+      ★ 哪一问没问出去会单独占一行，不会糊成「问了，一切正常」。密码只进请求，不进结果。</p>
+    <div class="row">
+      <div><label>服务地址（只填 IP 也行，默认 80 端口与设备服务路径）</label>
+        <input id="ov-u" placeholder="192.168.1.64 或 http://192.168.1.64:8899/onvif/device_service"></div>
+      <div style="flex:0 0 170px"><label>ONVIF 账号</label>
+        <input id="ov-a" placeholder="多数相机匿名只回 Fault"></div>
+      <div style="flex:0 0 170px"><label>密码</label>
+        <input id="ov-w" type="password" autocomplete="new-password"></div>
+    </div>
+    <div style="margin-top:12px"><button class="btn primary" id="ov-b">问一遍</button></div>
+    <div id="ov-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#ov-out');
+  const top = card.querySelector('#ov-top');
+  card.querySelector('#ov-b').onclick = async () => {
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">正在问…（几问是排着队发的，设备慢或者第一问就要账号时会多等几秒）</div>';
+    const args = {};
+    const put = (id, key) => { const s = card.querySelector(id).value.trim(); if (s) args[key] = s; };
+    put('#ov-u', 'url'); put('#ov-a', 'username'); put('#ov-w', 'password');
+    const r = await call('media.onvif.info', args);
+    if (!r.ok) { out.innerHTML = `<div class="empty">问不了：${esc(r.message || r.error)}</div>`; return; }
+    const v = r.values || {};
+    const [title, cls, advice] = ONVIF_CODE[r.verdict] || [r.verdict, '', ''];
+    top.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
+
+    const led = (v.steps || []).map((s) => {
+      const st = ONVIF_STEP[s.state] || [s.state || '—', 'bad', ''];
+      return `<tr><td>${esc(s.step || '')}</td>`
+        + `<td><span class="pill ${st[1]}">${esc(st[0])}</span></td>`
+        + `<td>${s.note ? esc(s.note) : '<span class="dim">它照答了</span>'}</td></tr>`;
+    }).join('');
+
+    const ps = v.profiles || [];
+    const streamRows = ps.length
+      ? `<tr><th>码流名</th><th>token（问地址用它）</th><th>编码</th><th>分辨率</th><th>帧率</th><th>上限码率</th><th>音频</th></tr>`
+        + ps.map((p) => `<tr><td>${esc(p.name || '—')}</td><td><code>${esc(p.token || '')}</code></td>`
+          + `<td>${esc(p.codec || '—')}</td>`
+          + `<td>${p.width ? `${p.width}×${p.height}` : '<span class="dim">没报</span>'}</td>`
+          + `<td>${esc(p.framerate || '—')}</td>`
+          + `<td>${p.bitrateKbps ? esc(p.bitrateKbps) + ' kbps' : '—'}</td>`
+          + `<td>${esc(p.audio || '没有')}</td></tr>`).join('')
+      : '';
+
+    // 时间那一格答的是「它自己说几点、它靠什么对时」。偏移照给，但注明是相对本机 ——
+    // 拿本机那把尺去论设备的对错，本机自己歪的时候就把它的准算成了错。
+    const off = typeof v.offsetMsVsLocal === 'number'
+      ? `<b>${esc(humanMs(v.offsetMsVsLocal))}</b> <span class="dim">它比本机${v.offsetMsVsLocal > 0 ? '快' : '慢'}（相对本机；本机准不准归「校时检查」判）</span>`
+      : '<span class="dim">没换算成偏差 —— 它只报了本地时间，或者这一问没问出去。<b>只给本地时间就不换算</b>：时区一差几小时，会凭空造出一个「它时间不对」。</span>';
+    const ntp = (v.ntpServers || []).join(' 、') || (v.ntpFromDHCP ? '由 DHCP 下发' : '');
+
+    // ★ 有内容才现身：第一问就被挡下时，「它是谁 / 几点 / 几路流」四张空表
+    //   会把真正那一条信息（问话记录）挤到屏幕外，还看着像「查过了，都没查到」。
+    const step = (name) => (v.steps || []).find((x) => x.step === name);
+    // 只有「这一问真的问出去了、它答了没有码流」才说它没配 —— 第一问就断掉时
+    // 这一问根本没发生，说成「它说没有码流」就是替设备编了一句它没说过的话。
+    const mediaAsked = step('问它有几路码流') && step('问它有几路码流').state === 'asked';
+    const hasWho = v.manufacturer || v.model || v.firmwareVersion || v.serialNumber || v.hardwareId || v.mediaService;
+    const hasClock = v.deviceTime || v.deviceTimeType || typeof v.offsetMsVsLocal === 'number'
+      || (v.ntpServers || []).length || v.ntpFromDHCP;
+    const secs = [];
+    if (v.mediaUri) {
+      secs.push(`<h2 style="margin-top:16px">它报的取流地址</h2>
+        <table>${tCell('拿这个去验流', `<code>${esc(v.mediaUri)}</code>`)}</table>`);
+    }
+    if (ps.length) {
+      secs.push(`<h2 style="margin-top:16px">它报的码流</h2><table>${streamRows}</table>`);
+    } else if (mediaAsked) {
+      secs.push(`<h2 style="margin-top:16px">它报的码流</h2>
+        <div class="empty">媒体服务答得清清楚楚：这台上一条码流都没配。几路流、什么规格，都得先在设备那侧把码流配出来。</div>`);
+    }
+    if (hasWho) {
+      secs.push(`<h2 style="margin-top:16px">它是谁</h2>
+        <table>
+          ${tCell('厂商 / 型号', `${esc(v.manufacturer || '它没说')} ${v.model ? '· ' + esc(v.model) : ''}`)}
+          ${tCell('固件 / 硬件', `${esc(v.firmwareVersion || '—')}${v.hardwareId ? ' · ' + esc(v.hardwareId) : ''}`)}
+          ${tCell('序列号', v.serialNumber ? `<code>${esc(v.serialNumber)}</code>` : '<span class="dim">它没说</span>')}
+          ${v.mediaService ? tCell('媒体服务挂在', `<code>${esc(v.mediaService)}</code> <span class="dim">（它自报的路径与端口，主机仍钉在这台）</span>`) : ''}
+        </table>`);
+    }
+    if (hasClock) {
+      secs.push(`<h2 style="margin-top:16px">它说现在几点</h2>
+        <table>
+          ${tCell('它的时刻', v.deviceTime ? `<code>${esc(v.deviceTime)}</code>` : '<span class="dim">这一问没答</span>')}
+          ${tCell('和差多少', off)}
+          ${tCell('靠什么对时', `${esc(v.deviceTimeType || '它没说')}${v.deviceTimezone ? ' · 时区 ' + esc(v.deviceTimezone) : ''}${v.daylightSavings === true ? ' · 开了夏令时' : ''}`)}
+          ${ntp ? tCell('它的时间源', `<code>${esc(ntp)}</code>`) : ''}
+        </table>`);
+    }
+    secs.push(`<h2 style="margin-top:16px">问话记录</h2>
+      <table><tr><th>问了什么</th><th>状态</th><th>为什么</th></tr>${led}</table>`);
+    out.innerHTML = `${advice ? adviceBox(cls, esc(advice)) : ''}
+      ${r.note ? `<p class="dim" style="margin:10px 0 0">${esc(r.note)}</p>` : ''}${secs.join('')}`;
+  };
+  return card;
+}
+
+const ONVIF_STEP = {
+  'asked': ['问出去了', 'ok', ''],
+  'not-asked': ['没问出去', 'bad',
+    '这一步的结论不算它的读数 —— 连问都没问到，就不能说这一项没问题。'],
+};
+
+const ONVIF_CODE = {
+  'onvif-ok': ['身份与码流都问到了', 'ok',
+    '★ 上面那个取流地址直接抄进下面「取流探测」验流。码流表里有几个 token 就是几条流 —— '
+    + '主码流 / 子码流是两条不同的 profile，对一下分辨率是不是你要的那一路，再对上下游平台期望的那一路。'],
+  'onvif-no-profile': ['它说一条码流都没配', 'bad',
+    '★ 媒体服务答得出来、也明确说了没有流 —— 这就不是链路的问题了。去设备自己的通道 / 码流配置看有没有启用'
+    + '（多数相机加完通道只开主码流，子码流默认是关的），配好再问一次。'],
+  'onvif-partial': ['身份问到了，媒体那一路问不出', 'warn',
+    '★ 设备确实是 ONVIF，只是媒体服务没答（那个端口不通、不认这一问、或者这台没实现媒体服务）。'
+    + '下面「问话记录」写了是哪一问、为什么。这一段问不出地址，取流地址先回设备网页后台或厂商工具里抄。'],
+  'auth-required': ['要账号，或者这个账号被挡', 'warn',
+    '★ 先分清是哪一种：账号没填 = 它在要；填了还被挡 = 这个账号不够格。'
+    + '很多相机把 ONVIF 账号和 Web 登录账号分开管 —— 要在它自己的用户列表里另加一个，并勾上媒体权限。'
+    + '拿「网页能登录」去推「ONVIF 也该能用」，就会一直卡在这一格。'],
+  'onvif-fault': ['它回了 Fault，是不接这一问', 'bad',
+    '★ Fault 是「问到了、但不这么答」，不是密码不对，别去翻密码。'
+    + '看问话记录里那句原因：Action not supported 这类是这台固件没实现这个操作，'
+    + '去对一下它的 ONVIF Profile 支持范围（S 只给取流，T 才给云台那一套）。'],
+  'not-onvif': ['这个地址不是 ONVIF 服务', 'bad',
+    '★ 连得上、也回了话，回的却是网页或别的协议，所以「没回应」这个说法在这儿是错的。'
+    + 'ONVIF 常见在 80，也有 8899 / 2020 / 8080；先进设备网页后台确认 ONVIF 开关是开着的。'
+    + '那个端口如果是 TLS，地址前缀要写 https://。'],
+  'no-response': ['连上了，一声不响', 'bad',
+    '★ 端口活着却不答话：服务卡死，或者它只放行白名单里的 IP 发 ONVIF。'
+    + '先看这台的网络服务要不要重启，再确认本机地址在不在它的允许列表里。'],
+  'unreachable': ['连不上', 'bad',
+    '★ 连不上先别改密码 —— 密码错不会导致连不上。去「ping 与端口」那页确认这个端在不在：'
+    + '端口不在 = ONVIF 没开、或者中间隔了路由/防火墙；端口在而这里连不上 = 前缀（http / https）写错了。'],
+};
 
 function rtspCard() {
   const card = $(`<div class="card">
@@ -5572,7 +5715,7 @@ const SYMPTOM = {
   'cert-error': ['证书报错 / HTTPS 打不开',
     '填报错的那个地址（或者把浏览器地址栏那串贴到高级的「网址」）。★ 这一条会先问时间，再决定是不是证书的锅。'],
   'device-down': ['一台设备不在线 / 没画面',
-    '把那台设备的地址填进来。有 rtsp 取流地址就填在高级的「网址」里，最后一步会去问它肯不肯给流。'],
+    '把那台设备的地址填进来。★ 有 rtsp 取流地址就填在高级的「网址」里；没有也行 —— 会先向设备问一次 ONVIF，把地址问出来再去验流。'],
 };
 
 // 五种状态。★ 这一列是这张卡最要紧的一列：「没去问」和「问了没有」差一次跑错机房。
@@ -5606,7 +5749,7 @@ const TREE_CODE_OF = {
   'gw-watch': [WATCH_CODE], watch: [WATCH_CODE], ping: [PING_CODE],
   trace: [TRACE_CODE], mtr: [MTR_CODE], clock: [TIME_CODE], tcp: [PROBE_CODE],
   ports: [SCAN_CODE], 'on-link': [SUBNET_CODE], tls: [CERT_CODE],
-  http: [HTTP_CODE], mtu: [MTU_CODE], stream: [RTSP_CODE],
+  http: [HTTP_CODE], mtu: [MTU_CODE], stream: [RTSP_CODE], onvif: [ONVIF_CODE],
 };
 
 // 树里问到的那一步没给出话术时，只回落到码本身 —— 不许在这儿编一句人话顶上：
@@ -5790,6 +5933,31 @@ const TREE_CAUSE = {
   'cause-device-no-service': ['设备在，但那些服务口一个都没开', 'bad',
     '端口明确回了拒绝，说明主机活着。★ 那就不是链路的事：查取流服务开没开、'
     + '通道号对不对、这个账号有没有该通道的权限（NVR 上不同用户开的通道不一样）。'],
+  // ── 「向设备问取流地址」那一步的七种落点 ──
+  // ★ 这一批的共同点：地址问不出来，下一步就没东西可验 —— 所以话术全都在说
+  //   「那这一格怎么补」，而不是复述 ONVIF 回了什么。
+  'cause-onvif-auth': ['设备要账号才肯说取流地址', 'warn',
+    '401 是它答了、只是不放行，不是设备坏了。★ 很多相机把 ONVIF 账号和 Web 登录账号分开管，'
+    + '拿后台密码来问 ONVIF 问不通是常态 —— 去它自己的「用户 / ONVIF 设置」里单加一个。'],
+  'cause-port-not-onvif': ['那个端口上不是 ONVIF', 'warn',
+    '连得上、也回了话，可回的不是 ONVIF 应答。★ 先照上面那一步自己那句话办：它要是说「那个端口说的是 HTTPS」，'
+    + '把地址前缀改成 https:// 再问一次就好，这不是故障；它回的是一页网页，那地址就得去后台的「取流 / 网络」页里抄。'],
+  'cause-onvif-unsupported': ['这台不接 ONVIF 的这一问', 'warn',
+    '包它认、账号也过了，可它回一句「不会这一问」。ONVIF 是分档实现的（S / T / M），'
+    + '只做设备档的就没有媒体服务。★ 这不必去翻密码，要确认的是这台到底支持到哪一档。'],
+  'cause-onvif-no-media': ['身份问到了，可说 RTSP 的那一路没问出来', 'warn',
+    '它肯报自己是哪台，但几路流、地址在哪这一路没答上来（媒体服务没起、挂在别的端口上，'
+    + '或者它只给了 http 那一路 —— 下一步只会说 RTSP）。★ 这路地址我们问不出来：'
+    + '去设备后台抄一条填在高级的「网址」里，这一步就接着往下问。'],
+  'cause-onvif-no-profile': ['设备自己说它一条码流都没配', 'bad',
+    '媒体服务答得清清楚楚：0 路。这就不是链路、也不是账号的事 —— 是那个通道没出码流。'
+    + '去设备上把主 / 子码流建出来，配好再问一次地址。'],
+  'cause-onvif-silent': ['端口开着，可它不回 ONVIF 这一问', 'bad',
+    '连上了一个字都没回 —— 和「连不上」是两种病，这一种多半是那个服务卡住了，'
+    + '或者它压根不在这端口上应答。★ 先看设备的 Web 后台打得开吗，再对端口号。'],
+  'cause-onvif-unreachable': ['ONVIF 那一问连都连不出去', 'warn',
+    '默认 80 没人应 —— 各家会把 ONVIF 挪到 8899 / 2020 / 8080，或者只在 https 上。'
+    + '★ 先进后台确认它开了 ONVIF、端口是多少；有取流地址的话直接填到高级的「网址」里，这一步就绕过去了。'],
   'cause-stream-auth': ['问到了，只是不让看', 'warn',
     '★ 401 不是设备坏了，是它答了并且认得这个请求。核对账号密码，再确认这个账号'
     + '对该通道有取流权限 —— 现场十次有八次是权限而不是密码。'],
@@ -5833,6 +6001,8 @@ const TREE_FACT = {
   url: '地址', offsetMs: '差了多少', checkedWith: '问的是哪台时间源',
   agreeSources: '互相印证的源', attribution: '是谁不对', codec: '编码',
   width: '宽', height: '高', trackCount: '有几路轨', answers: '解出来的地址',
+  manufacturer: '它自报是哪台', model: '型号', profileCount: '它自报几路码流',
+  mediaUri: '问出来的取流地址',
   pathMtu: '路上允许的包长', suggestion: '建议设成', mtu: '这块口的 MTU',
   lossAt: '丢在第几发',
   // 双栈那一步里 Happy Eyeballs 那几项

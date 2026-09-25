@@ -156,6 +156,14 @@ var treeCauses = map[string]bool{
 	"cause-stream-missing":    true, // 设备答了，但这个通道上没有这路流
 	"cause-stream-broken":     true, // 认证都过了，应答里却没一条媒体轨：那路流在设备上没配出来
 	"cause-stream-ok":         true, // 流在播 —— 「没画面」是那头的显示侧
+	// 「我只有这台设备，取流地址是多少」—— ONVIF 那一问的六种落点各有各的下一步
+	"cause-onvif-no-profile":  true, // 媒体服务答得清楚：一条码流都没配
+	"cause-onvif-auth":        true, // 设备要账号才肯说地址
+	"cause-port-not-onvif":    true, // 那个端口上是别的服务（设备的 Web 后台最常见）
+	"cause-onvif-unsupported": true, // 认了这个包却不接这一问：这台没实现/没开 ONVIF
+	"cause-onvif-no-media":    true, // 身份问到了，媒体那一路问不出
+	"cause-onvif-silent":      true, // 端口开着却不回 ONVIF
+	"cause-onvif-unreachable": true, // 80 连不上：ONVIF 没开，或者根本不在 80
 	"cause-egress-blocked":    true, // 路到得了出口那台机器，却连不上它那个口：拦在中间
 	"cause-wrong-scheme":      true, // 明文口写成 https（或反过来），改个前缀就好
 }

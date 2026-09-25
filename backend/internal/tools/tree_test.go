@@ -8,6 +8,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -185,6 +186,7 @@ func everythingOK() map[string][]string {
 		"net.time.check":      {timeOK},
 		"net.mtu.path":        {mtuCodeLocal},
 		"media.rtsp.probe":    {verdictStreamOK},
+		"media.onvif.info":    {verdictONVIFOK},
 	}
 }
 
@@ -797,18 +799,26 @@ func TestTreeDeviceStreamActuallyPlays(t *testing.T) {
 	}
 }
 
-// 没给取流地址时那一步要写明「没地址问不了」，而不是被读成「流是好的」。
+// 没给取流地址、而 ONVIF 那一句回的不是可验的地址（各家确有只回 http 那一路的）：
+// 验流那一步只能是被跳过，★ 而且停下的理由要写在「停在哪一步」上，
+// 不许顺着往下走、再落一句「每一步都正常」—— 那会把我们问不出来读成网络没毛病。
 func TestTreeDeviceNoURLLeavesStepVisible(t *testing.T) {
-	codes := everythingOK()
+	codes := everythingOK() // media.onvif.info 回 onvif-ok，但没带出 rtsp 地址
 	fakeTools(t, codes, map[string]map[string]any{
 		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
 		"net.ports.scan":  {"open": 1},
+		"media.onvif.info": {"profileCount": 1.0,
+			"mediaUri": "http://192.0.2.31/snap.jpg"}, // ★ 不是 rtsp，下一步问不出去
 	})
 	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31"})
 	st := stepsOf(t, v)
-	wantStatus(t, st, "stream", treeNotAsked)
-	if !strings.Contains(st["stream"].Note, "url") {
-		t.Errorf("没写清缺什么：%q", st["stream"].Note)
+	wantStatus(t, st, "onvif", treeAsked)
+	wantStatus(t, st, "stream", treeSkipped)
+	if !strings.Contains(st["stream"].Note, "停在") {
+		t.Errorf("没写出停在哪儿：%q", st["stream"].Note)
+	}
+	if v.Code != "cause-onvif-no-media" {
+		t.Fatalf("顶层 = %s，想要 cause-onvif-no-media", v.Code)
 	}
 	if strings.HasPrefix(v.Code, "cause-stream") {
 		t.Errorf("没问过流却定了个流的根因：%s", v.Code)
@@ -846,6 +856,104 @@ func TestTreeDeviceNoICMP(t *testing.T) {
 	if v.Code != "cause-device-no-icmp" {
 		t.Fatalf("顶层 = %s，想要 cause-device-no-icmp", v.Code)
 	}
+}
+
+// ── 手里没有取流地址：先向设备问一次 ──
+
+// 「没地址」不等于查不动：ONVIF 问得出地址，问出来就接着去验流。
+//
+// ★★ 喂给下一步的那句地址里不许留着抹过口令的那一截。结果里的地址是
+//
+//	rtsp://admin（口令已隐去）@… 这种形状（凭据不进结果是硬规矩），
+//	照原样发出去就等于拿「admin（口令已隐去）」当用户名去敲门 ——
+//	设备回 401，我们把它读成「密码不对」，而密码正是调用方填对的那一份。
+func TestTreeDeviceAsksONVIFForTheStreamURL(t *testing.T) {
+	codes := everythingOK()
+	tracker := fakeTools(t, codes, map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+		"media.onvif.info": {"manufacturer": "ACME", "model": "C-100",
+			"mediaUri": "rtsp://admin%EF%BC%88%E5%8F%A3%E4%BB%A4%E5%B7%B2%E9%9A%90%E5%8E%BB%EF%BC%89@192.0.2.31:554/live"},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		Username: "admin", Password: "Sup3rS3cret"})
+	st := stepsOf(t, v)
+	wantStatus(t, st, "onvif", treeAsked)
+	wantStatus(t, st, "stream", treeAsked) // ★ 地址问出来了，最后那一步就问得出去
+	if v.Code != "cause-stream-ok" {
+		t.Fatalf("顶层 = %s，想要 cause-stream-ok", v.Code)
+	}
+	asked := tracker["media.onvif.info"].args[0]
+	if asked["url"] != "http://192.0.2.31" {
+		t.Errorf("没拿这台设备的地址去问它：%v", asked["url"])
+	}
+	if asked["password"] != "Sup3rS3cret" {
+		t.Errorf("ONVIF 那一问没带上账号（多数相机匿名只回 Fault）：%v", asked["password"])
+	}
+	got := tracker["media.rtsp.probe"].args[0]
+	if got["url"] != "rtsp://192.0.2.31:554/live" {
+		t.Errorf("喂给验流那一步的地址不对：%v", got["url"])
+	}
+	blob := fmt.Sprint(v.Values)
+	if strings.Contains(blob, "口令已隐去") || strings.Contains(blob, "%EF%BC%88") {
+		t.Errorf("抹过口令的那一截被当成可用地址留下来了：%s", blob)
+	}
+	if strings.Contains(blob, "Sup3rS3cret") {
+		t.Errorf("口令漏进结果了：%s", blob)
+	}
+}
+
+// 问不出地址的那七种落法各有各的下一步：要账号、端口上不是 ONVIF、这台不接这一问、
+// 它说没码流、媒体那一路问不出、连不上、连上不回话。
+// ★ 每一档都停在**这一问自己**给的判定上 —— 放它走到下一步只会得到
+//
+//	「缺参数，没问出去」，再落一句「每一步都正常」，那是把我们的问不出说成没毛病。
+func TestTreeDeviceOnvifStopsByItsOwnAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		code, want string
+	}{
+		{verdictONVIFAuth, "cause-onvif-auth"},
+		{verdictONVIFNotOnvif, "cause-port-not-onvif"},
+		{verdictONVIFFault, "cause-onvif-unsupported"},
+		{verdictONVIFPartial, "cause-onvif-no-media"},
+		{verdictONVIFNoProfile, "cause-onvif-no-profile"},
+		{verdictONVIFNoRepl, "cause-onvif-silent"},
+		{verdictONVIFUnreach, "cause-onvif-unreachable"},
+	} {
+		codes := everythingOK()
+		codes["media.onvif.info"] = []string{tc.code}
+		fakeTools(t, codes, map[string]map[string]any{
+			"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+			"net.ports.scan":  {"open": 1},
+		})
+		v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31"})
+		if v.Code != tc.want {
+			t.Errorf("ONVIF 回 %s，顶层却停在 %s，想要 %s", tc.code, v.Code, tc.want)
+		}
+		if c := stepsOf(t, v)["onvif"].Code; c != tc.code {
+			t.Errorf("那一步自己的判定没记下来：%v", c)
+		}
+	}
+}
+
+// 手里已经有地址时不必再多问一嘴 —— 但这一格要写明「为什么没问」，不许留空。
+func TestTreeDeviceSkipsOnvifWhenURLGiven(t *testing.T) {
+	codes := everythingOK()
+	tracker := fakeTools(t, codes, map[string]map[string]any{
+		"net.subnet.scan": hostFound("192.0.2.31", evICMP),
+		"net.ports.scan":  {"open": 1},
+	})
+	v := runTree(t, treeArgs{Symptom: symDeviceDown, Target: "192.0.2.31",
+		URL: "rtsp://192.0.2.31:554/live"})
+	st := stepsOf(t, v)
+	wantStatus(t, st, "onvif", treeNotAsked)
+	if !strings.Contains(st["onvif"].Note, "已经有") {
+		t.Errorf("没写出为什么没问：%q", st["onvif"].Note)
+	}
+	if tracker["media.onvif.info"].calls != 0 {
+		t.Error("有地址却还去问了设备")
+	}
+	wantStatus(t, st, "stream", treeAsked)
 }
 
 // ── 顶层码 ──
@@ -1314,6 +1422,7 @@ var toolValues = map[string][]string{
 	"net.time.check":      {"offsetMs", "checkedWith", "agreeSources", "attribution"},
 	"net.mtu.path":        {"pathMtu", "suggestion", "egress", "egressUnknown", "carriesAtLeast", "localMtuLimited", "steps", "warning", "dfVerified"},
 	"media.rtsp.probe":    {"codec", "width", "height", "trackCount", "status"},
+	"media.onvif.info":    {"manufacturer", "model", "profileCount", "mediaUri", "steps"},
 }
 
 func TestTreeShowsPathsExist(t *testing.T) {
