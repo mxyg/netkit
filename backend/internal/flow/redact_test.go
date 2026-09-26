@@ -261,6 +261,50 @@ func Test身份那几格不许被顺手打掉(t *testing.T) {
 	}
 }
 
+func Test补漏那道闸不许吃掉排查要用的那一格(t *testing.T) {
+	// ★ scrubLongB64 是补漏的闸，它最容易犯的错不是漏一处，是把第一手证据当密钥吃了：
+	//   「地址写错了」那一问读的就是这一串路径。更糟的是同一份包在按字段洗的那一层
+	//   完好、在摘要这一层被打码 —— 两个说法摆在一起，人只会去查那个看不见的答案。
+	for _, keep := range []string{
+		"SETUP rtsp://10.0.0.9/Streaming/Channels/101 RTSP/1.0",
+		"GET /onvif-http/snapshot/MediaProfile-1/20260926T101500.jpg HTTP/1.1",
+		"v=0\r\no=- 20260926101500 1 IN IP4 192.168.0.107\r\ns=LiveMediaStream,Camera\r\n",
+	} {
+		if got := scrubText(keep); strings.Contains(got, "***") {
+			t.Errorf("排查要用的那一格被吃了：%q -> %q", keep, got)
+		}
+	}
+	// 反过来说：真凭据那几种形状一个都不许走过去。
+	for _, leak := range []struct{ name, s, want string }{
+		{"digest response", "digest response=0a1b2c3d4e5f60718293a4b5c6d7e8f9", "0a1b2c3d4e5f60718293a4b5c6d7e8f9"},
+		{"JWT 的签名段", "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjYW0ifQ.2s4ObDPx8vVhYQe5s5AaZm7Y6XwZ1sGtcF2uvBh9oKo", "2s4ObDPx8vVhYQe5s5AaZm7Y6XwZ1sGtcF2uvBh9oKo"},
+	} {
+		if got := scrubText(leak.s); strings.Contains(got, leak.want) {
+			t.Errorf("%s 从补漏的闸漏出去了：%q -> %q", leak.name, leak.s, got)
+		}
+	}
+	// 带斜杠的 base64（PSK 的编码形式常是这个形状：一坨长块里夹一两个斜杠）也必须打掉。
+	// ★ 拿**随机字节**编，别拿 ASCII 编：ASCII 文本编出来的 base64 里根本不会出现斜杠
+	//   （要出现得有一个字节的低六位的形状凑巧是 63），拿它当样本等于没测这一档。
+	blob := ""
+	for i := 0; i < 500 && blob == ""; i++ {
+		key := make([]byte, 24) // 一把 AES-128 PSK 的长度
+		for j := range key {
+			key[j] = byte(i*7 + j*11 + 3)
+		}
+		cand := base64.StdEncoding.EncodeToString(key)
+		if strings.Contains(cand, "/") && len(cand) >= 32 {
+			blob = cand
+		}
+	}
+	if blob == "" {
+		t.Fatal("造不出带斜杠的长 base64 —— 这一档的前提没了，规则改了也没人知道")
+	}
+	if got := scrubText("a=crypto:1 AES_CM_128_NULL_SHA80 " + blob); !strings.Contains(got, "***") {
+		t.Errorf("带斜杠的 base64 凭据没被打掉：%q -> %q", blob, got)
+	}
+}
+
 func Test脱敏过的那几格自己承认脱过(t *testing.T) {
 	// 值是打掉了， 但「打掉了」这件事必须留在表上：
 	// 「设备根本没带 Authorization」与「带了但被拒了」是两种病， 界面要分得开。

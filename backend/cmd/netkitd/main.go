@@ -19,6 +19,7 @@ import (
 	"syscall"
 
 	"net.yuhox.com/netkit/internal/api"
+	"net.yuhox.com/netkit/internal/capture"
 	"net.yuhox.com/netkit/internal/mcp"
 	"net.yuhox.com/netkit/internal/ots"
 	"net.yuhox.com/netkit/internal/playbook"
@@ -80,6 +81,11 @@ func main() {
 	// ★ 装不上就不许开监测 —— 记不下来的监测只是给人一个「我盯着呢」的错觉。
 	if dir, err := quality.DefaultDir(); err == nil {
 		tools.SetQualityDir(dir)
+	}
+	// 抓包文件的落盘目录。★ 装不上就不许开抓包 —— 一份记不下来的抓包等于没抓，
+	// 而现场要拿它对账的正是这一份文件。
+	if dir, err := capture.DefaultDir(); err == nil {
+		tools.SetCaptureDir(dir)
 	}
 	if *approveURL != "" {
 		reg.SetApprover(&api.HTTPApprover{URL: *approveURL})

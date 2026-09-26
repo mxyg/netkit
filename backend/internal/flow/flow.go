@@ -450,23 +450,44 @@ func reasonFor(err error, linkType uint16) string {
 
 // cleanReason 把原因文本里的数字并成一格：
 // 「要 14 字节，这一包只有 3」与「…只有 5」是同一件事，不该占两格。
+//
+// 十六进制样本（0x806 这种）也并成一格，但**不许从那儿把句子截断**：
+// 截断会把后半句连同那个收尾的括号一起吃掉，界面上就剩一句读不通的话
+// （「协议类型」后面什么都没有）。并格要的是同一件事占一格，不是少说半句。
 func cleanReason(err error) string {
 	s := err.Error()
-	if i := strings.Index(s, "0x"); i >= 0 {
-		s = s[:i] // 十六进制样本长短不一，切在这里
-	}
 	var b strings.Builder
 	prevDigit := false
-	for _, r := range s {
+	for i := 0; i < len(s); {
+		if s[i] == '0' && i+1 < len(s) && (s[i+1] == 'x' || s[i+1] == 'X') {
+			j := i + 2
+			for j < len(s) && isHexDigit(s[j]) {
+				j++
+			}
+			if j > i+2 { // 后面确实跟着十六进制位：整段并成一格
+				if !prevDigit {
+					b.WriteRune('#')
+				}
+				prevDigit = true
+				i = j
+				continue
+			}
+		}
+		r := s[i]
 		isDigit := r >= '0' && r <= '9'
 		if isDigit && !prevDigit {
 			b.WriteRune('#')
 		} else if !isDigit {
-			b.WriteRune(r)
+			b.WriteByte(r)
 		}
 		prevDigit = isDigit
+		i++
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 func (a *Aggregator) noteReason(s string) {

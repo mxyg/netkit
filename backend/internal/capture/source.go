@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -22,6 +24,10 @@ var (
 	ErrClosed = errors.New("capture: 这个抓包口已经关了")
 	// ErrNoSuchInterface：点名的口在这台机器上没有。
 	ErrNoSuchInterface = errors.New("capture: 这台机器上没有这个口")
+	// ErrFilterPresent：这台机器上已经挂着别人下的抓包筛选器（Windows 的 pktmon filter）。
+	// ★ 单独一个哨兵：这一种的下一步与「没权限」恰好相反 —— 不是去提权，
+	// 而是先问清这些筛选器是谁下的。这一档绝不替你删别人的东西（filter remove 是全清）。
+	ErrFilterPresent = errors.New("capture: 这台机器上已经挂着别人的筛选器")
 )
 
 // Options 是一次采集的口径。零值 = 「所有口、按默认留长、别改系统」。
@@ -96,6 +102,18 @@ const DefaultBufferSize = 4 << 20
 // DefaultBlockRetire 是一块最多攒多久就交出去。
 // 100ms 是「界面看得出在动」和「系统调用不碎」之间的那一档。
 const DefaultBlockRetire = 100 * time.Millisecond
+
+// DefaultDir 是抓包文件默认的落盘目录（各平台同一句：用户配置目录下）。
+//
+// ★ 为什么由这一层给而不是让调用方自己拼：抓包文件的默认去处必须是一个「找得回来」
+// 的地方。现场抓完要发给同事、要拿 Wireshark 打开，人在界面里看到的就该是这个路径。
+func DefaultDir() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("capture: 找不到用户配置目录，抓包文件没地方落：%w", err)
+	}
+	return filepath.Join(base, "yuhox-netkit", "captures"), nil
+}
 
 // sourceIfaces 把「要哪个口」落成口名列表。空 = 所有口
 // （含 lo：现场往往只有回环上的东西抓得到，比如本机服务自己连自己）。

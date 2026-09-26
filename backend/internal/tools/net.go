@@ -29,6 +29,7 @@ var localTools = []ots.Tool{
 	fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
 	throughputServeTool, throughputStatusTool, throughputStopTool, throughputTestTool, speedTestTool,
 	qualityWatchTool, qualityStatusTool, qualityReportTool, qualityStopTool,
+	captureStartTool, captureStatusTool, captureStopTool, captureFlowsTool, captureFlowTool, captureOpenTool,
 	bandwidthTopTool,
 	diagBundleTool, troubleshootTool,
 }

@@ -14,6 +14,7 @@ package flow
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 
 	"net.yuhox.com/netkit/internal/capture"
@@ -25,17 +26,24 @@ import (
 // 这三种都不是某一条流的问题，是整张表的口径问题，
 // 混进某一条流的判定里，看的人就会去查那台机器。
 type Table struct {
-	a         *Aggregator
-	ifaces    []capture.Interface
-	byReason  map[string]int
-	noStamp   int // 没带时刻的包数
-	badIface  int // 口序号在口表里找不到的包数
-	truncated int // 带回来的比线上声明的短的包数
-	total     int
+	a        *Aggregator
+	ifaces   []capture.Interface
+	byReason map[string]int
+	noStamp  int // 没带时刻的包数
+	badIface int // 口序号在口表里找不到的包数
+	total    int
+	// 被剪过的包单独记：整表口径要说的是「剪到多少字节」，不是「每一种线上长度各来了一包」。
+	//
+	// ★ 为什么不按「线上多少字节」当键去攒：那一种键每一号包都可能不一样
+	//   （Windows pktmon 默认只带 128 字节回来，一份文件能给出上千种线上长度），
+	//   报告会被它撑成一条读不完的长串，而它想说的只有一句「带回来的都剪到 X 字节了」。
+	truncated int
+	truncAt   map[int]int // 带回来的长度 → 包数（这一种键一个文件里就几号）
+	truncWire int         // 线上最长的那一种：差多少要说出来，才知道 snaplen 该调到哪
 }
 
 func NewTable(opt Options) *Table {
-	return &Table{a: NewAggregator(opt), byReason: map[string]int{}}
+	return &Table{a: NewAggregator(opt), byReason: map[string]int{}, truncAt: map[int]int{}}
 }
 
 // Aggregator 露出聚合器：工具层要按键取一条流、或要直接喂 Packet 时用。
@@ -61,8 +69,13 @@ func (t *Table) Add(p capture.Packet) error {
 		return nil
 	}
 	if p.OrigLen > len(p.Data) {
+		// ★ 只攒「带回来多少」与「线上最长是多少」两笔，不逐号包记一句：
+		//   逐号记会把报告撑爆（见 Table 上那一段）。
 		t.truncated++
-		t.note("被截过：线上 " + strconv.Itoa(p.OrigLen) + " 字节，只带回来 " + strconv.Itoa(len(p.Data)))
+		t.truncAt[len(p.Data)]++
+		if p.OrigLen > t.truncWire {
+			t.truncWire = p.OrigLen
+		}
 	}
 	if !p.HasTimestamp {
 		// ★ 不拿零值当「1970 年抓的」，也不拿前一包的时刻凑：
@@ -175,14 +188,74 @@ func (t *Table) Report() []string {
 			"%d 包的口序号在口表里找不到：这一份文件的接口描述不齐，那一些包没进表", t.badIface))
 	}
 	if t.truncated > 0 {
-		out = append(out, fmt.Sprintf(
-			"%d 包带回来的比线上声明的短（抓的时候设了 snaplen 或被剪过）：正文与后面那半截字段不可信", t.truncated))
+		line := fmt.Sprintf(
+			"%d 包带回来的比线上声明的短（抓的时候设了 snaplen 或被剪过）：正文与后面那半截字段不可信", t.truncated)
+		if s := t.truncShape(); s != "" {
+			line += "。" + s
+		}
+		out = append(out, line)
 	}
-	for s, n := range t.byReason {
+	out = append(out, topReasons(t.byReason, 6)...)
+	return out
+}
+
+// truncShape 把「剪到多少字节」说成一句照着能改的话。
+//
+// 报告里要的是那一个数（带回来的长度集中在哪一档）和差多远（线上最长的那一种），
+// 不是上千种线上长度各来一行 —— 那种清单既读不完，也不指向任何一个下一步动作。
+func (t *Table) truncShape() string {
+	if len(t.truncAt) == 0 {
+		return ""
+	}
+	bestLen, bestN := -1, -1
+	for l, n := range t.truncAt {
+		// 并列时取更短的那一种：同一份文件读两遍必须给出同一句话。
+		if n > bestN || (n == bestN && l < bestLen) {
+			bestLen, bestN = l, n
+		}
+	}
+	s := fmt.Sprintf("带回来的长度最常见的是 %d 字节", bestLen)
+	if len(t.truncAt) > 1 {
+		s += fmt.Sprintf("（一共 %d 种长度）", len(t.truncAt))
+	}
+	if t.truncWire > 0 {
+		s += fmt.Sprintf("，线上最长的一种 %d 字节 —— 要正文全的，重抓时 snaplen 至少调到那里", t.truncWire)
+	}
+	return s
+}
+
+// topReasons 把零散的整表毛病列出来：按笔数从多到少，并列按字面排。
+//
+// ★ 两件事都必须做：
+//  1. **排序**。map 的遍历顺序每一遍都不一样 —— 不排，同一份文件两次读出的表就不一样，
+//     而这张表的全部分量都在「指着同一个数说同一句话」。
+//  2. **封顶**。一份口表错位的文件能给出上千种毛病，全列出来会把真正要看的那几行挤没。
+//     只列前几样，但「还有几种没列」必须报出来 —— 封顶是省版面，不许变成吞账。
+func topReasons(m map[string]int, n int) []string {
+	type kv struct {
+		s string
+		c int
+	}
+	list := make([]kv, 0, len(m))
+	for s, c := range m {
 		if s == "" {
 			continue
 		}
-		out = append(out, fmt.Sprintf("%s ×%d", s, n))
+		list = append(list, kv{s, c})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].c != list[j].c {
+			return list[i].c > list[j].c
+		}
+		return list[i].s < list[j].s
+	})
+	var out []string
+	for i, e := range list {
+		if i >= n {
+			out = append(out, fmt.Sprintf("另有 %d 种零头没列（笔数都比上面这几样少）", len(list)-n))
+			break
+		}
+		out = append(out, fmt.Sprintf("%s ×%d", e.s, e.c))
 	}
 	return out
 }

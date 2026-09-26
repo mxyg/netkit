@@ -321,33 +321,73 @@ func indexFold(s, sub string) int {
 	return strings.Index(strings.ToLower(s), sub)
 }
 
-// scrubLongB64 把 24 字符以上的纯 base64 样串打掉。
+// scrubLongB64 把「长得像凭据」的那一段连续 base64 样串打掉。
 //
-// ★ 会不会误伤？会：一段长 OID、一个 base64 的证书链都会被打码。
-// 这里的取舍是明确的 —— 误伤只是少了一格信息，漏一处就是泄一份凭据。
+// ★ 这一道是补漏的闸，不是主闸：主闸是按字段名洗的那一层，以及 password= 那几种形状。
+//
+//	  补漏的闸最容易犯的错不是漏一处，是**把排查要用的那一格吃掉，还让人以为脱敏成功了** ——
+//	  所以这里的三条口径都是为了让「误伤」不再顺手打死第一手证据：
+//
+//		① 点号不算 base64 的字符。base64 与 base64url 的字母表里没有 '.'，JWT 拿它分段
+//		   （每一段自己就够长，照样打掉）。把 '.' 收进来，"10.0.0.9/Streaming/Channels/101"
+//		   就凑成一个 31 格的「密钥」：流地址正是「地址写错了」那一问要读的那一格，
+//		   而同一包在 uri 那一格（走按字段的洗法）却完好 —— 同一份包两个说法，
+//		   现场就会信那个被吃掉的。
+//		② 门槛 32。digest response 是 32 位十六进制，JWT 三段与 PSK 的编码都在 36 以上；
+//		   24 那一档恰好把路径段捞进来。短于 32 的凭据归上面那两道闸管。
+//		③ 带斜杠的那一段还要再看一眼：真凭据是「一整坨」，斜杠两边的块都长；
+//		   路径是「好几个短词」，每个斜杠段都短。所以带斜杠时要求最长的一段够长，
+//		   否则当成路径留着。
+//
+// 仍然会误伤：一段长 OID、base64 的证书链。这里的取舍没变 —— 误伤少一格信息，
+// 漏一处泄一份凭据，而凭据一旦跟着结果出去就永远收不回来。
 func scrubLongB64(s string) string {
+	const minRun = 32
 	var b strings.Builder
 	run := 0
-	flush := func() {
-		if run >= 24 {
+	start := 0
+	flush := func(end int) {
+		if run >= minRun && looksLikeBlob(s[start:end]) {
 			b.WriteString("***")
+		} else {
+			b.WriteString(s[start:end]) // 原样还回去：没判定成凭据就不许吃掉一个字
 		}
 		run = 0
 	}
 	isB64 := func(c byte) bool {
-		return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '/' || c == '=' || c == '-' || c == '_' || c == '.'
+		return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' ||
+			c == '+' || c == '/' || c == '=' || c == '-' || c == '_'
 	}
 	for i := 0; i < len(s); {
 		if isB64(s[i]) {
-			b.WriteByte(s[i])
+			if run == 0 {
+				start = i
+			}
 			run++
 			i++
 			continue
 		}
-		flush()
+		flush(i)
 		b.WriteByte(s[i])
 		i++
 	}
-	flush()
+	flush(len(s))
 	return b.String()
+}
+
+// looksLikeBlob 问这一段够不够像一坨编码出来的凭据。
+//
+// 斜杠是 base64 的合法字符，也是路径的分隔符 —— 光看字符分不开，看形状分得开：
+// 44 字节的 PSK 编码里斜杠是零星的（一坨长块），而流地址是几个短词。
+func looksLikeBlob(seg string) bool {
+	if !strings.ContainsRune(seg, '/') {
+		return true
+	}
+	longest := 0
+	for _, p := range strings.Split(seg, "/") {
+		if len(p) > longest {
+			longest = len(p)
+		}
+	}
+	return longest >= 16
 }

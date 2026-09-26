@@ -565,6 +565,8 @@ func RestoreOnStart(log *slog.Logger) {
 	restoreFileShare(log)
 	// 持续质量监测同理：采集器随进程没了，但留痕文件一律不动（见 quality.go）
 	restoreQualityWatch(log)
+	// 抓包同理：采集口与文件句柄随进程释放，落盘那份是现场证据，一个字都不动（见 capture.go）
+	restoreCapture(log)
 }
 
 // ── 小工具 ──

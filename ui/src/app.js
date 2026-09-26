@@ -64,6 +64,7 @@ const PAGES = [
 
   { g: '出问题了', id: 'checkup', name: '一键体检与诊断包', render: renderCheckup },
   { g: '出问题了', id: 'trouble', name: '按症状排查', render: renderTrouble },
+  { g: '出问题了', id: 'capture', name: '抓包看内容', render: renderCapture },
 
   { g: '管别的机器', id: 'remote', name: '远程设备与审计', render: renderRemote },
   { g: '管别的机器', id: 'remote-work', name: '连上去干活', render: renderRemoteWork },
@@ -121,6 +122,11 @@ async function show() {
   clearInterval(qualityTimer);
   qualityTimer = null;
   qualityPick = null;
+  // ★ 抓包那一路的计数每 3 秒问一次，理由同上；capPick 留着会让流表上的
+  //   「看这一条」在换页之后仍往已经拆掉的明细卡里写
+  clearInterval(capTimer);
+  capTimer = null;
+  capPick = null;
   main.innerHTML = '<div class="empty">读取中…</div>';
   const p = PAGES.find((x) => x.id === current);
   main.innerHTML = '';
@@ -8727,6 +8733,577 @@ function troubleCard() {
         <pre class="dim">${esc(JSON.stringify(r.raw, null, 2))}</pre></details>`;
   };
   card.querySelector('#tr-t').onkeydown = (e) => { if (e.key === 'Enter') card.querySelector('#tr-go').click(); };
+  return card;
+}
+
+/*
+ * ── 抓包看内容（net.capture.*）──
+ *
+ * ★★ 这一页是「按症状排查」往下走的那一步。前面那些页都在问「通不通、快不快」，
+ *   而现场最后一句永远是「那里面到底跑了什么」—— 那一问只有包能答。
+ *
+ * ★★ 两条口径必须分开摆：盘上那份 pcapng 是**原始包**（明文口令、SNMP 团体名、
+ *   国标 digest response 全在里面），页面上这张表是**脱了敏的**（凭据只留「带没带、多长」）。
+ *   所以每一张卡都把这句话带到人眼前：人转出去的是表；把文件发出去就等于把口令发出去。
+ *
+ * ★ 界面一处都不算。包数账、丢包口径、流表、逐条判定、跨流引用，全部来自后端；
+ *   这里只把码翻成人话。判定点名的那个数和表上摆的那个数同源。
+ *
+ * ★ 「起不来」分四档各给一步：要提权 / 这平台没有这一档 / 场上挂着别人下的筛选器 /
+ *   点名的网卡没有。混成一句「抓包失败」，人就只会一遍遍点同一个按钮。
+ */
+
+// 开 / 状态 / 停 这一张卡的九档。
+const CAP_STATE = {
+  'capture-running': ['正在抓', 'ok'],
+  'capture-running-lossy': ['正在抓，但内核已报丢包', 'bad'],
+  'capture-idle': ['没在抓，上一次的账还在', ''],
+  'capture-stopped': ['停掉了，文件留着', ''],
+  'capture-no-session': ['这台机器上没有抓包的账', ''],
+  'capture-no-privilege': ['起不来：这一档要提权', 'bad'],
+  'capture-unsupported': ['这个平台没有现场抓这一档', 'bad'],
+  'capture-filter-present': ['场上挂着别人下的筛选器', 'bad'],
+  'capture-no-interface': ['点名的网卡在这台机器上没有', 'bad'],
+};
+
+// 表这一张卡的六档。★ 与上面分开：「这份来源没包」和「这台机器起不来」是两种下一步。
+const CAP_TABLE = {
+  'capture-flows': ['表出来了', 'ok'],
+  'capture-no-packets': ['一个包都没收到', 'warn'],
+  'capture-no-flows': ['收到包了，归不出一条流', 'warn'],
+  'capture-no-flow': ['这一条流不在当前这张表上', 'bad'],
+  'capture-file-unreadable': ['那份文件读不动', 'bad'],
+  'capture-no-session': ['手上没有一份能看的账', ''],
+};
+
+// ★ 丢包三种口径不许并成一句「有丢包/没丢包」：数到了几包才谈得上「丢的是哪几包」，
+//   只知道丢过就只能说方向，而「这一档平台给不出计数」既不是没丢也不是丢了。
+const CAP_DROP = {
+  counted: ['数到了包数', 'bad'],
+  'flagged-only': ['只知道丢过，给不出几包', 'warn'],
+  'none-reported': ['内核没报丢包（不等于一包没丢）', 'ok'],
+  unknown: ['这一档说不出丢没丢', 'warn'],
+};
+
+const CAP_WHY = {
+  user: '人停的',
+  duration: '到了自己定的时长',
+  'max-bytes': '★ 到了文件大小上限 —— 不是这条链路没流量了',
+  'io-error': '读包或写文件出错（先查是不是盘满了）',
+  'close-timeout': '★ 关口没回音，账先收在这儿：文件末尾可能还差几包',
+};
+
+let capTimer = null;
+let capPick = null;   // 流表上的「看这一条」按下去，填进明细卡
+
+async function renderCapture(root) {
+  root.appendChild(captureCard());
+  root.appendChild(captureFlowsCard());
+  root.appendChild(captureFlowCard());
+  root.appendChild(captureOpenCard());
+}
+
+const capClock = (s) => (s ? fmtStamp(s) : '—');
+
+// capFacts 一行一条「这一格从哪来」：抓包这一页的数全是现场证据，说不清出处就等于没有。
+function capFacts(rows) {
+  const kept = rows.filter(Boolean);
+  if (!kept.length) return '';
+  return `<table style="margin-top:12px"><tr><th></th><th></th></tr>
+    ${kept.map((f) => `<tr><td class="dim" style="white-space:nowrap">${f[0]}</td><td>${f[1]}</td></tr>`).join('')}</table>`;
+}
+
+function capShell(cls, text) {
+  const bg = cls === 'ok' ? 'var(--green-bg)' : cls === 'bad' ? 'var(--red-bg)' : 'var(--sunken)';
+  const line = cls === 'ok' ? 'var(--green-dim)' : cls === 'bad' ? 'var(--red-line)' : 'var(--line)';
+  // ★ 后端这些 note 是分行的（包数账、下一步各占一行），HTML 会把 \n 折成空格：
+  //   折完就是一整块看不清的话，而这一段正是这一页最长的一句结论。
+  return `<div style="background:${bg};border:1px solid ${line};border-radius:6px;padding:10px 12px;font-size:13.5px;white-space:pre-wrap">
+    ${esc(text || '')}</div>`;
+}
+
+/**
+ * capAccount 这份来源自己的口径：包数账 + 整表那一层的毛病 + 只读了一半 / 到顶停的。
+ * ★ 放在表外面而不是塞进某一条流：这些是**这份来源**的毛病，
+ *   混进某条流的判定里就会把人支去查一台没病的机器。
+ */
+function capAccount(v) {
+  const parts = [];
+  if (v.packetAccount) {
+    parts.push(`<p class="dim" style="margin:10px 0 0">包数账：${esc(v.packetAccount)}
+      ${v.partialRead ? '<span class="bad">· 这份文件只读了前面一段，下面所有结论只对读到的那一段成立</span>' : ''}</p>`);
+  }
+  const rep = v.report || [];
+  if (rep.length) {
+    parts.push(`<p class="warn" style="margin:6px 0 0">这份来源自己的毛病：<br>${
+      rep.map((r) => `· ${esc(r)}`).join('<br>')}</p>`);
+  }
+  if (v.stopWhy === 'max-bytes') {
+    parts.push('<p class="bad" style="margin:6px 0 0">这一路是<strong>到了文件大小上限</strong>停的：后面的包没进来，别说成「这条链路没流量」。</p>');
+  }
+  if (v.stopWhy === 'close-timeout') {
+    parts.push('<p class="bad" style="margin:6px 0 0">关口没回音就收了账：文件末尾可能还差几包，别按「这就是全部」用。</p>');
+  }
+  if (v.writeErr) {
+    parts.push(`<p class="bad" style="margin:6px 0 0">那一路写文件出过错：${esc(v.writeErr)}（文件可能不完整）</p>`);
+  }
+  return parts.join('');
+}
+
+function captureCard() {
+  const card = $(`<div class="card">
+    <h2>开一路抓包 <span id="cap-top"></span></h2>
+    <p class="hint">把这台机器上（或点名的那块网卡）<strong>每一个包原样</strong>落到一个 pcapng 文件里，
+      同时按流聚合成一张表。★ 默认就留全帧（一包 1600 字节）：「半截报文」是最难查的一种假象 ——
+      长度看着对，内容却是空的。
+      ★ <strong>文件里是原始包，含明文口令、SNMP 团体名、国标 digest response</strong>：
+      发给同事或 AI 的是下面那张脱敏的表，不是这个文件。
+      ★ 这一路会一直占着采集口、一直往盘上写，所以要你点头；一次只开一路，
+      那颗「停」只会停当前这一路。
+      ★ 丢包十有八九是内核环小了（默认 4MB，百兆口全速撑不到一秒），不是网络慢：
+      报了丢包就先把环调大或只抓点名的那块口再抓一次。</p>
+    <div class="row">
+      <div style="flex:1 1 200px"><label>只抓哪块网卡</label>
+        <select id="cap-iface"><option value="">所有网卡（含回环）</option></select></div>
+      <div style="flex:0 0 140px"><label>最长抓多少秒（空=不停）</label>
+        <input id="cap-seconds" placeholder="默认一直抓到你点停"></div>
+      <div style="flex:0 0 140px"><label>文件上限 MB</label>
+        <input id="cap-max" placeholder="默认 256"></div>
+      <div style="flex:0 0 140px"><label>内核环 MB</label>
+        <input id="cap-buffer" placeholder="默认 4"></div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:0 0 160px"><label>一包留多少字节</label>
+        <input id="cap-snap" placeholder="默认 1600（全帧）"></div>
+      <div style="flex:1 1 260px"><label>落到哪个完整路径（空=NetKit 数据目录，文件名带时刻）</label>
+        <input id="cap-file" placeholder="已经存在的文件会被直接拒，不覆盖"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <label class="dim" style="font-weight:400"><input type="checkbox" id="cap-promisc"> 混杂模式（不是发给本机的帧也收）</label></div>
+    </div>
+    <p class="hint" style="margin-top:6px">★ 混杂模式不是「抓到别人的包」的开关：交换机上本来就收不到别人的单播，
+      那一档要端口镜像。它只对集线器和镜像口有意义，而且虚拟口与部分无线网卡会直接拒。</p>
+    <div class="row" style="margin-top:6px">
+      <div style="flex:0 0 auto;min-width:0">
+        <button class="btn danger" id="cap-go">开始抓包</button>
+        <button class="btn" id="cap-refresh">刷新状态</button>
+        <button class="btn danger" id="cap-stop" style="display:none">立刻停掉</button>
+        <button class="btn" id="cap-reveal" style="display:none">去看这一张表</button>
+      </div>
+    </div>
+    <div id="cap-err" style="margin-top:12px"></div>
+    <div id="cap-out" style="margin-top:14px"></div>
+  </div>`);
+
+  const out = card.querySelector('#cap-out');
+  const errBox = card.querySelector('#cap-err');
+  const top = card.querySelector('#cap-top');
+  const btnStop = card.querySelector('#cap-stop');
+  const btnGo = card.querySelector('#cap-go');
+  const btnReveal = card.querySelector('#cap-reveal');
+  const sel = card.querySelector('#cap-iface');
+
+  // 网卡下拉：★ 这里列的是这台机器<strong>现在</strong>有哪几块口，抓不到对端的包
+  // 第一个原因常常就是选错了口，所以名字后面带上地址。
+  (async () => {
+    const r = await call('net.interfaces');
+    const ns = (r.ok && r.values.interfaces) || [];
+    for (const n of ns) {
+      const addr = (n.addrs || []).map((a) => a.cidr).join(' ');
+      const o = document.createElement('option');
+      o.value = n.name;
+      o.textContent = addr ? `${n.name}（${addr}）` : n.name;
+      sel.appendChild(o);
+    }
+    if (!ns.length) {
+      sel.innerHTML = '<option value="">所有网卡（含回环）</option>';
+      errBox.innerHTML = '<div class="empty">网卡一块都没读到 —— 下拉是空的，只能按「所有网卡」抓。</div>';
+    }
+  })();
+
+  let busy = false;
+
+  const paint = (code, v, note) => {
+    const [title, cls] = CAP_STATE[code] || [code || '没给判定', ''];
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+    const running = code === 'capture-running' || code === 'capture-running-lossy';
+    btnStop.style.display = running ? '' : 'none';
+    btnReveal.style.display = (running || v.packets) ? '' : 'none';
+    const facts = [];
+    if (v.interface !== undefined || running) {
+      facts.push(['抓的是', v.interface
+        ? `<code>${esc(v.interface)}</code>`
+        : `所有网卡（含回环）${typeof v.interfaces === 'number' ? ` · 读到 ${esc(v.interfaces)} 块口` : ''}`]);
+    }
+    if (typeof v.snapLen === 'number') {
+      facts.push(['一包留', `${esc(v.snapLen)} 字节${v.snapLen < 1600 ? ' <span class="warn">被剪过：正文与后面那半截字段不可信</span>' : ''}`]);
+    }
+    if (typeof v.bufferMB === 'number') { facts.push(['内核环', `${esc(v.bufferMB)} MB`]); }
+    if (v.promisc) { facts.push(['混杂模式', '开着']); }
+    if (typeof v.packets === 'number') {
+      facts.push(['已经收到', `<b>${esc(v.packets)}</b> 包 / ${esc(fsSize(v.bytes || 0))}`]);
+    }
+    if (v.startedAt) { facts.push(['什么时候开的', esc(capClock(v.startedAt))]); }
+    if (v.stoppedAt) { facts.push(['什么时候停的', esc(capClock(v.stoppedAt))]); }
+    if (typeof v.spanMs === 'number') { facts.push(['抓了多久', esc(humanMs(v.spanMs))]); }
+    if (v.file) { facts.push(['原始包落在', `<code style="user-select:all">${esc(v.file)}</code>`]); }
+    if (typeof v.maxMB === 'number' && running) { facts.push(['文件上限', `${esc(v.maxMB)} MB（到顶自己停，并且会写清是到顶不是没流量）`]); }
+    if (typeof v.seconds === 'number' && v.seconds > 0 && running) {
+      facts.push(['自动停', `到 ${esc(v.seconds)} 秒自己停`]);
+    }
+    if (v.stopWhy) { facts.push(['为什么停了', esc(CAP_WHY[v.stopWhy] || v.stopWhy)]); }
+    if (v.origin === 'file') { facts.push(['这一张表的来路', `导入的文件 <code>${esc(v.file || '')}</code>`]); }
+    const drop = CAP_DROP[v.dropAccount];
+    const dropRow = drop
+      ? `<p class="${drop[1]}" style="margin:10px 0 0">丢包口径：${esc(drop[0])}</p>`
+      : (typeof v.dropped === 'number'
+        ? `<p class="${v.dropped ? 'bad' : 'dim'}" style="margin:10px 0 0">这一本账记下的丢包：${esc(v.dropped)} 包${v.lossy ? '（内核还标过「丢过」）' : ''}</p>`
+        : '');
+    out.innerHTML = capShell(cls, note) + capFacts(facts) + dropRow
+      + `<details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+  };
+
+  const refresh = async (quiet) => {
+    const r = await call('net.capture.status');
+    if (busy) return;
+    if (!r.ok) {
+      if (!quiet) out.innerHTML = `<div class="empty">看不了状态：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    paint(r.verdict, r.values || {}, r.note);
+    const running = r.verdict === 'capture-running' || r.verdict === 'capture-running-lossy';
+    if (capTimer) { clearInterval(capTimer); capTimer = null; }
+    if (running) capTimer = setInterval(() => refresh(true), 3000);
+  };
+
+  const hush = () => {
+    busy = true;
+    if (capTimer) { clearInterval(capTimer); capTimer = null; }
+  };
+
+  btnGo.onclick = async () => {
+    const args = {};
+    // 不填就交给后端按默认来：这里替它填一个号，等于人没同意过的口径。
+    const num = (id, key) => {
+      const x = card.querySelector(id).value.trim();
+      if (x) { args[key] = Number(x); }
+    };
+    if (sel.value) { args.interface = sel.value; }
+    num('#cap-seconds', 'seconds');
+    num('#cap-max', 'maxMB');
+    num('#cap-buffer', 'bufferMB');
+    num('#cap-snap', 'snapLen');
+    if (card.querySelector('#cap-promisc').checked) { args.promisc = true; }
+    const f = card.querySelector('#cap-file').value.trim();
+    if (f) { args.file = f; }
+    hush();
+    errBox.innerHTML = '';
+    top.innerHTML = '';
+    out.innerHTML = '<div class="empty">等你点批准…（取消的话一个包都不收，盘上也不留文件）</div>';
+    const r = await call('net.capture.start', args);
+    busy = false;
+    if (!r.ok) {
+      // 「这一路没开起来」和「现在这台是什么状态」是两句话：前一句写在这里，
+      // 后一句照样问回来（多半是上一次那份账还躺在盘上）。
+      errBox.innerHTML = `<div class="empty">这一路没开起来：${esc(r.message || r.error)}</div>`;
+      refresh(true);
+      return;
+    }
+    paint(r.verdict, r.values || {}, r.note);
+    if (capTimer) clearInterval(capTimer);
+    if (r.verdict === 'capture-running' || r.verdict === 'capture-running-lossy') {
+      capTimer = setInterval(() => refresh(true), 3000);
+    }
+  };
+
+  card.querySelector('#cap-refresh').onclick = () => refresh(true);
+  btnReveal.onclick = () => {
+    const t = document.getElementById('cap-flows-go');
+    if (t) { t.click(); t.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+  };
+  btnStop.onclick = async () => {
+    btnStop.disabled = true;
+    hush();
+    errBox.innerHTML = '';
+    out.innerHTML = '<div class="empty">等你点批准…（取消就还在抓）</div>';
+    const r = await call('net.capture.stop');
+    btnStop.disabled = false;
+    busy = false;
+    if (!r.ok) {
+      errBox.innerHTML = `<div class="empty">停不下来：${esc(r.message || r.error)}</div>`;
+      refresh(true);
+      return;
+    }
+    paint(r.verdict, r.values || {}, r.note);
+  };
+  refresh(true);
+  return card;
+}
+
+// capRowsHTML 流表的一行。★ 每条流自己那一层的判定直接摆在这行里，
+// 不用先点开 —— 现场是「哪条不对点哪条」，反过来「先点开再发现不对」会漏。
+function capRowsHTML(rows) {
+  return (rows || []).map((f) => {
+    const app = f.app
+      ? `<b>${esc(f.app)}</b> <span class="dim">按${esc(f.appBy || '端口')}</span>`
+      : '<span class="dim">认不出</span>';
+    const dirs = `<span class="dim">${esc(f.ab ?? 0)} → / ← ${esc(f.ba ?? 0)}</span>`;
+    const notes = [...(f.notes || []), ...((f.findings || []).map((x) => x.text))]
+      .filter(Boolean);
+    const miss = (f.missing || []).length
+      ? `<div class="bad">信令里说好、表上没有的收流口：${esc((f.missing || []).join('、'))}</div>` : '';
+    const links = [];
+    if ((f.media || []).length) {
+      links.push(`这条信令开出来 ${f.media.length} 条媒体流：${
+        f.media.map((m) => `<button class="btn" data-k="${esc(m.key)}">${esc((m.endpoints || []).join(' ') || m.key)}</button>`).join(' ')
+      }<span class="dim">（${esc(f.media.map((m) => m.why).join('、'))}）</span>`);
+    }
+    if ((f.signaling || []).length) {
+      links.push(`这条媒体流是 ${f.signaling.length} 条信令开的：${
+        f.signaling.map((m) => `<button class="btn" data-k="${esc(m.key)}">${esc((m.endpoints || []).join(' ') || m.key)}</button>`).join(' ')
+      }`);
+    }
+    return `<tr>
+      <td><code>${esc(f.proto)}</code><div class="dim">${esc(f.a)} → ${esc(f.b)}</div>
+        ${f.iface ? `<div class="dim">口 ${esc(f.iface)}</div>` : ''}
+        ${f.vlans && f.vlans.length ? `<div class="dim">VLAN ${esc(f.vlans.join(','))}</div>` : ''}</td>
+      <td>${app}</td>
+      <td><b>${esc(f.packets)}</b><div class="dim">${esc(fsSize(f.bytes || 0))}</div>${dirs}</td>
+      <td class="dim">${f.durationMs ? esc(humanMs(f.durationMs)) : '—'}
+        <div>${esc(capClock(f.first).slice(11))}</div></td>
+      <td>${f.handshake ? esc(f.handshake) : '<span class="dim">—</span>'}
+        ${f.creds ? `<div class="dim">已脱敏 ${esc(f.creds)} 处</div>` : ''}</td>
+      <td>${notes.length ? notes.map((n) => `<div class="warn">· ${esc(n)}</div>`).join('') : '<span class="dim">—</span>'}${miss}
+        ${links.length ? `<div class="dim" style="margin-top:4px">${links.join('<br>')}</div>` : ''}</td>
+      <td><button class="btn" data-k="${esc(f.key)}">看这一条</button></td>
+    </tr>`;
+  }).join('');
+}
+
+// capTableOut 是「一张表」的统一画法：实时抓的、导入文件的两条来路走这一个函数。
+// ★ 两条来路必须同一张形状，否则同一份包从网卡上接的和从磁盘上读的迟早给出两套说法。
+function capTableOut(code, v, note) {
+  const [title, cls] = CAP_TABLE[code] || [code || '没给判定', ''];
+  const rows = v.flows || [];
+  const facts = [];
+  // ★ 只在真有一份账的时候摆这几行：「手上没账」那一档结果里一个字段都没有，
+  //   照摆就成了「当前这一路：（空）· 还在抓 · 收了 0 包」—— 那句「还在抓」是凭空造的结论。
+  if (v.origin) {
+    facts.push([v.origin === 'file' ? '这一张表的来路' : '当前这一路',
+      v.origin === 'file' ? `导入的文件 <code>${esc(v.file || '')}</code>`
+        // 「还在抓」按 stopWhy 空不空说：这一栏里空串就是「还在收」（后端同一口径）。
+        : `<code>${esc(v.file || '')}</code>${!v.stopWhy ? ' <span class="pill ok">还在抓</span>' : ''}`]);
+    facts.push(['这份账收了', `${esc(v.packets ?? 0)} 包 / ${esc(fsSize(v.bytes || 0))}`]);
+    if (typeof v.interfaces === 'number') { facts.push(['涉及几块口', `${esc(v.interfaces)} 块`]); }
+  }
+  if (typeof v.flowCount === 'number') {
+    facts.push(['归出多少条流', `<b>${esc(v.flowCount)}</b> 条，这一页列了 ${rows.length} 条`]);
+  }
+  return {
+    html: `${capShell(cls, note)}${capFacts(facts)}${capAccount(v)}
+      ${rows.length ? `<div style="margin-top:12px;max-height:420px;overflow:auto"><table>
+        <tr><th>端点</th><th>认出的协议</th><th>包数 / 字节 / 两向</th><th>多久</th><th>TCP 与脱敏</th><th>这一条自己的话</th><th></th></tr>
+        ${capRowsHTML(rows)}</table></div>` : ''}`,
+    pill: title ? `<span class="pill ${cls}">${esc(title)}</span>` : '',
+  };
+}
+
+function captureFlowsCard() {
+  const card = $(`<div class="card">
+    <h2>这一张流表 <span id="cf-top"></span></h2>
+    <p class="hint">把当前这一路（或刚导入的那份文件）按流聚合成一张表：端点、包数与字节、
+      两个方向各自的账、TCP 走到哪一步、认出的应用协议（以及它是<strong>按内容</strong>还是<strong>只按端口</strong>认的），
+      还有这一条流自己的全部判定。★ 表是整表<strong>脱敏</strong>的：认证那几格只留「带没带、多长」——
+      看不到口令不代表设备没带口令。
+      ★ 一条流上可以走一万包，所以「675 包 / 1 条流」不是表漏了什么。
+      只列前 N 条时一定会另外写出来还剩多少条没列。</p>
+    <div class="row">
+      <div style="flex:0 0 160px"><label>只看这个协议</label>
+        <input id="cf-app" placeholder="rtsp / sip / onvif / mqtt / snmp / dhcp / dns / rtp"></div>
+      <div style="flex:1 1 200px"><label>只看端点带这一串的流</label>
+        <input id="cf-host" placeholder="设备只有一台的时候用它把表收干净"></div>
+      <div style="flex:0 0 130px"><label>最多列几条流</label>
+        <input id="cf-flows" placeholder="默认 60，最多 500"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn" id="cap-flows-go">刷新这张表</button></div>
+    </div>
+    <div id="cf-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#cf-out');
+  const top = card.querySelector('#cf-top');
+
+  const read = async () => {
+    const args = {};
+    const app = card.querySelector('#cf-app').value.trim();
+    const host = card.querySelector('#cf-host').value.trim();
+    const n = card.querySelector('#cf-flows').value.trim();
+    if (app) { args.app = app; }
+    if (host) { args.host = host; }
+    if (n) { args.flows = Number(n); }
+    out.innerHTML = '<div class="empty">聚合中…</div>';
+    const r = await call('net.capture.flows', args);
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">表出不来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values || {};
+    const { html, pill } = capTableOut(r.verdict, v, r.note);
+    top.innerHTML = pill;
+    out.innerHTML = html + `<details style="margin-top:10px"><summary class="dim">原始结果</summary>
+      <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+    bindCapKeys(out);
+  };
+  const go = card.querySelector('#cap-flows-go');
+  go.onclick = read;
+  card.querySelector('#cf-host').onkeydown = (e) => { if (e.key === 'Enter') read(); };
+  read();   // 一开页就把现有的账摊出来：盘上躺着一份昨天的表，人不该去猜
+  return card;
+}
+
+function bindCapKeys(box) {
+  box.querySelectorAll('button[data-k]').forEach((b) => {
+    b.onclick = () => { if (capPick) capPick(b.dataset.k); };
+  });
+}
+
+function capMsgRow(m) {
+  // ★ dir 是后端那个下标（0 = 这条流记的那一端 A 发出去，1 = 对端发回来），
+  //   不是字符串：把它当 'ab'/'ba' 比一遍，箭头会永远画成「→」，
+  //   而「谁先开的口」正是这一栏要回答的问题。
+  const dir = Number(m.dir) === 1 ? '← 对端发的' : '→ 这一端发的';
+  const fields = (m.fields || []).map((fd) => `${esc(fd.k)}=${
+    fd.redacted ? `<span class="warn">〔已脱敏〕</span>` : esc(fd.v)}`).join('　');
+  const fs = (m.findings || []).map((x) => `<div class="warn">· ${esc(x.text)}</div>`).join('');
+  return `<tr>
+    <td class="dim">${esc(capClock(m.at).slice(11))}</td>
+    <td>${dir}</td>
+    <td><code>${esc(m.line || [m.proto, m.kind, m.method, m.status].filter(Boolean).join(' '))}</code>
+      ${m.sdp ? `<div class="dim">${esc(m.sdp)}</div>` : ''}
+      ${m.uri ? `<div class="dim">${esc(m.uri)}</div>` : ''}
+      ${m.note ? `<div class="dim">${esc(m.note)}</div>` : ''}</td>
+    <td class="dim">${fields || '—'}${m.creds ? `<div>已脱敏 ${esc(m.creds)} 处</div>` : ''}</td>
+    <td>${fs || '<span class="dim">—</span>'}</td>
+  </tr>`;
+}
+
+function captureFlowCard() {
+  const card = $(`<div class="card">
+    <h2>某一条流的明细 <span id="cd-top"></span></h2>
+    <p class="hint">一条流的报文列表（每条一起始行 / 方法 / 状态码 / 关键字段）、跨流引用、
+      以及这一条自己的判定与注记。★ 字段是脱过敏的：认证那几格只留「带没带、多长」。
+      要看真正的包去磁盘上那份 pcapng（原始包，含明文口令，自己权衡发给谁）。
+      key 从上表每一行末那个按钮带过来就行。</p>
+    <div class="row">
+      <div style="flex:1 1 300px"><label>哪一条流（key）</label>
+        <input id="cd-key" placeholder="从上表点「看这一条」自动带过来"></div>
+      <div style="flex:0 0 130px"><label>最多列几条报文</label>
+        <input id="cd-msg" placeholder="默认 40，最多 200"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn" id="cd-go">读这一条</button></div>
+    </div>
+    <div id="cd-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#cd-out');
+  const top = card.querySelector('#cd-top');
+  const key = card.querySelector('#cd-key');
+
+  const read = async () => {
+    const k = key.value.trim();
+    if (!k) {
+      out.innerHTML = '<div class="empty">先说是哪一条流 —— 上面那张表每行末点一下就把 key 带过来了。</div>';
+      return;
+    }
+    const args = { key: k };
+    const n = card.querySelector('#cd-msg').value.trim();
+    if (n) { args.messages = Number(n); }
+    out.innerHTML = '<div class="empty">读这一条…</div>';
+    const r = await call('net.capture.flow', args);
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">读不出来：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values || {};
+    const [title, cls] = CAP_TABLE[r.verdict] || [r.verdict || '没给判定', ''];
+    top.innerHTML = title ? `<span class="pill ${cls}">${esc(title)}</span>` : '';
+    const msgs = v.messagesList || [];
+    const refs = [];
+    if ((v.media || []).length) refs.push(`开出来的媒体流：${v.media.map((m) => `<button class="btn" data-k="${esc(m.key)}">${esc((m.endpoints || []).join(' ') || m.key)}</button>`).join(' ')}`);
+    if ((v.signaling || []).length) refs.push(`开出它的信令：${v.signaling.map((m) => `<button class="btn" data-k="${esc(m.key)}">${esc((m.endpoints || []).join(' ') || m.key)}</button>`).join(' ')}`);
+    out.innerHTML = `${capShell(cls, r.note)}
+      ${capFacts([
+        ['端点', `<code>${esc(v.a || '')} → ${esc(v.b || '')}</code>`],
+        ['这一条', `${esc(v.packets ?? 0)} 包 / ${esc(fsSize(v.bytes || 0))}，列了 ${msgs.length} 条报文`],
+        v.proto === 'tcp' && v.handshake ? ['TCP 走到哪一步', esc(v.handshake)] : null,
+        (v.notes || []).length ? ['注记', v.notes.map((n) => esc(n)).join('<br>')] : null,
+        v.creds ? ['这一条脱敏了几处', `${esc(v.creds)} 处`] : null,
+      ])}
+      ${refs.length ? `<p class="dim" style="margin:10px 0 0">${refs.join('<br>')}</p>` : ''}
+      ${(v.findings || []).length ? `<div class="warn" style="margin-top:8px">${
+        v.findings.map((f) => `· ${esc(f.text)}`).join('<br>')}</div>` : ''}
+      ${msgs.length ? `<div style="margin-top:12px;max-height:420px;overflow:auto"><table>
+        <tr><th>时刻</th><th>向</th><th>这一条是什么</th><th>关键字段</th><th>它自己的判定</th></tr>
+        ${msgs.map(capMsgRow).join('')}</table></div>` : ''}
+      <details style="margin-top:10px"><summary class="dim">原始结果</summary>
+        <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+    bindCapKeys(out);
+  };
+  card.querySelector('#cd-go').onclick = read;
+  key.onkeydown = (e) => { if (e.key === 'Enter') read(); };
+  capPick = (k) => {
+    key.value = k;
+    read();
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  return card;
+}
+
+function captureOpenCard() {
+  const card = $(`<div class="card">
+    <h2>打开一份现成的抓包文件 <span id="co-top"></span></h2>
+    <p class="hint">同事用 tcpdump 抓的、设备导出来的、Wireshark 转出来的都算（pcapng 与老 pcap 都认），
+      出与本机抓包<strong>同一张表</strong>：按流聚合、协议专解、逐条判定、整表脱敏。
+      ★ 这个工具只读，不改它、不删它。
+      ★ 有包数上限（默认 20 万）：撞到就停下并明写「只读了前 N 包」——
+      悄悄读完一半就给整份的判断，是最坏的一种错。
+      ★ 这一档也是「这台机器压根抓不了包」时的退路：抓不了就让能抓的人抓一份发过来，
+      在这里打开，看的是同一张表。表是脱敏的，<strong>原始文件里有明文口令</strong>，转发时自己权衡。</p>
+    <div class="row">
+      <div style="flex:1 1 320px"><label>文件完整路径</label>
+        <input id="co-file" placeholder="/Users/you/captures/x.pcapng"></div>
+      <div style="flex:0 0 150px"><label>最多读多少包</label>
+        <input id="co-packets" placeholder="默认 200000"></div>
+      <div style="flex:0 0 auto;min-width:0"><label>&nbsp;</label>
+        <button class="btn" id="co-go">打开并出表</button></div>
+    </div>
+    <div id="co-out" style="margin-top:14px"></div>
+  </div>`);
+  const out = card.querySelector('#co-out');
+  const top = card.querySelector('#co-top');
+
+  const read = async () => {
+    const f = card.querySelector('#co-file').value.trim();
+    if (!f) {
+      out.innerHTML = '<div class="empty">先给文件的完整路径 —— 相对路径会落在后端自己的工作目录上，而那个目录现场没人知道在哪。</div>';
+      return;
+    }
+    const args = { file: f };
+    const n = card.querySelector('#co-packets').value.trim();
+    if (n) { args.packets = Number(n); }
+    out.innerHTML = '<div class="empty">读这份文件…（大文件要等一会儿）</div>';
+    const r = await call('net.capture.open', args);
+    if (!r.ok) {
+      out.innerHTML = `<div class="empty">打不开：${esc(r.message || r.error)}</div>`;
+      return;
+    }
+    const v = r.values || {};
+    const { html, pill } = capTableOut(r.verdict, v, r.note);
+    top.innerHTML = pill;
+    out.innerHTML = html + `<details style="margin-top:10px"><summary class="dim">原始结果</summary>
+      <pre class="dim">${esc(JSON.stringify(v, null, 2))}</pre></details>`;
+    bindCapKeys(out);
+  };
+  card.querySelector('#co-go').onclick = read;
+  card.querySelector('#co-file').onkeydown = (e) => { if (e.key === 'Enter') read(); };
   return card;
 }
 

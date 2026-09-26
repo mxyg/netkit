@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -742,6 +743,127 @@ func Test一个口都没读到时要说出来(t *testing.T) {
 	}
 	if !anyContains(tbl.Report(), "口表里没有第 0 号口") {
 		t.Errorf("缺口表的口径没写出来：%v", tbl.Report())
+	}
+}
+
+// ==================== 整表口径这一栏自己的形状 ====================
+
+func Test剪过的包只报一种形状不报上千行(t *testing.T) {
+	tbl := NewTable(Options{})
+	tbl.SetInterfaces([]capture.Interface{{Name: "eth0", LinkType: LinkEN10MB}})
+	frame := v4frame(client, device, protoUDP, udp(51234, 554, 8+len(rtspOptions), rtspOptions))
+	// ★ 一份 pktmon 真文件就是这个形状：带回来的长度全是同一个（snaplen），
+	//   线上声明的长度每一包不一样。逐号长度各记一句，口径栏会被撑成一串读不完的话，
+	//   而它想说的只有一句「剪到 128 了，要正文全的把 snaplen 调上去」。
+	for i := 0; i < 1200; i++ {
+		if err := tbl.Add(capture.Packet{Timestamp: at(i), Data: frame,
+			OrigLen: len(frame) + 1 + i, HasTimestamp: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var lines []string
+	for _, s := range tbl.Report() {
+		if strings.Contains(s, "比线上声明的短") {
+			lines = append(lines, s)
+		}
+	}
+	if len(lines) != 1 {
+		t.Fatalf("剪过的包报了 %d 行：%v（要一行，且这一行里必须带着那两个数）", len(lines), lines)
+	}
+	one := lines[0]
+	if !strings.Contains(one, "1200 包") {
+		t.Errorf("没说清有多少包被剪过：%s", one)
+	}
+	if !strings.Contains(one, fmt.Sprintf("最常见的是 %d 字节", len(frame))) {
+		t.Errorf("没说清剪到了多少字节（现场照着这一格改 snaplen）：%s", one)
+	}
+	if !strings.Contains(one, fmt.Sprintf("线上最长的一种 %d 字节", len(frame)+1200)) {
+		t.Errorf("没说清差多远：%s", one)
+	}
+	// ★ 同一份表读两遍必须给出同一串话。map 的遍历顺序每一遍都不一样，
+	//   不排序的话「同一份文件两次读出两张表」会在界面上被人看成数字在跳。
+	a, b := strings.Join(tbl.Report(), "\n"), strings.Join(tbl.Report(), "\n")
+	if a != b {
+		t.Errorf("同一份表两遍读出了两张口径：%v / %v", tbl.Report(), tbl.Report())
+	}
+}
+
+func Test零散毛病列全要排序封顶(t *testing.T) {
+	tbl := NewTable(Options{})
+	tbl.SetInterfaces([]capture.Interface{{Name: "eth0", LinkType: LinkEN10MB}})
+	frame := v4frame(client, device, protoUDP, udp(51234, 554, 8+len(rtspOptions), rtspOptions))
+	// 九种不同的毛病，笔数各不一样（第 20 号口 1 包 …… 第 28 号口 9 包）。
+	for idx, n := 20, 1; idx < 29; idx, n = idx+1, n+1 {
+		for k := 0; k < n; k++ {
+			if err := tbl.Add(capture.Packet{InterfaceIndex: idx, Timestamp: at(k),
+				Data: frame, OrigLen: len(frame), HasTimestamp: true}); err == nil {
+				t.Fatal("口表里没有的号被当成正常包收了")
+			}
+		}
+	}
+	rep := tbl.Report()
+	var reasons []string
+	capped := 0
+	for _, s := range rep {
+		switch {
+		case strings.Contains(s, "零头没列"):
+			capped++
+		case strings.Contains(s, "口表里没有第"):
+			reasons = append(reasons, s)
+		}
+	}
+	if capped != 1 {
+		t.Fatalf("封顶那一句 = %d 条，要 1 条：%v", capped, rep)
+	}
+	if !strings.Contains(rep[len(rep)-1], "另有 3 种零头没列") {
+		t.Errorf("没列出来的种数要说准（9 种只列 6 种）：%v", rep)
+	}
+	if len(reasons) != 6 {
+		t.Fatalf("列了 %d 种：%v（封顶是省版面，不是把账吞了）", len(reasons), reasons)
+	}
+	// 列出来的必须是笔数最多的那几样，从多到少。
+	prev := 1 << 30
+	for _, s := range reasons {
+		m := strings.LastIndex(s, "×")
+		// ★ 乘号是两个字节，切在字节位上会把「9」切成乱码。
+		n, err := strconv.Atoi(s[m+len("×"):])
+		if err != nil {
+			t.Fatalf("这一行没带着笔数：%s", s)
+		}
+		if n > prev {
+			t.Errorf("顺序不是从多到少：%v", reasons)
+		}
+		prev = n
+	}
+	if !strings.Contains(reasons[0], "第 28 号口") {
+		t.Errorf("最多的那一种没排在第一位：%v", reasons)
+	}
+	if strings.Join(tbl.Report(), "\n") != strings.Join(rep, "\n") {
+		t.Errorf("同一份表两遍读出了两张口径：%v / %v", rep, tbl.Report())
+	}
+}
+
+func Test原因并格不许把句子截断(t *testing.T) {
+	// 「0x」后面那一段要并成一格（0x806 与 0x0800 是同一件事），
+	// ★ 但不许从那儿把整句截掉：截掉的话界面上剩一句以「协议类型」结尾的半截话，
+	//   收尾的括号连同后面的说明全没了 —— 并格是为了少占一格，不是少说半句。
+	for _, e := range []error{
+		fmt.Errorf("flow: 只拆「以太网 ＋ IPv4」的 ARP（硬件类型 %d， 协议类型 %#x）", 1, 0x806),
+		fmt.Errorf("flow: 只拆「以太网 ＋ IPv4」的 ARP（硬件类型 %d， 协议类型 %#x）", 1, 2048),
+	} {
+		got := cleanReason(e)
+		if !strings.HasSuffix(got, "）") {
+			t.Errorf("句子被截断了：%q", got)
+		}
+		if strings.Contains(got, "806") || strings.Contains(got, "0x") {
+			t.Errorf("十六进制没并成一格：%q（两种取值会占两格，账就散了）", got)
+		}
+	}
+	// 同一件事的两种取值必须并到同一格，否则上限一撞就散成上千格。
+	a := cleanReason(fmt.Errorf("要 14 字节，这一包只有 3"))
+	b := cleanReason(fmt.Errorf("要 14 字节，这一包只有 5"))
+	if a != b {
+		t.Errorf("同一件事占了两个数：%q / %q", a, b)
 	}
 }
 

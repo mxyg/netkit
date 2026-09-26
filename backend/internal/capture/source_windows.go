@@ -220,8 +220,8 @@ func openPktmon(opt Options, names []string, run pktmonRunner, elevated int8) (S
 	} else if names := pktmonFilters(out); len(names) > 0 {
 		s.cleanup()
 		return nil, fmt.Errorf("capture: 这台机器上挂着 pktmon 筛选器（%s），"+
-			"它们会把这一路能看见的包滤掉。这一档不替你删别人的东西，请先跑一句 pktmon filter remove",
-			strings.Join(names, "、"))
+			"它们会把这一路能看见的包滤掉。这一档不替你删别人的东西，请先跑一句 pktmon filter remove：%w",
+			strings.Join(names, "、"), ErrFilterPresent)
 	}
 	if err := s.startSegment(); err != nil {
 		s.cleanup()
