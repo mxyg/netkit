@@ -21,3 +21,9 @@ keys/
 # 界面依赖与构建产物
 ui/node_modules/
 ui/build/yuhox-kit/
+
+# 翻译的中间现场（分片箱、各语言的分片、merge 不掉头的半成品 .partial）。
+# 这些不进仓库：成品是 ui/src/locales/*.js，那一份才是界面上真正加载的东西。
+# 不收进来还有一个好处 —— 分片是按 key 装箱的，改一句中文原文整批重排，
+# diff 会大得没法看，而里面没有任何一条信息是成品词典里没有的。
+ui/.i18n-work/

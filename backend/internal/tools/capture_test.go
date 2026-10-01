@@ -234,8 +234,9 @@ const (
 // rtspSessionOn 同上，客户机端口由调用方给。
 //
 // ★ 回的那一包必须整个反过来（两个 MAC、源/目的 IP、源/目的端口全部对调）：
-//   两包都写成「客户机→设备」时聚合器会归成两条流，界面上那条「一问一答」压根不存在，
-//   而这种假一路能绿着通过所有断言。
+//
+//	两包都写成「客户机→设备」时聚合器会归成两条流，界面上那条「一问一答」压根不存在，
+//	而这种假一路能绿着通过所有断言。
 func rtspSessionOn(base time.Time, cport uint16) []capture.Packet {
 	req := "DESCRIBE rtsp://" + capDevice + "/Streaming/Channels/101 RTSP/1.0\r\n" +
 		"CSeq: 2\r\n" +

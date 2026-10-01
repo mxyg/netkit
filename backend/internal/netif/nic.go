@@ -49,6 +49,11 @@ type NIC struct {
 	Kind    string `json:"kind"`
 	KindSrc string `json:"kindSrc"`
 
+	// Parent 这块口挂在哪个设备下面（桥的成员口 → 桥名）。
+	// ★ 空**不等于**「它是独立口」，还包含「这个平台没实现查法 / 问不到」——
+	//   所以只有非空才允许拿它做任何折叠或隐藏端口的决定，见 topo 层。
+	Parent string `json:"parent,omitempty"`
+
 	Addrs []netaddr.Addr `json:"addrs"` // 全部地址，v4 v6 混在一起，按有用程度排序
 
 	// Verdict 是这块网卡处于什么状态的**结构化判定**，不是一句话。
@@ -146,6 +151,7 @@ func Interfaces() ([]NIC, error) {
 	// ★ 整机问一次。macOS/Windows 上这一步要起子进程，
 	//   放进循环就是每块网卡 fork 一次，24 块网卡能把「看网卡」从毫秒拖到秒。
 	osKinds := kinds()
+	osParents := parents()
 	out := make([]NIC, 0, len(ifs))
 	for _, in := range ifs {
 		n := NIC{
@@ -157,6 +163,7 @@ func Interfaces() ([]NIC, error) {
 			Running: in.Flags&net.FlagRunning != 0,
 			Loop:    in.Flags&net.FlagLoopback != 0,
 			Virtual: IsVirtualName(in.Name),
+			Parent:  osParents[in.Name],
 		}
 		n.Kind, n.KindSrc = kindOf(in.Name, n.Loop, n.Virtual, osKinds[in.Name])
 		if addrs, err := in.Addrs(); err == nil {

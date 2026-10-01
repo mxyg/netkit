@@ -339,6 +339,7 @@ func runUp(ctx context.Context, addr string, o Options) (*Direction, int64, *RTT
 		d.Fault = err.Error()
 		return d, 0, nil
 	}
+	enableTCPInfo(c) // 趁还没开打，先把内核那本账的采集开关打开（Windows 需要；见 tcpinfo.go）
 	payload := pattern(o.Chunk)
 	deadline := time.Now().Add(time.Duration(o.Seconds) * time.Second)
 	start := time.Now()
@@ -425,6 +426,7 @@ func runDown(ctx context.Context, addr string, o Options) (*Direction, int64, *R
 		d.Fault = err.Error()
 		return d, 0, nil
 	}
+	enableTCPInfo(c) // 趁还没开收，先把内核那本账的采集开关打开（Windows 需要；见 tcpinfo.go）
 	buf := make([]byte, maxFrame)
 	deadline := time.Now().Add(time.Duration(o.Seconds) * time.Second)
 	start := time.Now()

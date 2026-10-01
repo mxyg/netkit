@@ -1057,7 +1057,7 @@ func Test对测的判定码界面上都有人话(t *testing.T) {
 	for _, code := range codes {
 		if !strings.Contains(table, "'"+code+"'") {
 			t.Errorf("码表里没有判定码 %s —— 后端只出码，中文得有人写 [OTS-4.5]", code)
-		} else if m := regexp.MustCompile(`'` + code + `': \['([^']*)'`).FindStringSubmatch(table); m == nil || m[1] == "" {
+		} else if m := regexp.MustCompile(`'` + code + `': \[(?:t\()?'([^']*)'`).FindStringSubmatch(table); m == nil || m[1] == "" {
 			t.Errorf("判定码 %s 在码表里没配人话（或那句是空的）", code)
 		}
 	}

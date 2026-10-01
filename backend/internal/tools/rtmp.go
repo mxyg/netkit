@@ -51,24 +51,28 @@ const (
 var rtmpProbeTool = ots.Tool{
 	Name:  "media.rtmp.probe",
 	Class: ots.ClassRead,
-	Summary: "问一路 RTMP：把「推流没到平台」拆成连不上、端口开着但不是 RTMP、握手不回、" +
-		"应用被拒、要口令、这路名上没有、名字对可此刻没人推、答应给流却一个媒体字节都没到、" +
-		"以及在推（顺手量出实际码率与它声明的分辨率）。" +
-		"★ 这问的是**推流那一路**（相机/OBS 往平台推、平台之间转推），" +
+	Summary: "问一路 RTMP，也问一路 HTTP-FLV（flv://）。RTMP 那一支把「推流没到平台」拆成连不上、" +
+		"端口开着但不是 RTMP、握手不回、应用被拒、要口令、这路名上没有、名字对可此刻没人推、" +
+		"答应给流却一个媒体字节都没到、以及在推（顺手量出实际码率与它声明的分辨率）。" +
+		"flv:// 那一支把 HTTP-FLV 的容器问清楚：回 404 是这路上没有、回 403/401 是要凭据、回 302 是被重定向、" +
+		"回 200 可里面不是 FLV、头是好的却一帧都没有、只有音频没有画面（那句「打开了但没画面」）、" +
+		"以及容器里真有视频（顺手把分辨率、关键帧、码种记进账）。\n" +
+		"★ 这问的是**推流那一路**（相机/OBS 往平台推、平台之间转推）与它对外给出来的那路 flv 裸流，" +
 		"取流看摄像机用 media.rtsp.probe，看平台给出来的清单用 media.hls.probe —— 三问隔的是三层，谁也不替谁。" +
-		"只读：只发 connect / createStream / play 三条命令，绝不发 publish / FCPublish / releaseStream / deleteStream，" +
+		"只读：只发 connect / createStream / play 三条命令与一次 HTTP GET，绝不发 publish / FCPublish / releaseStream / deleteStream，" +
 		"不往别人服务器上挂流。口令与 key 只上线路，不进结果。",
 	Schema: json.RawMessage(`{
 	  "type": "object",
 	  "additionalProperties": false,
 	  "required": ["url"],
 	  "properties": {
-	    "url": {"type": "string", "description": "RTMP 地址，如 rtmp://192.168.1.20:1935/live/cam1 。路径第一段是应用名（live），后面的算流名。只想问「这台认不认这个应用」时把流名省掉"},
-	    "app": {"type": "string", "description": "应用名。填了就覆盖地址里那一段 —— 地址写法古怪（应用名带参数）时用它分开填"},
-	    "stream": {"type": "string", "description": "流名。填了就覆盖地址里那一段。留空且地址里也没有时，这一问只问到「应用认不认」，判定会明说这路在不在推根本没问"},
-	    "connectParams": {"type": "object", "additionalProperties": true, "description": "connect 命令里额外的参数，各家服务器自要的：vhost、key、token 这类。★ 这些值只发出去，不进结果、不进日志。app 与 tcUrl 由探测方自己算，填了也不收"},
-	    "timeoutMs": {"type": "integer", "minimum": 500, "maximum": 60000, "description": "一步的超时毫秒数（连接、握手、每条命令各算一次），默认 5000"},
-	    "watchMs": {"type": "integer", "minimum": 500, "maximum": 15000, "description": "play 之后收多久的媒体字节，默认 3000。这一段决定「在不在推」问得准不准：给得太短，一秒一两个关键帧的流会被说成没在推"}
+	    "url": {"type": "string", "description": "RTMP 地址（rtmp://192.168.1.20:1935/live/cam1，路径第一段是应用名，后面算流名）或 HTTP-FLV 地址（flv://192.168.1.20/live/cam1，按 SRS / nginx-rtmp / ZLMediaKit 约定就是对该主机对该路径发一次 HTTP GET；不写端口默认 80）。只想问「这台认不认这个应用」时把流名省掉"},
+	    "app": {"type": "string", "description": "应用名。填了就覆盖地址里那一段 —— 地址写法古怪（应用名带参数）时用它分开填。flv:// 这一支用不上"},
+	    "stream": {"type": "string", "description": "流名。填了就覆盖地址里那一段。留空且地址里也没有时，RTMP 这一问只问到「应用认不认」，判定会明说这路在不在推根本没问。flv:// 这一支用不上"},
+	    "connectParams": {"type": "object", "additionalProperties": true, "description": "connect 命令里额外的参数，各家服务器自要的：vhost、key、token 这类。★ 这些值只发出去，不进结果、不进日志。app 与 tcUrl 由探测方自己算，填了也不收。flv:// 这一支用不上"},
+	    "timeoutMs": {"type": "integer", "minimum": 500, "maximum": 60000, "description": "一步的超时毫秒数（RTMP：连接、握手、每条命令各算一次；flv://：连接与等响应头各算一次），默认 5000"},
+	    "watchMs": {"type": "integer", "minimum": 500, "maximum": 15000, "description": "观测窗口毫秒数（默认 3000）。RTMP 是 play 之后收多久的媒体字节；flv:// 是 HTTP-GET 起来最多读多久的这段流。这一段决定「在不在推 / 有没有画面」问得准不准：给得太短，一秒一两个关键帧的流会被说成没在推"},
+	    "maxBytes": {"type": "integer", "minimum": 65536, "maximum": 16777216, "description": "仅 flv:// 用：一次容器走查最多读多少字节，默认 8388608（8 MiB）。读满就收口并按「读到的这一段」下判定 —— 直播流本来就读不到头，那不是故障。越界直接拒绝，不静默夹到边界"}
 	  }
 	}`),
 	Invoke: probeRTMP,
@@ -81,6 +85,7 @@ type rtmpArgs struct {
 	ConnectParams map[string]any `json:"connectParams,omitempty"`
 	TimeoutMS     int            `json:"timeoutMs,omitempty"`
 	WatchMS       int            `json:"watchMs,omitempty"`
+	MaxBytes      int            `json:"maxBytes,omitempty"` // 仅 flv:// 这一支用：一次容器走查最多读多少字节
 }
 
 func probeRTMP(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -93,6 +98,11 @@ func probeRTMP(ctx context.Context, raw json.RawMessage) (any, error) {
 	u, err := normalizeRTMPURL(a.URL)
 	if err != nil {
 		return nil, ots.Errf(ots.ErrInvalidArgument, "%s", err)
+	}
+	// ★ flv:// 是 HTTP-FLV 那一支：同一个问题（这一路到底有没有画面）在容器这一层
+	//   问，落点是 flv- 那套码，与 RTMP 那一层的 rtmp- 那套分开 —— 见 rtmp_flv.go。
+	if u.Scheme == "flv" {
+		return probeHTTPFLV(ctx, a, u)
 	}
 	app, stream, err := rtmpSplitPath(u, a.App, a.Stream)
 	if err != nil {
@@ -596,15 +606,13 @@ func normalizeRTMPURL(s string) (*url.URL, error) {
 		return nil, fmt.Errorf("看不懂地址 %q：%s", redactString(s), err)
 	}
 	switch u.Scheme {
-	case "rtmp", "rtmps":
+	case "rtmp", "rtmps", "flv":
 	case "rtsp", "rtsps":
 		return nil, errors.New("这是 RTSP 地址，请用 media.rtsp.probe")
 	case "http", "https":
 		return nil, errors.New("这是 http 地址；m3u8 清单用 media.hls.probe，别的要按那一族的规矩问")
-	case "flv":
-		return nil, errors.New("FLV 裸流这一版还没做；先用 media.rtmp.probe 问它上面那路 RTMP")
 	default:
-		return nil, fmt.Errorf("只支持 rtmp:// 与 rtmps://，给的是 %q", u.Scheme)
+		return nil, fmt.Errorf("只支持 rtmp:// 与 rtmps://（以及 flv:// 走 HTTP-FLV），给的是 %q", u.Scheme)
 	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("地址里没有主机名：%q", redactString(s))

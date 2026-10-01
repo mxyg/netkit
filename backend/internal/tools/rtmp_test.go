@@ -428,7 +428,6 @@ func Test别族的地址推到别的卡上(t *testing.T) {
 		{"rtsp://1.2.3.4/cam", "media.rtsp.probe"},
 		{"http://1.2.3.4/a.m3u8", "media.hls.probe"},
 		{"https://1.2.3.4/a.m3u8", "media.hls.probe"},
-		{"flv://1.2.3.4/live/cam1", "media.rtmp.probe"},
 		{"gopher://1.2.3.4/x", "只支持 rtmp"},
 	} {
 		raw, _ := json.Marshal(map[string]any{"url": tc.in})

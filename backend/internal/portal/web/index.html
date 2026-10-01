@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>昱弘网通 · 手机门户</title>
+<style>
+  :root { --bg:#11161d; --card:#1a222c; --line:#2a3644; --fg:#dbe4ee; --dim:#8b9aab;
+          --ok:#5dcf8f; --bad:#e0716f; --warn:#e0b15d; --accent:#5aa7e0; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:14px 16px 8px; }
+  header h1 { margin:0; font-size:17px; }
+  header p { margin:2px 0 0; color:var(--dim); font-size:12.5px; }
+  nav { display:flex; gap:6px; padding:6px 16px 10px; overflow-x:auto; position:sticky; top:0;
+        background:var(--bg); z-index:5; }
+  nav button { flex:0 0 auto; border:1px solid var(--line); background:var(--card); color:var(--fg);
+        border-radius:16px; padding:6px 14px; font-size:14px; }
+  nav button.on { border-color:var(--accent); color:var(--accent); }
+  main { padding:0 12px 40px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:12px 14px; margin:10px 0; }
+  .card h2 { margin:0 0 6px; font-size:15px; }
+  .dim { color:var(--dim); font-size:12.5px; }
+  .hint { color:var(--dim); font-size:12.5px; margin:4px 0; }
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+  ul.files { list-style:none; margin:0; padding:0; }
+  ul.files li { display:flex; justify-content:space-between; align-items:center;
+          gap:10px; padding:8px 0; border-top:1px solid var(--line); }
+  ul.files li:first-child { border-top:0; }
+  a.dl { color:var(--accent); text-decoration:none; flex:0 0 auto; }
+  .name { overflow-wrap:anywhere; }
+  button.act { background:#22405c; color:var(--fg); border:1px solid #2f5a80;
+          border-radius:8px; padding:8px 12px; font-size:14px; }
+  button.act:disabled { opacity:.45; }
+  button.stop { background:#4d2a2c; border-color:#6e3a3c; }
+  textarea, input[type=text], select { width:100%; background:#10151b; color:var(--fg);
+          border:1px solid var(--line); border-radius:8px; padding:8px; font-size:14px; }
+  pre.out { background:#0d1218; border:1px solid var(--line); border-radius:8px;
+          padding:8px 10px; font-size:12.5px; overflow-x:auto; white-space:pre-wrap;
+          overflow-wrap:anywhere; }
+  video, .live img { width:100%; border-radius:8px; background:#000; display:block; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .bar { height:6px; border-radius:3px; background:var(--line); overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--accent); width:0; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:9px; font-size:12px;
+           border:1px solid var(--line); color:var(--dim); }
+  .badge.ok { color:var(--ok); border-color:#2c5a42; }
+  .badge.bad { color:var(--bad); border-color:#5a2c2c; }
+</style>
+</head>
+<body>
+<header>
+  <h1>昱弘网通 · 手机门户</h1>
+  <p id="hostline">连接中…</p>
+</header>
+<nav id="tabs"></nav>
+<main id="view"></main>
+<script>
+'use strict';
+const $ = (sel, el=document) => el.querySelector(sel);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const KB = (n) => n>=1<<20 ? (n/(1<<20)).toFixed(1)+' MB'
+  : n>=1024 ? Math.round(n/1024)+' KB' : n+' 字节';
+
+const P = {};            // 门户开关，来自 /api/status
+let tab = '';
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) throw new Error('配对失效：请重新扫主机上的二维码');
+  return r.json();
+}
+async function tool(name, args) {
+  const j = await api('/api/tool', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({tool:name, args: args||{}})});
+  if (!j.ok) throw new Error(j.error || '调用失败');
+  return j.result;
+}
+
+// ── 页签 ──
+const TABS = [];
+function buildTabs() {
+  TABS.length = 0;
+  if (P.files)  TABS.push(['files','文件']);
+  if (P.remote) TABS.push(['remote','远程']);
+  if (P.cast)   TABS.push(['cast','投屏']);
+  if (P.screen) TABS.push(['screen','主机屏幕']);
+  if (!TABS.length) TABS.push(['empty','门户']);
+  const nav = $('#tabs'); nav.innerHTML='';
+  TABS.forEach(([id,label]) => {
+    const b = document.createElement('button');
+    b.textContent = label; b.className = id===tab ? 'on':'';
+    b.onclick = () => { tab=id; draw(); };
+    nav.appendChild(b);
+  });
+}
+function draw() {
+  buildTabs();
+  const v = $('#view'); v.innerHTML = '<div class="card">读取中…</div>';
+  ({files: drawFiles, remote: drawRemote, cast: drawCast, screen: drawScreen,
+    empty: () => { $('#view').innerHTML =
+      '<div class="card">这台主机没给手机开任何功能。</div>'; }})[tab]();
+}
+
+// ── 文件 ──
+async function drawFiles() {
+  const j = await api('/api/files');
+  if (!j.ok) { $('#view').innerHTML = `<div class="card bad">${esc(j.error)}</div>`; return; }
+  const files = (j.files||[]).filter(f=>!f.dir);
+  const dirs  = (j.files||[]).filter(f=>f.dir);
+  $('#view').innerHTML = `
+    <div class="card">
+      <h2>手机 → 主机（传到收件箱）</h2>
+      <p class="hint">落到主机的收件目录：${esc(P.inbox||'（主机没显示路径）')}。单文件上限 ${esc(j.uploadMaxMB)} MB。</p>
+      <div class="row">
+        <button class="act" id="pickf">选文件</button>
+        <button class="act" id="pickc">拍照 / 选照片</button>
+      </div>
+      <input type="file" id="f" hidden>
+      <input type="file" id="c" hidden accept="image/*" capture="">
+      <div class="bar" id="pbar" hidden><i id="pfill"></i></div>
+      <p class="hint" id="fmsg"></p>
+    </div>
+    <div class="card">
+      <h2>主机 → 手机（发件目录）</h2>
+      ${dirs.length ? `<p class="hint">目录不在这一栏里（${dirs.length} 个），只列文件。</p>` : ''}
+      ${files.length ? `<ul class="files">${files.map(f=>`
+        <li><span class="name">${esc(f.name)}<br><span class="dim">${KB(f.bytes)} · ${esc((f.at||'').slice(0,16).replace('T',' '))}</span></span>
+        <a class="dl" href="/dl/${encodeURIComponent(f.name)}" download>下载</a></li>`).join('')}</ul>`
+        : '<p class="hint">发件目录是空的。让主机把要发的文件放进发件目录再刷新。</p>'}
+      <p class="hint"><button class="act" id="rff">刷新列表</button></p>
+    </div>`;
+  $('#rff').onclick = drawFiles;
+  $('#pickf').onclick = () => $('#f').click();
+  $('#pickc').onclick = () => $('#c').click();
+  $('#f').onchange = e => upload(e.target.files[0]);
+  $('#c').onchange = e => upload(e.target.files[0]);
+}
+
+function upload(file) {
+  if (!file) return;
+  const fd = new FormData(); fd.append('file', file);
+  const bar = $('#pbar'), fill = $('#pfill'), msg = $('#fmsg');
+  bar.hidden = false; fill.style.width='0%';
+  msg.className='hint'; msg.textContent = `上传中：${file.name}`;
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST','/upload');
+  xhr.upload.onprogress = e => { if (e.lengthComputable) fill.style.width = (e.loaded/e.total*100)+'%'; };
+  xhr.onload = () => {
+    let j = {}; try { j = JSON.parse(xhr.responseText); } catch {}
+    if (j.ok) msg.textContent = `已传到主机收件目录：${j.name}（${KB(j.bytes)}）`;
+    else msg.textContent = (xhr.status===401) ? '配对失效，请重新扫码' : `没传成：${j.error||xhr.status}`;
+    msg.className = j.ok ? 'hint ok' : 'hint bad';
+  };
+  xhr.onerror = () => { msg.textContent='传断了：网掉了？'; msg.className='hint bad'; };
+  xhr.send(fd);
+}
+
+// ── 远程（遥控器） ──
+let devices = [], cur = null;
+async function drawRemote() {
+  try {
+    const r = await tool('remote.device.list');
+    devices = (r.values && r.values.devices) || [];
+  } catch (e) { $('#view').innerHTML = `<div class="card bad">${esc(e.message)}</div>`; return; }
+  if (!devices.length) {
+    $('#view').innerHTML = '<div class="card"><h2>还没有登记的设备</h2>' +
+      '<p class="hint">在主机界面「远程设备与审计」里登记设备（SSH），这里才会列出。</p></div>';
+    return;
+  }
+  cur = devices.find(d => d.id === cur && cur) || null;
+  $('#view').innerHTML = `
+    <div class="card">
+      <h2>挑一台</h2>
+      <ul class="files">${devices.map(d=>`
+        <li><span class="name">${esc(d.name||d.host)}<br>
+          <span class="dim">${esc(d.user)}@${esc(d.host)} · ${esc(d.os||'系统未知')}</span></span>
+          <button class="act" data-go="${esc(d.id)}">${cur&&cur.id===d.id?'在看这台':'干活'}</button></li>`).join('')}</ul>
+    </div>
+    ${cur ? opsCard(cur) : '<p class="hint" style="padding:0 4px">点上面任意一台的「干活」，下面会出现这台的操作。改东西的动作主机上会弹框确认。</p>'}`;
+  document.querySelectorAll('[data-go]').forEach(b => b.onclick = () => {
+    cur = devices.find(d => d.id === b.dataset.go); drawRemote();
+  });
+  if (cur) wireOps(cur);
+}
+
+function opsCard(d) {
+  return `<div class="card" id="ops">
+    <h2>${esc(d.name||d.host)} 的操作 <span class="badge" id="probe-state">${d.lastSeen?'上次联系过':'没探过'}</span></h2>
+    <div class="grid">
+      <button class="act" id="bp">探测一下</button>
+      <button class="act" id="bd">远程桌面</button>
+    </div>
+    <p class="hint" id="pn"></p>
+    <h2 style="margin-top:14px">执行命令 <span class="dim">（改东西，主机会弹框确认）</span></h2>
+    <textarea id="cmd" rows="2" placeholder="比如 ipconfig / ifconfig -a"></textarea>
+    <p class="row"><button class="act" id="bx">执行</button> <span class="dim" id="xs"></span></p>
+    <pre class="out" id="xo" hidden></pre>
+    <h2 style="margin-top:14px">发一条屏幕消息</h2>
+    <input type="text" id="mt" placeholder="消息内容（发送方标识自动带）">
+    <p class="row"><button class="act" id="ms">发送</button> <span class="dim" id="msg"></span></p>
+    <h2 style="margin-top:14px">体检剧本</h2>
+    <p class="row"><select id="bk"><option value="">（点右侧加载）</option></select>
+      <button class="act" id="bl">加载</button><button class="act" id="br" disabled>跑这本</button></p>
+    <p class="hint" id="pl"></p>
+    <pre class="out" id="po" hidden></pre>
+  </div>`;
+}
+
+function wireOps(d) {
+  const show = (id, cls, text) => { const el=$('#'+id); if(el){ el.className=cls; el.textContent=text; } };
+  $('#bp').onclick = async () => {
+    show('pn','hint','探测中…（连上去要点时间）'); $('#bp').disabled=true;
+    try { const r = await tool('remote.device.probe', {device:d.id});
+      show('pn','hint ok', `探测完：${r.verdict||''} ${r.note||''}`);
+      const nd = devices.find(x=>x.id===d.id); if (nd && r.values && r.values.os) nd.os = r.values.os;
+    } catch (e) { show('pn','hint bad', '探测没成：'+e.message); }
+    $('#bp').disabled=false;
+  };
+  $('#bd').onclick = async () => {
+    show('pn','hint','查桌面通道中…');
+    try { const r = await tool('remote.desktop.open', {device:d.id});
+      show('pn','hint ok', r.note || r.verdict || '已处理'); }
+    catch (e) { show('pn','hint bad', e.message); }
+  };
+  $('#bx').onclick = async () => {
+    const cmd = $('#cmd').value.trim(); if (!cmd) return;
+    show('xs','dim','等主机那边点确认…（手机上会一直转）'); $('#bx').disabled=true;
+    $('#xo').hidden = false;
+    try { const r = await tool('remote.exec', {device:d.id, command:cmd});
+      const v = r.values||{};
+      show('xs','dim', `退出码 ${v.exitCode ?? '?'} · ${r.verdict||''}`);
+      $('#xo').textContent = (v.stdout||'') + (v.stderr? `\n[stderr]\n${v.stderr}`:'') || '（无输出）';
+    } catch (e) { show('xs','dim bad', e.message); }
+    $('#bx').disabled=false;
+  };
+  $('#ms').onclick = async () => {
+    const text = $('#mt').value.trim(); if (!text) return;
+    show('msg','dim','发…');
+    try { const r = await tool('remote.msg.send', {device:d.id, text});
+      show('msg','dim ok', r.note || r.verdict); }
+    catch (e) { show('msg','dim bad', e.message); }
+  };
+  $('#bl').onclick = async () => {
+    show('pl','hint','加载中…');
+    try { const r = await tool('remote.playbook.list', {device:d.id});
+      const books = (r.values && r.values.playbooks) || [];
+      $('#bk').innerHTML = books.length
+        ? books.map(b=>`<option value="${esc(b.id)}">${esc(b.name)} · ${esc(b.stepCount)} 条${b.builtIn?'（内置）':''}</option>`).join('')
+        : '<option value="">（没有剧本）</option>';
+      $('#br').disabled = !books.length;
+      show('pl','hint ok', `共 ${books.length} 本`);
+    } catch (e) { show('pl','hint bad', e.message); }
+  };
+  $('#br').onclick = async () => {
+    const pb = $('#bk').value; if (!pb) return;
+    show('pl','hint','在跑…慢剧本可能要走几分钟'); $('#br').disabled=true;
+    $('#po').hidden = false;
+    try { const r = await tool('remote.playbook.run', {device:d.id, playbook:pb});
+      $('#po').textContent = r.note || JSON.stringify(r.values||r, null, 2);
+      show('pl','hint '+(r.verdict==='playbook-ok'?'ok':'warn'), `跑完：${r.verdict||''}`);
+    } catch (e) { show('pl','hint bad', e.message); }
+    $('#br').disabled=false;
+  };
+}
+
+// ── 投屏（手机 → 主机） ──
+let cast = { on:false, mode:'', frames:0, bytes:0, stream:null, timer:0 };
+
+function castCapability() {
+  const md = navigator.mediaDevices || {};
+  const secure = window.isSecureContext;
+  return {
+    secure,
+    screen: secure && typeof md.getDisplayMedia === 'function',
+    camera: secure && typeof md.getUserMedia === 'function',
+    ios: /iPhone|iPad|iPod/.test(navigator.userAgent) && !window.MSStream,
+  };
+}
+
+async function drawCast() {
+  const c = castCapability();
+  let note = '';
+  if (!c.secure) note = '<p class="hint bad">这个页面不是安全上下文（要 https）。' +
+    '手机的浏览器只在 https 里交出屏幕或摄像头 —— 让主机把门户开成「带 TLS」再扫码进来。</p>';
+  else if (c.ios) note = '<p class="hint warn">iPhone/iPad 的浏览器不允许网页录屏幕，' +
+    '这里只能投<b>摄像头</b>（拍下现场给主机看）。要投 iPhone 的屏幕本身，用系统自带的屏幕镜像（AirPlay）或数据线方案。</p>';
+  $('#view').innerHTML = `
+    <div class="card">
+      <h2>把手机画面投到主机</h2>
+      ${note}
+      <div class="grid">
+        <button class="act" id="cs"${c.screen?'':' disabled'}>投屏幕${c.screen?'':'（不支持）'}</button>
+        <button class="act" id="cc"${c.camera?'':' disabled'}>投摄像头${c.camera?'':'（不支持）'}</button>
+      </div>
+      <p class="row" style="margin-top:10px">帧率
+        <select id="fps" style="width:auto"><option value="2">慢（省电省流量）</option>
+          <option value="4" selected>标准</option><option value="8">流畅</option></select>
+        <button class="act stop" id="ce" hidden>停止</button></p>
+      <p class="hint" id="cstat"></p>
+      <video id="pv" autoplay muted playsinline hidden></video>
+      <p class="hint">主机界面「手机互联与投屏」页上实时看到这一路；手机切到后台会停在最后一帧。</p>
+    </div>
+    <div class="card"><h2>主机现在收到的是什么</h2><pre class="out" id="hs">（点了投屏后这里显示主机看到的统计）</pre></div>`;
+  $('#cs').onclick = () => startCast('screen');
+  $('#cc').onclick = () => startCast('camera');
+  $('#ce').onclick = stopCast;
+  statLoop();
+}
+
+async function startCast(mode) {
+  stopCast();
+  const md = navigator.mediaDevices;
+  let stream;
+  try {
+    stream = mode === 'screen'
+      ? await md.getDisplayMedia({video:{frameRate:8}, audio:false})
+      : await md.getUserMedia({video:{facingMode:'environment', frameRate:8}, audio:false});
+  } catch (e) {
+    $('#cstat').textContent = '没拿到画面权限：' + (e.message || e.name);
+    $('#cstat').className = 'hint bad';
+    return;
+  }
+  cast.on = true; cast.mode = mode; cast.stream = stream; cast.frames = 0; cast.bytes = 0;
+  const v = $('#pv'); v.srcObject = stream; v.hidden = false;
+  $('#ce').hidden = false;
+  stream.getVideoTracks()[0].onended = () => stopCast();
+  const canvas = document.createElement('canvas');
+  const cx = canvas.getContext('2d');
+  const fpsSel = $('#fps');
+  const sendLoop = async () => {
+    while (cast.on) {
+      const wait = 1000 / (parseInt(fpsSel.value,10) || 4);
+      await new Promise(res => setTimeout(res, wait));
+      if (!cast.on || v.videoWidth === 0) continue;
+      const scale = Math.min(1, 960 / v.videoWidth);
+      canvas.width = Math.round(v.videoWidth*scale);
+      canvas.height = Math.round(v.videoHeight*scale);
+      cx.drawImage(v, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.55));
+      if (!blob || !cast.on) continue;
+      try {
+        const r = await fetch('/api/cast/frame',
+          {method:'POST', headers:{'X-Cast-Mode':mode}, body:blob});
+        const j = await r.json();
+        if (!j.ok) { $('#cstat').textContent = '主机没收下：' + j.error; continue; }
+        cast.frames++; cast.bytes += blob.size;
+      } catch (e) {
+        $('#cstat').textContent = '发帧失败（网断了？）：' + e.message;
+      }
+    }
+  };
+  sendLoop();
+}
+
+function stopCast() {
+  if (cast.stream) cast.stream.getTracks().forEach(t => t.stop());
+  cast = { on:false, mode:'', frames:0, bytes:0, stream:null, timer:0 };
+  const v = $('#pv'); if (v) { v.srcObject = null; v.hidden = true; }
+  const b = $('#ce'); if (b) b.hidden = true;
+}
+
+let statTimer = 0;
+function statLoop() {
+  clearInterval(statTimer);
+  statTimer = setInterval(async () => {
+    if (tab !== 'cast') { clearInterval(statTimer); return; }
+    const el = $('#hs'); if (!el) return;
+    try {
+      const j = await api('/api/cast/state');
+      const c = j.cast || {};
+      el.textContent = c.active
+        ? `主机正在看：${c.mode==='camera'?'摄像头':'屏幕'} · 已收 ${c.frames} 帧 · ` +
+          `${KB(c.bytes||0)}` + (c.stale?' · 好像停了（超过 5 秒没新帧）':'')
+        : '主机还没收到画面。';
+    } catch (e) { el.textContent = e.message; }
+    if (cast.on) {
+      const st = $('#cstat');
+      if (st) { st.className='hint ok';
+        st.textContent = `已投出 ${cast.frames} 帧（${KB(cast.bytes)}）· 切后台会停在最后一帧`; }
+    }
+  }, 2000);
+}
+
+// ── 主机屏幕（主机 → 手机） ──
+function drawScreen() {
+  $('#view').innerHTML = `
+    <div class="card">
+      <h2>主机屏幕实时</h2>
+      <p class="hint">约一秒一帧。看不到内容多半是主机没给屏幕录制权限（macOS 会截出黑图）。</p>
+      <div class="live"><img id="sh" alt="主机屏幕"></div>
+      <p class="row" style="margin-top:8px"><button class="act" id="sp">停掉</button>
+      <button class="act" id="sr">重连</button></p>
+    </div>`;
+  $('#sp').onclick = () => { $('#sh').src=''; };
+  $('#sr').onclick = () => { $('#sh').src='/api/screen/live?t='+Date.now(); };
+  $('#sh').src = '/api/screen/live';
+}
+
+// ── 启动 ──
+(async function boot() {
+  let j;
+  try { j = await api('/api/status'); }
+  catch (e) { $('#hostline').textContent = e.message;
+    $('#view').innerHTML = `<div class="card bad">${esc(e.message)}</div>`; return; }
+  Object.assign(P, j.portal || {});
+  const exp = j.me && j.me.expiresAt;
+  $('#hostline').textContent =
+    `主机 ${P.hostName || ''} · 配对有效期至 ${exp ? new Date(exp).toLocaleString('zh-CN') : '（未登录）'}`;
+  tab = P.files ? 'files' : P.remote ? 'remote' : P.cast ? 'cast' : P.screen ? 'screen' : 'empty';
+  draw();
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && tab) draw(); });
+})();
+</script>
+</body>
+</html>

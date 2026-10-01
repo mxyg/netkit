@@ -734,11 +734,9 @@ func Test带宽的判定码界面上都有人话(t *testing.T) {
 			continue
 		}
 		rest := block[at+1+len(code)+len("': ["):] // 跳过头上那个引号
-		if !strings.HasPrefix(rest, "'") {
+		if phrase, ok := jsPhrase(rest); !ok {
 			t.Errorf("%s 那一行不像 ['人话', '档色']：%s", code, rest)
-			continue
-		}
-		if end := strings.Index(rest[1:], "'"); end <= 0 {
+		} else if phrase == "" {
 			t.Errorf("%s 没配人话（或那句是空的）", code)
 		}
 	}
@@ -773,4 +771,25 @@ func readUI(t *testing.T) string {
 		t.Fatalf("读不到界面文件：%v", err)
 	}
 	return string(b)
+}
+
+// jsPhrase 取出码表里 `code': [` 之后的那一句「人话」。
+//
+// 两种形状都认：`'有进程在吃'` 与 `t('有进程在吃')`。后者是多语种那层（i18n-codemod）
+// 包上去的 —— 这道守卫判的是「这一档到底配没配句子」，包没包 t() 不是它关心的事。
+// ★ 不许把它改成只认裸引号：那样一来「给界面加了 i18n」会把守卫弄成红的，
+//
+//	而下一个人为了让它变绿最可能的做法是删掉这一条，判定码没配人话这件事就再没人管了。
+func jsPhrase(rest string) (string, bool) {
+	if s, ok := strings.CutPrefix(rest, "t("); ok {
+		rest = s
+	}
+	if !strings.HasPrefix(rest, "'") {
+		return "", false
+	}
+	end := strings.Index(rest[1:], "'")
+	if end <= 0 {
+		return "", false
+	}
+	return rest[1 : 1+end], true
 }

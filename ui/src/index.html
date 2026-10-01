@@ -14,11 +14,31 @@
 <header>
   <!-- 标志来自 08-品牌资产 的下发（部署子项目标识.py），不是这里画的 -->
   <img class="mark" src="../assets/icon.svg" alt="">
+  <!-- ★ 品牌名不译：昱弘网通 / Yuhox NetKit 是资产，译了就对不上发票、合同和装机目录 -->
   <h1>昱弘网通<span class="en">Yuhox NetKit</span></h1>
-  <span class="state" id="conn">连接中…</span>
+  <!-- 搜索钮：整副牌里唯一一处「想用什么直接打出来」的入口，所以放在顶栏正中偏左，
+       不藏进菜单。文字与快捷键由 app.js 现填（要过词典）。 -->
+  <button id="find" class="find" type="button"></button>
+  <span class="runstate" id="runstate"></span>
+  <span class="state" id="conn" data-i18n>连接中…</span>
+  <span id="lang"></span>
 </header>
-<nav id="nav"></nav>
-<main id="main"></main>
-<script src="app.js"></script>
+<!--
+  ★ 壳层三栏：侧栏是「全部功能一眼可见」的导航（23 页不再分两层按钮），
+    中间是内容，右边是这一页的上下文（用到哪几件事、最近问过什么）。
+    窄于 1240px 时右栏收起 —— 页头那一条「这一页回答什么」才是主理解路径，
+    它在任何宽度都在，右栏只是补充。
+-->
+<div class="shell">
+  <nav id="nav"></nav>
+  <main id="main"></main>
+  <aside id="rail"></aside>
+</div>
+<!--
+  ★★ 这里**不许**再写 <script src="app.js">：app.js 得等词典就位之后再解析。
+    它顶部那三十多张判定码表存的是 t('中文') 的返回值，词典异步先到还是 app.js 先到
+    决定了选英文的人冷启动看见的是英文还是中文 —— 由 i18n.js 的 i18nBoot 负责按顺序拉进来。
+-->
+<script src="i18n.js"></script>
 </body>
 </html>

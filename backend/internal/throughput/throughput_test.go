@@ -385,6 +385,16 @@ func Test这条连接的账取得到就取得到取不到就说(t *testing.T) {
 		if info.SndCwndBytes <= 0 {
 			t.Errorf("拥塞窗口报 %d —— 刚灌完一轮的量，窗口不可能是 0：%+v", info.SndCwndBytes, info)
 		}
+	case "windows":
+		// Windows 走 iphlpapi 每连接统计：只有「以管理员开着采集」时才给得全；
+		// 没提权那台就是给不了（Given=false）——两种都是这台的真话，别硬判其中一种。
+		if info.Given {
+			if info.SndCwndBytes <= 0 {
+				t.Errorf("Given=true 却说拥塞窗口 %d —— 要么真开了统计，要么别报 Given：%+v", info.SndCwndBytes, info)
+			}
+		} else if info.Why == "" {
+			t.Error("Windows 这份账给不了就得说清为什么给不了")
+		}
 	default:
 		if info.Given {
 			t.Errorf("%s 上这份账没核对过结构，不该报取得到：%+v", runtime.GOOS, info)

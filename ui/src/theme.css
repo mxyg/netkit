@@ -121,6 +121,9 @@ body {
   font-size: 15px;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
+  /* ★ 壳层：顶栏定高，下面三栏各自滚。整页不滚 —— 一滚，侧栏和页头就跟着跑，
+     人立刻不知道自己在哪一页（这是上一版最被诟病的地方）。 */
+  display: flex; flex-direction: column; overflow: hidden;
 }
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
@@ -146,26 +149,185 @@ input[type='checkbox'], input[type='radio'] {
 
 header {
   display: flex; align-items: center; gap: 12px;
-  padding: 10px 18px;
+  padding: 10px 18px; flex: none;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
 }
 header .mark { width: 26px; height: 26px; flex: none; }
 header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
 header .en { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
-header .state { margin-left: auto; color: var(--muted); font-size: 12.5px; }
+header .state { margin-left: auto; color: var(--muted); font-size: 12.5px; white-space: nowrap; }
 
-/* ── 导航：两层 ──
+/* 搜索钮：做成「一眼是个输入口」的样子，但它是按钮 —— 真输入在弹层里。
+   快捷键写死在按钮上（⌘K / Ctrl+K 由 app.js 按平台填），不另开一处说明文档。 */
+header .find {
+  margin-left: 18px; display: flex; align-items: center; gap: 8px;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--sunken); color: var(--muted);
+  font: inherit; font-size: 13px; padding: 4px 9px; min-width: 210px;
+}
+header .find:hover { border-color: var(--gold-dim); color: var(--text); }
+header .find kbd {
+  margin-left: auto; font: inherit; font-size: 11px; color: var(--muted-2);
+  border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; background: var(--panel-2);
+}
+
+/* 「此刻在跑」那一排：曦金只给正在发生的事，这一排正是它唯一的合法用途。
+   没有东西在跑时整排不出现（空槽不许占默认版面）。 */
+header .runstate { display: flex; align-items: center; gap: 6px; flex: none; }
+header .runstate:empty { display: none; }
+.runchip {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid var(--gold-dim); border-radius: 99px; background: var(--gold-bg);
+  color: var(--gold); font-size: 12px; padding: 1px 9px; white-space: nowrap;
+}
+.runchip::before {
+  content: ''; width: 6px; height: 6px; border-radius: 99px; background: var(--gold);
+  animation: live 1.6s ease-in-out infinite;
+}
+@keyframes live { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
+@media (prefers-reduced-motion: reduce) { .runchip::before { animation: none } }
+
+/* 语言钮：不常用的功能不许占默认版面 —— 挨着状态那格，用现成的面板色与描边，
+ * 不自带颜色（文件头那条规矩：颜色是品牌资产，这里一律 var()）。 */
+header #lang { display: flex; align-items: center; }
+header select.lang {
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--line); border-radius: 6px;
+  font: inherit; font-size: 12.5px; padding: 2px 6px; cursor: pointer;
+}
+header select.lang:hover { color: var(--text); border-color: var(--gold-dim); }
+
+/* ── 壳层三栏 ──
  *
- * ★ 上面一组是「现在要回答的问题」，下面才是那一组里的具体页。
- *   四十多个工具平铺成一排按钮等于没有导航，所以分两层。
- *   这里只排布局、不加颜色 —— 颜色一律用现成令牌，见文件头那条规矩。
+ * ★ 侧栏不再分两层按钮（2026-09-30 老板：「想用什么功能还找不到」）。
+ *   两层的问题是要先猜「我这问题属于哪一组」，猜错一次整排按钮重画一遍。
+ *   现在 23 页在侧栏里一次全露出，组名只当小节标题用 —— 找页靠眼睛扫，找功能靠搜索。
  */
+.shell {
+  flex: 1; min-height: 0;
+  display: grid; grid-template-columns: 244px minmax(0, 1fr) 300px;
+}
+nav {
+  overflow: auto; padding: 10px 8px 20px;
+  background: var(--panel); border-right: 1px solid var(--line);
+}
+main { overflow: auto; padding: 14px 18px 44px; min-width: 0 }
+#rail {
+  overflow: auto; padding: 12px 12px 24px;
+  background: var(--panel-2); border-left: 1px solid var(--line);
+}
 
-nav { display: block; padding: 8px 16px; background: var(--panel-2);
-      border-bottom: 1px solid var(--line); }
-.navrow { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.navrow + .navrow { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line-soft); }
+@media (max-width: 1240px) {
+  .shell { grid-template-columns: 232px minmax(0, 1fr); }
+  #rail { display: none; }
+}
+/* 窄到放不下侧栏时，侧栏横过来当一条可滑的页签，主内容仍占满 ——
+   宁可退化成一条带，也不把导航收进汉堡里（收进去就等于又找不着了）。 */
+@media (max-width: 880px) {
+  .shell { display: block; }
+  nav { display: flex; gap: 4px; overflow-x: auto; border-right: 0;
+        border-bottom: 1px solid var(--line); padding: 8px; }
+  nav .navgrp { display: contents; }
+  nav .navgh { display: none; }
+  nav .navp { white-space: nowrap; border-radius: 99px }
+}
+
+/* 侧栏：组名当小节标题，页名当条目 */
+.navgrp + .navgrp { margin-top: 14px; }
+.navgh {
+  font-size: 11px; letter-spacing: .08em; color: var(--muted-2);
+  padding: 0 10px 4px; text-transform: none;
+}
+.navp {
+  display: flex; align-items: center; gap: 7px; width: 100%; text-align: left;
+  border: 0; border-left: 2px solid transparent; border-radius: 0 6px 6px 0;
+  background: none; color: var(--text); font: inherit; font-size: 13.5px;
+  padding: 5px 10px;
+}
+.navp:hover { background: var(--sunken); }
+.navp.on { border-left-color: var(--gold); background: var(--gold-bg); color: var(--gold); font-weight: 600; }
+.navp .nicon { width: 16px; text-align: center; color: var(--muted); flex: none }
+.navp.on .nicon { color: var(--gold) }
+/* 侧栏底部那一组（总览 / 搜索）与上面的页之间隔一条线 */
+.navtop { padding-bottom: 10px; margin-bottom: 6px; border-bottom: 1px solid var(--line-soft); }
+
+/* ── 页头带：这一页回答什么问题，相关页在哪 ──
+ * 它替代了原先「卡片自己写一段 hint 说明本页」的做法：说明只写一次，
+ * 而且和导航贴在一起，滚到哪儿都知道自己在哪。 */
+.pagehead { margin: 0 0 14px; }
+.pagehead h2 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: .01em; }
+.pagehead .ask { margin: 3px 0 0; color: var(--muted); font-size: 13.5px; max-width: 76ch; }
+.pagehead .rel { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center; }
+.pagehead .rel .lbl { font-size: 12px; color: var(--muted-2) }
+
+/* ── 右侧上下文栏 ── */
+.railh { font-size: 11.5px; letter-spacing: .06em; color: var(--muted-2); margin: 0 0 6px }
+.railsec + .railsec { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line-soft) }
+.railist { display: flex; flex-direction: column; gap: 5px }
+.railrow {
+  display: block; text-align: left; width: 100%; font: inherit; font-size: 12.5px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
+  color: var(--text); padding: 5px 8px; cursor: pointer;
+}
+.railrow:hover { border-color: var(--gold-dim) }
+.railrow code { color: var(--blue); font-size: 12px; word-break: break-all }
+.railrow .cls { color: var(--muted-2); font-size: 11.5px }
+.railrow.mut { border-color: var(--red-line) }
+
+/* ── 搜索弹层（命令面板）── */
+.find-ov { position: fixed; inset: 0; background: rgba(6, 12, 22, .55);
+           display: flex; align-items: flex-start; justify-content: center; z-index: 60; padding-top: 12vh }
+.find-box { width: min(760px, 92vw); max-height: 72vh; display: flex; flex-direction: column;
+            background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+            box-shadow: var(--shadow); overflow: hidden }
+.find-in { display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+           border-bottom: 1px solid var(--line) }
+.find-in input { border: 0; background: none; padding: 0; font-size: 16px; width: 100% }
+.find-in input:focus { outline: none }
+.find-list { overflow: auto; padding: 6px }
+.find-grp { font-size: 11.5px; color: var(--muted-2); padding: 8px 10px 3px }
+.find-it { display: flex; gap: 10px; align-items: baseline; width: 100%; text-align: left;
+           border: 0; border-radius: 7px; background: none; color: var(--text); font: inherit;
+           padding: 7px 10px; cursor: pointer }
+.find-it .t1 { font-size: 14px; white-space: nowrap }
+.find-it .t2 { font-size: 12.5px; color: var(--muted); overflow: hidden;
+               display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical }
+.find-it.on { background: var(--gold-bg) }
+.find-it.on .t1 { color: var(--gold) }
+.find-it mark { background: none; color: var(--gold); font-weight: 600 }
+.find-foot { border-top: 1px solid var(--line); padding: 6px 12px; font-size: 11.5px; color: var(--muted-2) }
+.find-empty { padding: 18px 12px; color: var(--muted); font-size: 13.5px }
+
+/* ── 实体钮：屏上任何一个地址／MAC／端口都是一个问题入口 ──
+ * 虚线下划线是「点它有故事」的通用记号，不新造颜色。 */
+.ent {
+  border: 0; padding: 0; font: inherit; color: inherit; cursor: pointer;
+  border-bottom: 1px dashed var(--gold-dim);
+}
+.ent:hover { color: var(--gold) }
+.pop { position: fixed; z-index: 70; min-width: 218px; max-width: 300px;
+       background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+       box-shadow: var(--shadow); padding: 6px }
+.pop .popv { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px;
+             color: var(--muted); padding: 4px 8px 6px; word-break: break-all }
+.pop button { display: block; width: 100%; text-align: left; border: 0; border-radius: 6px;
+              background: none; color: var(--text); font: inherit; font-size: 13px; padding: 6px 8px; cursor: pointer }
+.pop button:hover { background: var(--gold-bg); color: var(--gold) }
+
+/* 复制钮：小、贴边、不抢内容 */
+.copy { border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2);
+        color: var(--muted); font: inherit; font-size: 11.5px; padding: 1px 7px; cursor: pointer }
+.copy:hover { color: var(--gold); border-color: var(--gold-dim) }
+details.raw > summary { cursor: pointer; display: flex; align-items: center; gap: 8px }
+details.raw > summary .copy { margin-left: auto }
+
+/* 从搜索里跳过来时闪一下，告诉人「就是这一张」 */
+@keyframes flash { 0% { box-shadow: 0 0 0 2px var(--gold) } 100% { box-shadow: var(--lift) } }
+.card.flash { animation: flash 1.1s ease-out }
+@media (prefers-reduced-motion: reduce) { .card.flash { animation: none } }
+
+/* ── 侧栏按钮：沿用 .btn 的描边，只是更紧凑 ── */
 .btn.grp { font-weight: 600; }
 .btn.sub { font-size: 12.5px; padding: 4px 10px; color: var(--muted); }
 .btn.sub.on { color: var(--gold); }
@@ -189,11 +351,19 @@ nav { display: block; padding: 8px 16px; background: var(--panel-2);
 .btn.danger { border-color: var(--red-line); background: var(--red-bg); color: var(--red-text); }
 .btn:disabled { opacity: .45; cursor: default; }
 
-/* ── 卡片 ── */
-
-main { padding: 16px 18px; max-width: 1080px; }
+/* ── 卡片 ──
+ *
+ * ★ 内容列不再钉死 1080px：宽屏上右边空一半，是「页面非常单一」这句话的来源之一。
+ *   现在跟着窗口走，最宽到 1240px 就停（再宽一行字就太长了，读不动）。
+ *   小卡片成排的页（计算器、单表单的探测）用 .grid 并排，大表的页保持一列 ——
+ *   并排是为了密度，不是为了好看，所以带表的页一律不许并排。
+ */
+main.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
+            gap: 0 14px; max-width: 1240px }
+main.grid .card { margin-bottom: 12px }
+main.grid .card.span, main.grid .pagehead { grid-column: 1 / -1 }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-        padding: 14px 16px; margin-bottom: 12px; box-shadow: var(--lift); }
+        padding: 14px 16px; margin-bottom: 12px; box-shadow: var(--lift); max-width: 1240px }
 .card h2 { margin: 0 0 4px; font-size: 14.5px; font-weight: 600; }
 .hint { color: var(--muted); font-size: 13px; margin: 0 0 10px; }
 label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
@@ -251,6 +421,20 @@ td.bad { color: var(--red-text); }
 .warn { color: var(--gold); }
 .ok { color: var(--green-text); }
 
+/* ── 拓扑画布 ──
+   图上任何一处颜色都得从令牌来：这张图是要拿去给客户对账的，
+   自己写死一个灰，换成亮色主题就成了一块脏斑。 */
+
+.tp-canvas { background: var(--deep); border: 1px solid var(--line);
+             border-radius: 6px; padding: 4px; overflow: hidden; }
+.tp-panel { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+.tp-nm { fill: var(--text); font-size: 12.5px; text-anchor: middle; }
+.tp-sub { fill: var(--muted); font-size: 10.5px; text-anchor: middle; }
+.tp-el { fill: var(--muted-2); font-size: 10px; text-anchor: middle; }
+.tp-n text, .tp-e text, .tp-e line { pointer-events: none; }
+.tp-n:hover rect { stroke: var(--gold-dim); }
+.tp-n.on rect { stroke: var(--gold); stroke-width: 2; }
+
 /* ── 确认弹框：责任那段话要完整摆出来，native confirm() 放不下 ── */
 
 .modal-ov { position: fixed; inset: 0; background: rgba(6, 12, 22, .55);
@@ -259,3 +443,53 @@ td.bad { color: var(--red-text); }
          padding: 18px 20px; max-width: 480px; box-shadow: var(--shadow); }
 .modal h2 { margin: 0 0 8px; font-size: 15px; }
 .modal .hint { margin: 6px 0; }
+
+/* ── 总览页（新用户的第一屏）──
+ *
+ * ★ 这一屏的任务只有一个：让「这台软件能干什么、我现在该点哪」不问人就成立。
+ *   所以它不放表格，放的是**问题**（你要回答的是哪一句）和**入口**（跳到哪一页）。
+ *   数量一律由 app.js 现算并写进 DOM —— 这里不许出现任何写死的数字。
+ */
+.qgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(286px, 1fr)); gap: 12px }
+.qtile { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+         padding: 12px 14px }
+.qtile h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650 }
+.qtile .ask { margin: 0 0 8px; font-size: 12.5px; color: var(--muted) }
+.qtile ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px }
+.qtile li a, .qtile li button { border: 0; background: none; padding: 0; font: inherit;
+  cursor: pointer; text-align: left; font-size: 13px; color: var(--text); text-decoration: none }
+.qtile li a:hover, .qtile li button:hover { color: var(--gold); text-decoration: underline }
+.hero { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap }
+.hero .say { flex: 1 1 320px; min-width: 0 }
+.hero .verdict { font-size: 15.5px; font-weight: 600; margin: 0 0 4px }
+.steps { counter-reset: st; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+         gap: 10px; margin: 0; padding: 0; list-style: none }
+.steps li { counter-increment: st; border: 1px solid var(--line); border-radius: 8px;
+            padding: 10px 12px 10px 40px; position: relative; background: var(--panel) }
+.steps li::before { content: counter(st); position: absolute; left: 12px; top: 10px;
+  width: 20px; height: 20px; border-radius: 99px; background: var(--gold-bg); color: var(--gold);
+  border: 1px solid var(--gold-dim); font-size: 12px; display: flex; align-items: center; justify-content: center }
+.steps b { display: block; font-size: 13.5px }
+.steps span { font-size: 12.5px; color: var(--muted) }
+.caplist { display: flex; flex-direction: column; gap: 4px }
+.caprow { display: flex; gap: 10px; align-items: baseline; border: 0; border-radius: 6px;
+          background: none; color: var(--text); font: inherit; text-align: left; padding: 4px 8px; cursor: pointer }
+.caprow:hover { background: var(--sunken) }
+.caprow code { font-size: 12.5px; color: var(--blue); flex: none }
+.caprow .sum { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.caprow.mut code { color: var(--red-text) }
+.caprow.orphan { border: 1px dashed var(--red-line) }
+/* 一小节上面的题字：总览里按组分块、能力表里按页分块都用它 */
+.minilbl { font-size: 11.5px; letter-spacing: .06em; color: var(--muted-2); margin: 12px 0 6px }
+.caplist + .minilbl { margin-top: 16px }
+
+/* ── 复制成功这类只活一秒多的回执 ──
+ * ★ 固定在底部居中：它不能出现在被点的那一行旁边 —— 表格里一行挨一行，
+ *   弹出位置会盖住下一行的内容，人正要往下读。
+ */
+.toast { position: fixed; left: 50%; bottom: 26px; transform: translate(-50%, 12px);
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--gold-dim);
+  border-radius: 99px; padding: 6px 16px; font-size: 13px; box-shadow: var(--shadow);
+  opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; z-index: 80 }
+.toast.on { opacity: 1; transform: translate(-50%, 0) }
+@media (prefers-reduced-motion: reduce) { .toast { transition: none } }

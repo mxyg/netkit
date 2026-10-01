@@ -805,12 +805,8 @@ func Test持续质量的判定码界面上都有人话(t *testing.T) {
 				continue
 			}
 			rest := block[at+len("'")+len(code)+len("': ["):]
-			if !strings.HasPrefix(rest, "'") {
-				t.Errorf("%s 在 %s 里那一行不像 ['人话', '档色'] 的样子：%s", code, tbl.head, rest)
-				continue
-			}
-			if end := strings.Index(rest[1:], "'"); end <= 0 {
-				t.Errorf("%s 在 %s 里没配人话（或那句是空的）", code, tbl.head)
+			if _, ok := jsPhrase(rest); !ok {
+				t.Errorf("%s 在 %s 里没配人话（或那句是空的、或者不像 ['人话', '档色']）：%s", code, tbl.head, rest)
 			}
 		}
 	}

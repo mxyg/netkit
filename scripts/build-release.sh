@@ -32,6 +32,19 @@ gofmt -l . | grep -q . && { echo "✗ 有没 gofmt 的文件："; gofmt -l .; ex
 go vet ./...
 go test ./...
 
+# ★★ 界面这一遍必须跟着跑，否则「所有功能都做完了」这句话在**出厂那一刻**才算数就没意义了：
+#   词典是三样东西凑出来的 —— 源码里的中文原文（唯一分母）、分片译文、合成好的 src/locales/*.js。
+#   少了这三步里的任何一步，客户界面上就会出现一句露回中文的话，而这**在本机看不出来**：
+#   本机跑的是合并后的那一份，改完源码没合成分片的人，看到的还是旧的词典。
+#   顺序是有讲究的：先数术语（少数派改名要落在分片上），再合成（把分片烤进词典），
+#   最后按整本词典量覆盖率 —— 审计读的是合成产物，不是分片，放在合成之前等于没量。
+echo "→ 界面自检（术语统一 → 合成词典 → 覆盖率闸门，不过就不出包）"
+cd "$ROOT/ui"
+node scripts/i18n-terms.cjs --check
+node scripts/i18n-merge.cjs en ja ko ru
+node scripts/i18n-audit.cjs
+cd "$ROOT/backend"
+
 # ★★ 目标平台就是老板定的那四个（交接 §2 第 4 条）：Win10+、Win7、Linux、macOS。
 #   Win7 单独一份：它要 Electron 22，界面那边分包；后端这一份用同样的产物即可，
 #   但**必须单列**，否则没人会记得 Win7 这条线还活着。
@@ -47,7 +60,7 @@ windows/amd64/netkitd.exe
 windows/386/netkitd.exe
 "
 
-echo "→ 交叉编译（版本 $VERSION）"
+echo "→ 交叉编译（版本 ${VERSION}）"
 for t in $targets; do
   goos="${t%%/*}"; rest="${t#*/}"; goarch="${rest%%/*}"; bin="${rest#*/}"
   dir="$OUT/${goos}-${goarch}"

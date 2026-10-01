@@ -1385,6 +1385,8 @@ func restoreCapture(log *slog.Logger) {
 	if journal == nil {
 		return
 	}
+	// 对端那一路先收：它说的话和本机的相反（见 restorePeerCapture）。
+	restorePeerCapture(log)
 	for _, e := range journal.Outstanding() {
 		if e.Kind != "capture" {
 			continue

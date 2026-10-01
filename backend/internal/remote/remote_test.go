@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -541,5 +542,410 @@ func Test掐掉的命令要能被认成超时(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "没跑完") {
 		t.Errorf("光有码没有人话：%v", err)
+	}
+}
+
+// ── 远程桌面：三种目标各走各的路（desktop.go）──
+
+// macOS 上非 root 读不到 system 域，只能拿「5900 在不在听」当硬证据。
+// ★ 而它的 netstat 是点分端口（*.5900），且 -ltn 退出码 0 却没有 LISTEN 行 ——
+//
+//	这条钉住探测链不许退回 `netstat -ltn`（身份采集那边实测踩过的坑）。
+func TestQueryShareUsesNetstatANOnMac(t *testing.T) {
+	f := &fakeExecer{seq: []*Output{{Stdout: `
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+tcp4       0      0  *.22                   *.*                    LISTEN
+tcp4       0      0  *.5900                 *.*                    LISTEN
+`}}}
+	d := &Device{ID: "me@mac", OS: "darwin", Host: "192.168.3.20", User: "me"}
+	st, err := QueryShare(context.Background(), f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.seen[0], "netstat -an") || strings.Contains(f.seen[0], "netstat -ltn") {
+		t.Errorf("macOS 探测链不对（-ltn 在那边不给 LISTEN 行）：%q", f.seen[0])
+	}
+	if !st.Listening {
+		t.Errorf("点分端口的 *.5900 要认成在听：%+v", st)
+	}
+}
+
+func TestQueryShareNotListening(t *testing.T) {
+	// 5901（第二路显示）不能被当成 5900，也不能被当成没开：这是两件事
+	f := &fakeExecer{seq: []*Output{{Stdout: "LISTEN 0 128 0.0.0.0:5901 0.0.0.0:*\n"}}}
+	st, err := QueryShare(context.Background(), f, &Device{ID: "u@h", OS: "linux"})
+	if err != nil || st.Listening {
+		t.Fatalf("5901 不该判成 5900 在听：%+v %v", st, err)
+	}
+}
+
+func TestParsePrintDisabled(t *testing.T) {
+	// 本机实测：从没开过屏幕共享的 Mac 上，这条压根不在这张表里
+	if got := parsePrintDisabled(`	disabled services = {
+		"com.apple.ftpd" => disabled
+	}`, "com.apple.screensharing"); got != "未记录" {
+		t.Errorf("没记录该说「未记录」，拿到 %q", got)
+	}
+	if got := parsePrintDisabled(`	"com.apple.screensharing" => enabled`, "com.apple.screensharing"); got != "enabled" {
+		t.Errorf("要 enabled，拿到 %q", got)
+	}
+}
+
+// ★ 这台机器（macOS 15.6）实测的 sudo -n 形状：`sudo: a password is required` + rc=1。
+//
+//	测试用的是这份真输出，不是编的。
+func TestParseMacPrivThisMac(t *testing.T) {
+	raw := "staff access_bpf everyone admin _lpoperator com.apple.access_screensharing\n" +
+		probeSep + "\nsudo: a password is required\nnetkit-rc=1\n"
+	p := parseMacPriv(raw)
+	if !p.Admin {
+		t.Error("在 admin 组里要判成管理员")
+	}
+	if p.SudoFree {
+		t.Error("★ 这台不给免密 sudo，判成给就是假话")
+	}
+	if !strings.Contains(p.SudoText, "password") {
+		t.Errorf("sudo 的原话要留着给人看：%q", p.SudoText)
+	}
+	p2 := parseMacPriv("admin staff\n" + probeSep + "\nnetkit-rc=0\n")
+	if !p2.SudoFree || !p2.Admin {
+		t.Errorf("免密那条要判成能动手：%+v", p2)
+	}
+	p3 := parseMacPriv("staff everyone\n" + probeSep +
+		"\nsudo: user is not in the sudoers file\nnetkit-rc=1\n")
+	if p3.Admin || p3.SudoFree {
+		t.Errorf("不在 admin 组要判成不是管理员：%+v", p3)
+	}
+}
+
+// 三档下一步各不相同：能替开 / 给你贴（给免密才行）/ 换账号。判定码必须分得开。
+func TestMacShareChangeTiers(t *testing.T) {
+	free := MacShareChange(&MacPriv{Admin: true, SudoFree: true})
+	if free.HandsOff || free.Code != "" {
+		t.Errorf("给了免密 sudo 就该是 NetKit 替跑：%+v", free)
+	}
+	joined := strings.Join(cmdLinesOf(free.Do), "\n")
+	if !strings.Contains(joined, "sudo launchctl enable system/com.apple.screensharing") ||
+		!strings.Contains(joined, "/System/Library/LaunchDaemons/com.apple.screensharing.plist") {
+		t.Errorf("开屏幕共享的两条命令不齐：\n%s", joined)
+	}
+	if !strings.Contains(strings.Join(cmdLinesOf(free.Undo), "\n"), "launchctl disable system/com.apple.screensharing") {
+		t.Error("没有关回去的那几条，账本就还原不了")
+	}
+
+	needSudo := MacShareChange(&MacPriv{Admin: true})
+	if !needSudo.HandsOff || needSudo.Code != "share-need-sudo" {
+		t.Errorf("不给免密要判 share-need-sudo：%+v", needSudo)
+	}
+	// ★ 交给人贴的必须还是那两条（带 sudo），不能退化成一句"你自己去开"
+	if got := strings.Join(cmdLinesOf(needSudo.Do), "\n"); !strings.Contains(got, "launchctl enable") {
+		t.Errorf("不代跑也得把命令给全：\n%s", got)
+	}
+	if strings.Contains(strings.Join(cmdLinesOf(needSudo.Do), "\n"), "sudo -S") {
+		t.Error("★ 不许出现把口令喂给 sudo -S 的写法")
+	}
+
+	notAdmin := MacShareChange(&MacPriv{})
+	if notAdmin.Code != "share-not-admin" || !strings.Contains(notAdmin.Reason, "管理员") {
+		t.Errorf("不是管理员要判 share-not-admin 并说清换账号：%+v", notAdmin)
+	}
+
+	unknown := MacShareChange(nil)
+	if !unknown.HandsOff || unknown.Code == "" {
+		t.Errorf("没问过权限就不许演「我能替你开」：%+v", unknown)
+	}
+}
+
+func cmdLinesOf(cmds []Cmd) []string {
+	out := make([]string, 0, len(cmds))
+	for _, c := range cmds {
+		out = append(out, c.Line)
+	}
+	return out
+}
+
+// 动手那一步：顺序跑完、"已经在跑"那一类非 0 不算失败、别的非 0 必须报出是哪一步。
+func TestApplyRDPOrdersAndToleratesAlreadyRunning(t *testing.T) {
+	f := &fakeExecer{seq: []*Output{
+		{Stdout: "操作成功完成。"},
+		// 1056 = ERROR_SERVICE_ALREADY_RUNNING。★ 不是 1062：那是 ERROR_SERVICE_PAUSED
+		// （服务挂着），拿它当「已经在跑」会把一种真故障洗成成功。
+		{ExitCode: 1056, Stderr: "SERVICE_ALREADY_RUNNING"}, // sc start 对已运行的服务
+		{Stdout: "Ok."},
+	}}
+	if err := ApplyChange(context.Background(), f, &Device{OS: "windows"}, RDPChange()); err != nil {
+		t.Fatalf("服务已在跑不该算失败：%v", err)
+	}
+	if len(f.seen) != 3 {
+		t.Fatalf("要按顺序跑 3 步，跑了 %d：%q", len(f.seen), f.seen)
+	}
+	if !strings.Contains(f.seen[0], "fDenyTSConnections /t REG_DWORD /d 0") {
+		t.Errorf("第一步该是注册表：%q", f.seen[0])
+	}
+	if !strings.Contains(f.seen[2], `name="NetKit-RDP"`) || !strings.Contains(f.seen[2], "localport=3389") {
+		t.Errorf("第三步该加那条固定名的防火墙规则：%q", f.seen[2])
+	}
+	// ★ 不碰本地化的「远程桌面」规则组
+	for _, c := range f.seen {
+		if strings.Contains(c, "rule group=") {
+			t.Errorf("不许按本地化组名下发防火墙规则：%q", c)
+		}
+	}
+}
+
+func TestApplyChangeReportsWhichStepRefused(t *testing.T) {
+	f := &fakeExecer{seq: []*Output{
+		{Stdout: "ok"},
+		{ExitCode: 5, Stderr: "拒绝访问。"},
+		{Stdout: "不该跑到这"},
+	}}
+	err := ApplyChange(context.Background(), f, &Device{OS: "windows"}, RDPChange())
+	var ae *ApplyError
+	if !errors.As(err, &ae) {
+		t.Fatalf("权限不够要报成 ApplyError，拿到 %v", err)
+	}
+	if ae.ExitCode != 5 || !strings.Contains(ae.Cmd, "TermService") {
+		t.Errorf("要说清是哪一步、退出码多少：%+v", ae)
+	}
+	if len(f.seen) != 2 {
+		t.Errorf("失败后不许接着往下跑：%q", f.seen)
+	}
+}
+
+// ★★ macOS 那两条的纪律：成败由 `launchctl print` 说，不由 launchctl 自己的退出码说。
+//
+//	本机量过：load -w 对已加载的 plist 嘴上回 "Load failed: 5" 却**退出 0**，
+//	unload -w 对没加载的也一样 —— 所以「|| load -w 兜底」这条链的最后一码可以是 0，
+//	而那一趟其实什么都没改成。钉法要能红：把链尾那句 print 删掉，这一条就必须失败。
+func TestMacShareCommandsEndWithStateProof(t *testing.T) {
+	do, undo := MacShareCmds("sudo ")
+	if len(do) != 2 || len(undo) != 2 {
+		t.Fatalf("计划形状变了：%q / %q", cmdLinesOf(do), cmdLinesOf(undo))
+	}
+	起 := do[1].Line
+	停 := undo[0].Line
+	for _, c := range []struct{ what, line string }{{"起", 起}, {"停", 停}} {
+		if !strings.HasPrefix(c.line, "launchctl print system/"+macScreensharingLabel) {
+			t.Errorf("%s 这一条没先看状态就动手：%q", c.what, c.line)
+		}
+		if i := strings.LastIndex(c.line, ";"); i < 0 || !strings.Contains(c.line[i:], "launchctl print") {
+			t.Errorf("%s 这一条的链尾不是 print 定成败（launchctl 自己的退出码会骗人）：%q", c.what, c.line)
+		}
+	}
+	// 白名单必须空着：这两条不靠「非 0 也放过」，放过任何一码都是把没改成说成改成了。
+	for _, c := range append(append([]Cmd{}, do...), undo...) {
+		if len(c.AlreadyOK) != 0 {
+			t.Errorf("这一条又用回「退出码放过」了（%v）：%q", c.AlreadyOK, c.Line)
+		}
+	}
+	// 反证的正身：假对端每一步都回非 0（等于「print 说没起着 / 没权限」），必须报成失败。
+	f := &fakeExecer{seq: []*Output{{ExitCode: 1}, {ExitCode: 1}}}
+	err := ApplyChange(context.Background(), f, &Device{OS: "darwin"}, &Change{Kind: "mac", Do: do})
+	var ae *ApplyError
+	if !errors.As(err, &ae) {
+		t.Fatalf("链尾 print 说没起着，就要报失败，拿到 %v", err)
+	}
+}
+
+// ★★ Linux 这一路的纪律：只给命令、不代跑。这里钉的是"计划一旦 HandsOff，
+//
+//	ApplyChange 必须大声拒绝"——否则哪天有人把 HandsOff 忘了，就会拿给人看的文本去动系统。
+func TestApplyChangeRefusesHandsOffPlan(t *testing.T) {
+	f := &fakeExecer{seq: []*Output{{}}}
+	ch := LinuxShareChange(&LinuxEnv{Distro: "ubuntu", Pretty: "Ubuntu 22.04", Bins: []string{"gnome-remote-desktop"}})
+	err := ApplyChange(context.Background(), f, &Device{OS: "linux"}, ch)
+	if err == nil || !strings.Contains(err.Error(), "不代跑") {
+		t.Fatalf("不代跑的计划被执行了：%v", err)
+	}
+	if len(f.seen) != 0 {
+		t.Errorf("一条命令都不许发到对端：%q", f.seen)
+	}
+}
+
+func TestLinuxShareChangeGivesConcreteCommands(t *testing.T) {
+	cases := []struct {
+		name string
+		env  *LinuxEnv
+		want []string
+	}{
+		{"gnome-新", &LinuxEnv{Distro: "ubuntu", Bins: []string{"gnome-remote-desktop", "grdctl"}},
+			[]string{"org.gnome.desktop.remote-desktop.vnc enabled true", "systemctl --user enable --now gnome-remote-desktop"}},
+		{"gnome-vino", &LinuxEnv{Distro: "debian", Bins: []string{"vino-passwd"}},
+			[]string{"org.gnome.Vino enabled true", "vino-server"}},
+		{"kde", &LinuxEnv{Distro: "fedora", Sessions: []string{"plasma"}},
+			[]string{"krfb"}},
+		{"只有x11vnc", &LinuxEnv{Distro: "opensuse", Bins: []string{"x11vnc"}},
+			[]string{"x11vnc -display :0", "x11vnc -storepasswd"}},
+		{"什么都没装", &LinuxEnv{Distro: "ubuntu"},
+			[]string{"sudo apt install -y gnome-remote-desktop", "sudo apt install -y x11vnc"}},
+		{"没装且发行版陌生", &LinuxEnv{Distro: "kylin"},
+			[]string{"install gnome-remote-desktop"}},
+	}
+	for _, tc := range cases {
+		ch := LinuxShareChange(tc.env)
+		if !ch.HandsOff || ch.Code != "linux-share-commands" {
+			t.Errorf("%s: 这一路必须是不代跑：%+v", tc.name, ch)
+		}
+		got := strings.Join(cmdLinesOf(ch.Do), "\n")
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: 缺这一条 %q，拿到：\n%s", tc.name, w, got)
+			}
+		}
+		// ★ SSH 会话里没有这两个变量，systemctl --user / gsettings 会报 Could not connect to bus，
+		//   看着像"那台的桌面服务坏了"。每条计划都先给这两句。
+		if !strings.Contains(got, "XDG_RUNTIME_DIR=/run/user/$(id -u)") ||
+			!strings.Contains(got, "DBUS_SESSION_BUS_ADDRESS") {
+			t.Errorf("%s: 没给 user 会话缺的那两个环境变量：\n%s", tc.name, got)
+		}
+		if len(ch.Undo) == 0 || !strings.Contains(cmdLinesOf(ch.Undo)[0], "没有改动过") {
+			t.Errorf("%s: Linux 这一路没改过对端，账本里要写明没有要还原的东西", tc.name)
+		}
+	}
+}
+
+func TestParseLinuxProbe(t *testing.T) {
+	raw := `/usr/bin/gnome-remote-desktop
+/usr/bin/grdctl
+` + probeSep + `
+/usr/share/wayland-sessions:
+gnome.desktop
+plasma.desktop
+
+` + probeSep + `
+ID="ubuntu"
+PRETTY_NAME="Ubuntu 24.04.1 LTS"
+`
+	env := parseLinuxProbe(raw)
+	if env.DE() != "gnome" {
+		t.Errorf("要认出 gnome：%+v", env)
+	}
+	if env.Distro != "ubuntu" || env.Pretty != "Ubuntu 24.04.1 LTS" {
+		t.Errorf("发行版解错：%+v", env)
+	}
+	if len(env.Bins) != 2 || env.Bins[0] != "gnome-remote-desktop" {
+		t.Errorf("服务端程序要只留文件名：%v", env.Bins)
+	}
+	// ls 的表头与空行不能混进会话名
+	for _, s := range env.Sessions {
+		if strings.Contains(s, "/") || s == "" {
+			t.Errorf("会话名混进了噪声：%v", env.Sessions)
+		}
+	}
+}
+
+// 只读那一路：PrepareDesktop 一条改系统的命令都不许发出去。
+func TestPrepareDesktopIsReadOnly(t *testing.T) {
+	for _, goos := range []string{"windows", "linux", "darwin"} {
+		f := &fakeExecer{seq: []*Output{{Stdout: "0x1\n"}, {Stdout: ""}, {Stdout: ""}}}
+		if _, err := PrepareDesktop(context.Background(), f, &Device{ID: "u@h", OS: goos, User: "u", Host: "h"}); err != nil {
+			t.Fatalf("%s: %v", goos, err)
+		}
+		for _, c := range f.seen {
+			for _, bad := range []string{"reg add", "sc start", "launchctl enable", "launchctl bootstrap",
+				"systemctl --user enable", "gsettings set", "apt install", "sudo"} {
+				if strings.Contains(c, bad) {
+					t.Errorf("%s 的「查状态」里发出了改动命令 %q：%q", goos, bad, c)
+				}
+			}
+		}
+	}
+}
+
+func TestPrepareDesktopUnknownOSLoudly(t *testing.T) {
+	f := &fakeExecer{seq: []*Output{{}}}
+	if _, err := PrepareDesktop(context.Background(), f, &Device{OS: "routeros"}); err == nil ||
+		!strings.Contains(err.Error(), "remote.device.probe") {
+		t.Errorf("认不出的系统要大声报错并给下一步，拿到 %v", err)
+	}
+}
+
+func TestConfirmListeningRetries(t *testing.T) {
+	f := &fakeExecer{seq: []*Output{
+		{Stdout: "tcp4 0 0 *.22 *.* LISTEN\n"},
+		{Stdout: "tcp4 0 0 *.5900 *.* LISTEN\n"},
+	}}
+	ok, err := ConfirmListening(context.Background(), f, &Device{OS: "darwin"}, 3, time.Millisecond)
+	if err != nil || !ok {
+		t.Fatalf("第二次就该看到 5900：%v %v", ok, err)
+	}
+	if len(f.seen) != 2 {
+		t.Errorf("看到就该停，跑了 %d 次", len(f.seen))
+	}
+	// 一直查不到就是查不到 —— 不许把"没核实"说成"开好了"
+	f2 := &fakeExecer{seq: []*Output{{Stdout: "no listener here\n"}}}
+	ok, err = ConfirmListening(context.Background(), f2, &Device{OS: "darwin"}, 2, time.Millisecond)
+	if err != nil || ok {
+		t.Fatalf("没在听要报 false：%v %v", ok, err)
+	}
+}
+
+// ── NetKit 主机是 Windows、目标是 VNC：先找装过的查看器 ──
+
+func TestParseRegInstallDirs(t *testing.T) {
+	// reg query ... /s /f 的真实排版：键路径行 + 三列的值行
+	out := `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\TigerVNC
+    DisplayName    REG_SZ    TigerVNC 1.13.1
+    InstallLocation    REG_SZ    C:\Program Files\TigerVNC\
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\RealVNC-VNC Viewer_is1
+    DisplayIcon    REG_SZ    C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe
+
+Found.`
+	dirs := parseRegInstallDirs(out)
+	want := []string{`C:\Program Files\TigerVNC`, `C:\Program Files\RealVNC\VNC Viewer`}
+	if len(dirs) != len(want) {
+		t.Fatalf("要 %v，拿到 %v", want, dirs)
+	}
+	for i := range want {
+		// ★ 不许切成 "."：那是拿宿主 filepath 切 Windows 路径的下场
+		if dirs[i] != want[i] {
+			t.Errorf("第 %d 个要 %q，拿到 %q", i, want[i], dirs[i])
+		}
+	}
+}
+
+func TestViewerCandidatesAndArgs(t *testing.T) {
+	cands := viewerCandidates([]string{`C:\Program Files\TigerVNC`, `C:\Program Files\TightVNC`})
+	if len(cands) == 0 || !strings.Contains(cands[0], `C:\Program Files\TigerVNC\vncviewer.exe`) {
+		t.Fatalf("候选路径形状不对：%v", cands)
+	}
+	for _, c := range cands {
+		if strings.Contains(c, `\\`) {
+			t.Errorf("拼路径拼出了双反斜杠：%q", c)
+		}
+	}
+	// 各家命令行形状不同，认不出的产品按最通用那一形，且一定把形状说出去（界面上看得见）
+	args, shape := vncViewerArgs(`C:\Program Files\TigerVNC\vncviewer.exe`, "192.168.3.20", 5900)
+	if len(args) != 1 || args[0] != "192.168.3.20::5900" || shape == "" {
+		t.Errorf("TigerVNC 要主机::端口，且要报出用的是哪一形：%v %q", args, shape)
+	}
+	args, shape = vncViewerArgs(`C:\Program Files\TightVNC\tvnviewer.exe`, "192.168.3.20", 5901)
+	if len(args) != 1 || !strings.HasPrefix(args[0], "-connect=") || !strings.Contains(args[0], "::5901") {
+		t.Errorf("TightVNC 2.x 那一形没给对：%v %q", args, shape)
+	}
+	if vncClipboardText("192.168.3.20", 5900) != "192.168.3.20::5900" {
+		t.Error("剪贴板里那句要和查看器连的一样（双冒号=直接给端口号）")
+	}
+	// 认不出产品也要给个形状说出去，不能默默丢参数
+	_, shape = vncViewerArgs(`D:\somewhere\weird.exe`, "h", 5900)
+	if shape == "" {
+		t.Error("没说出用的是哪一形，人连不上时看不见原因")
+	}
+}
+
+// Windows 主机上找查看器：不在 Windows 上跑就明说不跑（POSIX 测试机器不许去 exec reg.exe）。
+func TestRunLocalRefusesNonWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("这一条钉的是非 Windows 的护栏")
+	}
+	if _, err := runLocal(time.Second, "reg", "query", "HKLM"); err == nil ||
+		!strings.Contains(err.Error(), "不是 Windows") {
+		t.Errorf("非 Windows 主机上跑本机命令要报错，拿到 %v", err)
+	}
+	if dirs := winViewerDirsFromRegistry(); dirs != nil {
+		t.Errorf("非 Windows 上不该去查注册表：%v", dirs)
+	}
+	if err := windowsClipboard("x"); err == nil {
+		t.Error("非 Windows 上剪贴板兜底要如实报做不了")
 	}
 }

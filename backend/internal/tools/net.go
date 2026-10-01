@@ -24,13 +24,14 @@ import (
 // 注册进注册表的是它，装进排查路线的可选步骤也是它 ——
 // 否则新加一个工具忘了登记给路线，路线里就永远问不到它，而编译器不会提醒。
 var localTools = []ots.Tool{
-	interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, onvifInfoTool, hlsProbeTool, rtmpProbeTool, neighborsTool, discoverTool, identifyTool,
+	interfacesTool, tcpProbeTool, udpProbeTool, portsScanTool, subnetScanTool, pingTool, pingWatchTool, rtspProbeTool, onvifInfoTool, hlsProbeTool, rtmpProbeTool, gbProbeTool, gbRegisterTool, neighborsTool, discoverTool, identifyTool,
 	dualStackTool, checkupTool, portProcTool, dnsQueryTool, tlsCheckTool, httpProbeTool, traceTool, mtrTool, mtuPathTool, timeCheckTool, subnetCalcTool, macAnalyzeTool, macRandomTool, codecTool, wolTool, routesTool,
 	fileshareServeTool, fileshareStatusTool, fileshareStopTool, snmpProbeTool, snmpMacTool, snmpPortsTool, snmpPoeTool, snmpLldpTool,
 	throughputServeTool, throughputStatusTool, throughputStopTool, throughputTestTool, speedTestTool,
 	qualityWatchTool, qualityStatusTool, qualityReportTool, qualityStopTool,
 	captureStartTool, captureStatusTool, captureStopTool, captureFlowsTool, captureFlowTool, captureOpenTool,
-	bandwidthTopTool,
+	peerCaptureProbeTool, peerCaptureStartTool, peerCaptureStatusTool, peerCaptureStopTool,
+	bandwidthTopTool, topologyTool,
 	diagBundleTool, troubleshootTool,
 }
 
@@ -42,6 +43,7 @@ func Register(r *ots.Registry) {
 	RegisterDHCP(r)
 	RegisterRemote(r)
 	RegisterPlaybooks(r)
+	RegisterPortal(r)
 }
 
 // version 是本机跑的产品版本，由 main 在启动时装进来（编译台注入，本地构建是 dev）。

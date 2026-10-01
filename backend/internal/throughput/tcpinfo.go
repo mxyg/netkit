@@ -35,6 +35,24 @@ func absentTCPInfo(why string) TCPInfo {
 	return TCPInfo{Why: why}
 }
 
+// enableTCPInfo 在一条刚握完手、还没开打的连接上尽力打开内核那份账的采集开关。
+//
+// ★★ 为什么要在传输之前调：Windows 的每连接统计默认不采，且重传这类计数是「自开启起累加」的
+//
+//	—— 等到传完再开，只能数到最后那几帧，报出来的「重传 0 段」是假的。macOS/Linux 上这一步是空操作
+//	（那两份账现取现得）。这一步 best-effort：成不成都不报，读账时再按「这台给不给」说话。
+func enableTCPInfo(c net.Conn) {
+	sc, ok := c.(syscall.Conn)
+	if !ok {
+		return
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = rc.Control(func(fd uintptr) { enableConnTCPStats(fd) })
+}
+
 // tcpInfoOf 从一条还开着的连接上取内核的账。★ 只在连接关闭前取：
 //
 //	另起一条连接去问，问回来的是另一条的状态，与刚才那一段传输无关。

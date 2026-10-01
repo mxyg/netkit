@@ -276,6 +276,8 @@ var dhcpLeasesTool = ots.Tool{
 			Values: map[string]any{
 				"iface": running.cfg.Iface.Name, "leases": ls, "count": len(ls),
 				"poolSize": running.cfg.PoolSize(),
+				// 界面要靠这一格标出「这台已经钉过了」，不然钉没钉上看不出来
+				"reserved": running.srv.Reserved(),
 				"since":    running.since.Format(time.RFC3339),
 			},
 			Note: fmt.Sprintf("已发出 %d 个地址（池子共 %d 个）", len(ls), running.cfg.PoolSize()),
@@ -563,6 +565,8 @@ func RestoreOnStart(log *slog.Logger) {
 	}
 	// 文件共享同理：端口随进程释放，没有要还原的东西，但账要了结（见 fileshare.go）
 	restoreFileShare(log)
+	// 手机门户同理（见 portal.go）
+	restorePortal(log)
 	// 持续质量监测同理：采集器随进程没了，但留痕文件一律不动（见 quality.go）
 	restoreQualityWatch(log)
 	// 抓包同理：采集口与文件句柄随进程释放，落盘那份是现场证据，一个字都不动（见 capture.go）
