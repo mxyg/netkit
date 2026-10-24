@@ -20,6 +20,7 @@ import (
 
 	"net.yuhox.com/netkit/internal/api"
 	"net.yuhox.com/netkit/internal/capture"
+	"net.yuhox.com/netkit/internal/desk"
 	"net.yuhox.com/netkit/internal/mcp"
 	"net.yuhox.com/netkit/internal/ots"
 	"net.yuhox.com/netkit/internal/playbook"
@@ -40,10 +41,20 @@ func main() {
 		approveURL = flag.String("approve-url", "",
 			"批准端点（界面开的）。★ 不给 = 没有批准渠道 = 改系统的工具一律拒绝执行")
 		journalPath = flag.String("journal", "", "改动账本路径。默认放用户配置目录")
+		deskAddr    = flag.String("desk", "", "只共享本机屏幕，值是监听地址，例如 0.0.0.0:8790。给另一台网通看画面用")
+		deskToken   = flag.String("desk-token", "", "看画面要用的令牌")
 		mutations   = flag.Bool("mutations", false,
 			"启用会改系统的工具。★ 一期不要开：改系统的工具必须等「先登记后执行、能还原」机制落地")
 	)
 	flag.Parse()
+
+	if *deskAddr != "" {
+		if err := desk.Serve(*deskAddr, *deskToken); err != nil {
+			fmt.Fprintln(os.Stderr, "屏幕共享停了：", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	reg := ots.NewRegistry(*mutations)
 	tools.SetVersion(Version) // 诊断包里要写「那台是什么版本」

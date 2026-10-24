@@ -5230,6 +5230,7 @@ async function renderRemote(root) {
   const r = await call('remote.device.list');
   if (!r.ok) { root.appendChild($(t('<div class=\"card\">远程功能不可用：{0}</div>', [esc(r.message)]))); return; }
   const devices = r.values.devices || [];
+  root.appendChild(winsshCard());
   root.appendChild(notifyCard(r.values.notifyTarget !== false));
   root.appendChild(deviceTable(devices));
   root.appendChild(addDeviceCard());
@@ -5427,6 +5428,47 @@ function playbookResult(r) {
           : t('<p class=\"dim\" style=\"margin:8px 0\">凭据核过一遍：{0}。</p>', [esc(v.redactedHow)]), steps, esc(v.nextStep || ''), esc(v.device), esc(v.playbook), esc(v.seconds ? v.seconds.toFixed(1) : '—')]);
 }
 
+function winsshCard() {
+  const card = $(t('<div class=\"card\">\n    <h2>网线那头开 SSH</h2>\n    <p class=\"hint\">网线另一头是 Windows、还没有 SSH 时用。这边开一个网页，对方打开后下载文件并双击（点允许更改）。文件名带下载时间，重新下载名字会变。装好之后用下面「登记一台设备」填地址和 Windows 密码，就能传文件、跑命令。</p>\n    <div style=\"display:flex;gap:8px;flex-wrap:wrap\">\n      <button class=\"btn primary\" id=\"on\">打开页面</button>\n      <button class=\"btn\" id=\"off\">关掉页面</button>\n    </div>\n    <div class=\"out\" id=\"o\" style=\"display:none;margin-top:10px;white-space:pre-wrap\"></div>\n  </div>'));
+  const out = card.querySelector('#o');
+  const paint = (v) => {
+    out.style.display = 'block';
+    const urls = (v.urls || []).map((u) => u).join('\n');
+    const peers = (v.peers || []).map((p) => t('{0}  {1}', [p.ip, p.ssh ? t('SSH 已开') : t('22 端口还没开')])).join('\n');
+    const lines = (v.lines || []).slice(-12).join('\n');
+    const head = v.running ? t('页面开着。让 Windows 打开：\n{0}', [urls || t('（还没有地址）')]) : t('页面没开。');
+    const who = v.done ? t('\n对方装完了{0}。到下面登记：地址用 SSH 已开的那个，账号填 Windows 用户名。', [v.user ? t('，账号 {0}', [v.user]) : '']) : '';
+    out.textContent = [head, peers && t('\n看见的机器：\n{0}', [peers]), lines && t('\n对方脚本：\n{0}', [lines]), who].filter(Boolean).join('');
+  };
+  const refresh = async () => {
+    const r = await call('remote.winssh.status');
+    if (!r.ok) { out.style.display = 'block'; out.textContent = r.message; return null; }
+    paint(r.values || {});
+    return r.values;
+  };
+  card.querySelector('#on').onclick = async () => {
+    out.style.display = 'block';
+    out.textContent = t('等你点批准…（取消的话网页不会开）');
+    const r = await call('remote.winssh.start');
+    if (!r.ok) { out.textContent = t('开不了：') + r.message; return; }
+    paint(r.values || {});
+  };
+  card.querySelector('#off').onclick = async () => {
+    out.style.display = 'block';
+    out.textContent = t('等你点批准…（取消就还开着）');
+    const r = await call('remote.winssh.stop');
+    if (!r.ok) { out.textContent = t('关不了：') + r.message; return; }
+    refresh();
+  };
+  const timer = setInterval(async () => {
+    if (!card.isConnected) { clearInterval(timer); return; }
+    const v = await refresh();
+    if (v && !v.running) { /* 没开着也继续看邻居，方便确认 22 通了 */ }
+  }, 3000);
+  refresh();
+  return card;
+}
+
 function notifyCard(on) {
   const card = $(t('<div class=\"card\">\n    <h2>对方可见 <span class=\"pill {0}\">{1}</span></h2>\n    <p class=\"hint\">开着时，远程连接 / 控制 / 连桌面会先在目标机屏幕上提示一声（带「来自 NetKit·谁」的标识）。\n      审计日志不受这个开关影响，怎么设都照记。</p>\n    <button class=\"btn {2}\" id=\"tog\">{3}</button>\n  </div>', [on ? 'ok' : 'bad', on ? t('开（默认）') : t('静默'), on ? 'danger' : 'primary', on ? t('关闭（进入静默）') : t('打开')]));
   card.querySelector('#tog').onclick = async () => {
@@ -5518,12 +5560,13 @@ function addDeviceCard() {
 }
 
 function remoteOps(d) {
-  const card = $(t('<div class=\"card\">\n    <h2>操作 <code>{0}</code> <span class=\"dim\">{1}</span></h2>\n    <p class=\"hint\">下面每一项改系统的操作都会先弹框确认，且全程记入审计。</p>\n\n    <label>执行命令（远程诊断主力：看资源、抓日志、重启服务）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"cmd\" placeholder=\"{2}\">\n      <button class=\"btn primary\" id=\"bcmd\">执行</button>\n      <button class=\"btn\" id=\"bsess\">看会话</button>\n    </div>\n    <div class=\"out\" id=\"ocmd\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>给屏幕发消息（自动带发送方标识）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"msg\" placeholder=\"如：10 分钟后重启收银系统，请保存工作\">\n      <button class=\"btn\" id=\"bmsg\">发送</button>\n    </div>\n    <div class=\"out\" id=\"omsg\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>传文件（断点续传 + 整包 SHA256 复核）</label>\n    <div class=\"row\">\n      <div><label>本机路径</label><input id=\"flocal\" placeholder=\"/Users/me/升级包.bin\"></div>\n      <div><label>设备路径</label><input id=\"fremote\" placeholder=\"{3}\"></div>\n    </div>\n    <div style=\"display:flex;gap:8px;margin-top:8px\">\n      <button class=\"btn\" id=\"bpush\">推到设备 ↑</button>\n      <button class=\"btn\" id=\"bpull\">拉回本机 ↓</button>\n    </div>\n    <div class=\"out\" id=\"ofile\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>远程桌面</label>\n    <div style=\"display:flex;gap:8px\">\n      <button class=\"btn\" id=\"bdq\">查状态</button>\n      <button class=\"btn primary\" id=\"bdo\">打通并连接{4}</button>\n    </div>\n    <div class=\"out\" id=\"odesk\" style=\"display:none;margin-top:8px\"></div>\n    {5}\n  </div>', [esc(d.id), esc(OS_LABEL[d.os] || t('系统未知，先探测')), d.os === 'windows' ? 'ipconfig /all' : 'systemctl status nginx', d.os === 'windows' ? t('C:\\\\tmp\\\\升级包.bin') : t('/tmp/升级包.bin'), d.os === 'windows' ? t('（RDP 没开会替它开）') : '', d.hostKeyKnown ? t('\n    <label>主机密钥</label>\n    <div style=\"display:flex;gap:8px;align-items:center\">\n      <button class=\"btn danger\" id=\"bkey\">忘掉这台的主机密钥</button>\n      <span class=\"dim\">连不上说「密钥对不上」时才用：确认那台机器重装过系统/换过机器。密钥变了也可能是有人冒充它。</span>\n    </div>\n    <div class=\"out\" id=\"okey\" style=\"display:none;margin-top:8px\"></div>') : '']));
+  const card = $(t('<div class=\"card\">\n    <h2>操作 <code>{0}</code> <span class=\"dim\">{1}</span></h2>\n    <p class=\"hint\">下面每一项改系统的操作都会先弹框确认，且全程记入审计。</p>\n\n    <label>执行命令（远程诊断主力：看资源、抓日志、重启服务）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"cmd\" placeholder=\"{2}\">\n      <button class=\"btn primary\" id=\"bcmd\">执行</button>\n      <button class=\"btn\" id=\"bsess\">看会话</button>\n    </div>\n    <div class=\"out\" id=\"ocmd\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>给屏幕发消息（自动带发送方标识）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"msg\" placeholder=\"如：10 分钟后重启收银系统，请保存工作\">\n      <button class=\"btn\" id=\"bmsg\">发送</button>\n    </div>\n    <div class=\"out\" id=\"omsg\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>传文件（断点续传 + 整包 SHA256 复核）</label>\n    <div class=\"row\">\n      <div><label>本机路径</label><input id=\"flocal\" placeholder=\"/Users/me/升级包.bin\"></div>\n      <div><label>设备路径</label><input id=\"fremote\" placeholder=\"{3}\"></div>\n    </div>\n    <div style=\"display:flex;gap:8px;margin-top:8px\">\n      <button class=\"btn\" id=\"bpush\">推到设备 ↑</button>\n      <button class=\"btn\" id=\"bpull\">拉回本机 ↓</button>\n    </div>\n    <div class=\"out\" id=\"ofile\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>远程桌面</label>\n    <p class=\"hint\">网通自己开一个窗口看对方屏幕。把文件拖进那个窗口，会放到对方正在打开的文件夹；没开文件夹就放到桌面。</p>\n    <div style=\"display:flex;gap:8px\">\n      <button class=\"btn primary\" id=\"bview\">打开对方屏幕</button>\n      <button class=\"btn\" id=\"bviewstop\">停止</button>\n    </div>\n    <div class=\"out\" id=\"odesk\" style=\"display:none;margin-top:8px\"></div>\n    {5}\n  </div>', [esc(d.id), esc(OS_LABEL[d.os] || t('系统未知，先探测')), d.os === 'windows' ? 'ipconfig /all' : 'systemctl status nginx', d.os === 'windows' ? t('C:\\\\tmp\\\\升级包.bin') : t('/tmp/升级包.bin'), d.os === 'windows' ? t('（RDP 没开会替它开）') : '', d.hostKeyKnown ? t('\n    <label>主机密钥</label>\n    <div style=\"display:flex;gap:8px;align-items:center\">\n      <button class=\"btn danger\" id=\"bkey\">忘掉这台的主机密钥</button>\n      <span class=\"dim\">连不上说「密钥对不上」时才用：确认那台机器重装过系统/换过机器。密钥变了也可能是有人冒充它。</span>\n    </div>\n    <div class=\"out\" id=\"okey\" style=\"display:none;margin-top:8px\"></div>') : '']));
   const out = (id, s) => { const o = card.querySelector(id); o.style.display = 'block'; o.textContent = s; };
   const busy = async (btn, fn) => {
-    const b = card.querySelector(btn); const t = b.textContent;
+    const b = card.querySelector(btn);
+    const label = b.textContent;
     b.disabled = true; b.textContent = t('进行中…');
-    try { await fn(); } finally { b.disabled = false; b.textContent = t; }
+    try { await fn(); } finally { b.disabled = false; b.textContent = label; }
   };
 
   card.querySelector('#bcmd').onclick = () => busy('#bcmd', async () => {
@@ -5569,15 +5612,16 @@ function remoteOps(d) {
     transfer('remote.file.pull', { device: d.id, local: l, remote: rm });
   };
 
-  card.querySelector('#bdq').onclick = () => busy('#bdq', async () => {
-    const r = await call('remote.desktop.open', { device: d.id });
-    out('#odesk', r.ok ? t('{0}\n判定：{1}', [r.note, r.verdict]) : t('失败：') + r.message);
-  });
-  card.querySelector('#bdo').onclick = () => busy('#bdo', async () => {
-    out('#odesk', t('打通中…（等待批准；Windows 目标 RDP 没开时会改对端注册表和防火墙）'));
-    const r = await call('remote.desktop.open', { device: d.id, enable: true });
-    out('#odesk', r.ok ? t('{0}\n判定：{1}', [r.note, r.verdict]) : t('失败：') + r.message);
-  });
+  card.querySelector('#bview').onclick = () => {
+    out('#odesk', t('正在另开窗口…'));
+    if (!window.netkit || !window.netkit.openDesk) { out('#odesk', t('这个窗口开不了远程桌面')); return; }
+    window.netkit.openDesk(d.id);
+  };
+  card.querySelector('#bviewstop').onclick = async () => {
+    const r = await call('remote.desk.close', { device: d.id });
+    out('#odesk', r.ok ? r.note : t('停不掉：') + r.message);
+  };
+
   const keyBtn = card.querySelector('#bkey');
   if (keyBtn) keyBtn.onclick = async () => {
     if (!confirm(t('忘掉 {0} 的主机密钥？\n\n只在确认那台机器重装过系统/换过机器时做。下次连接会重新记录一把新密钥；如果其实没人换过机器，这一步等于把「有人在冒充它」这个信号抹掉了。', [d.id]))) return;

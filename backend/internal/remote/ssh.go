@@ -75,6 +75,11 @@ func (m *Manager) Dial(ctx context.Context, d *Device) (*ssh.Client, error) {
 		HostKeyCallback: hostKeyOK,
 		Timeout:         DialTimeout,
 	}
+	// 记下的是某一种算法的公钥。不限定的话，这次握手可能改用另一种算法的公钥，
+	// 比对就会误报成「主机密钥变了」。
+	if i := strings.IndexByte(d.HostKey, ' '); i > 0 {
+		cfg.HostKeyAlgorithms = []string{d.HostKey[:i]}
+	}
 	addr := net.JoinHostPort(d.Host, fmt.Sprint(port))
 	// ★ d.Host 可能是带 zone 的 fe80:: —— Go 的 Dial 认 fe80::1%en0 这种标准写法。
 	//   用 net.Dialer 而不是 ssh.Dial，为了 ctx 取消真的能中断建连。
@@ -125,6 +130,9 @@ func (m *Manager) hostKeyCallback(d *Device) (ssh.HostKeyCallback, error) {
 		if known == "" {
 			d.HostKey = got // 首连：记下，连接成功后由调用方 UpdateDevice 落盘
 			return nil
+		}
+		if knownType, _, ok := strings.Cut(known, " "); ok && knownType != key.Type() {
+			return fmt.Errorf("★ %s 这次出示的是 %s 公钥，登记里记的是 %s。不是密钥变了，是算法没对上", addr, key.Type(), knownType)
 		}
 		if known != got {
 			return fmt.Errorf("★ %s 的主机密钥和首次连接时不一样了 —— 要么那台机器重装/换机了，"+

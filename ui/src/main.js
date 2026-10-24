@@ -124,5 +124,15 @@ app.whenReady().then(async () => {
 
 ipcMain.handle('api-base', () => apiBase);
 
+ipcMain.handle('open-desk', (_evt, device) => {
+  const w = new BrowserWindow({
+    width: 1280, height: 800, minWidth: 800, minHeight: 500,
+    title: '远程桌面',
+    backgroundColor: '#111',
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true },
+  });
+  w.loadFile(path.join(__dirname, 'desk.html'), { query: { device: String(device || '') } });
+});
+
 app.on('window-all-closed', () => app.quit());
 app.on('quit', () => { if (backend) backend.kill(); });

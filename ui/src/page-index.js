@@ -600,10 +600,21 @@ const PAGE_INDEX = {
    "remote.device.add",
    "remote.device.list",
    "remote.device.probe",
-   "remote.device.remove"
+   "remote.device.remove",
+   "remote.winssh.start",
+   "remote.winssh.status",
+   "remote.winssh.stop"
   ],
   "refs": [],
   "cards": [
+   {
+    "t": "网线那头开 SSH",
+    "tools": [
+     "remote.winssh.start",
+     "remote.winssh.status",
+     "remote.winssh.stop"
+    ]
+   },
    {
     "t": "对方可见",
     "tools": [
@@ -634,7 +645,10 @@ const PAGE_INDEX = {
  },
  "remote-work": {
   "tools": [
-   "remote.desktop.open",
+   "remote.desk.close",
+   "remote.desk.frame",
+   "remote.desk.input",
+   "remote.desk.open",
    "remote.device.forget-hostkey",
    "remote.device.list",
    "remote.exec",

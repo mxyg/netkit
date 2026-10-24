@@ -6,4 +6,5 @@
 const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('netkit', {
   apiBase: () => ipcRenderer.invoke('api-base'),
+  openDesk: (device) => ipcRenderer.invoke('open-desk', device),
 });

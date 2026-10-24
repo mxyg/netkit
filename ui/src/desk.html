@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>远程桌面</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee; font-family: sans-serif; }
+  #bar { height: 36px; display: flex; align-items: center; gap: 12px; padding: 0 12px; background: #1c1c1c; }
+  #stage { position: absolute; top: 36px; left: 0; right: 0; bottom: 0; }
+  #view { position: absolute; cursor: default; image-rendering: auto; }
+  #remote-cursor { position: absolute; pointer-events: none; display: none; }
+  label { font-size: 13px; user-select: none; }
+  #hint { opacity: .75; font-size: 13px; }
+</style>
+<div id="bar">
+  <b>远程桌面</b>
+  <label><input id="show-remote" type="checkbox"> 显示远端鼠标</label>
+  <span id="hint"></span>
+</div>
+<div id="stage">
+  <img id="view" alt="">
+  <img id="remote-cursor" alt="">
+</div>
+<script src="desk.js"></script>
