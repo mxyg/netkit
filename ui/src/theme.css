@@ -593,22 +593,12 @@ td.bad { color: var(--red-text); }
 @media (prefers-reduced-motion: reduce) { .toast { transition: none } }
 
 /* ═══════════════════════════════════════════════════════════════════════
-   壳层改版（2026-11-26）：六个一级入口的任务树 + 面包屑 + 状态栏 + 模式段
+   壳层改版（2026-11-26）：图标栏 + 页面树 + 面包屑 + 状态栏
    ═══════════════════════════════════════════════════════════════════════ */
 
-/* 顶栏的新手 / 专家模式段：两颗互斥的段钮，当前的那颗走金底金字 */
-.modeseg {
-  display: flex; flex: none;
-  border: 1px solid var(--line); border-radius: 7px;
-  background: var(--sunken); overflow: hidden;
-}
-.modeseg button {
-  border: 0; background: none; color: var(--muted);
-  font: inherit; font-size: 12.5px; padding: 3px 12px; cursor: pointer;
-}
-.modeseg button + button { border-left: 1px solid var(--line); }
-.modeseg button:hover { color: var(--text); }
-.modeseg button.on { background: var(--gold-bg); color: var(--gold); font-weight: 600; }
+/* （新手/专家模式段已按同日决定移除：功能分类交给树里的「高级」分隔条，
+   没有的 UI 不留死样式。） */
+
 
 /* 主题快切钮：一颗循环 跟随系统 → 深 → 浅 的图标钮，字由 app.js 现填 */
 header .themebtn {
@@ -847,12 +837,6 @@ header .hspacer { flex: 1 1 auto; }
 .treehead span:first-child { font-weight: 650; font-size: 13.5px; color: var(--text); }
 .treehead .cnt { font-size: 11px; color: var(--muted-2); }
 .treebody { display: flex; flex-direction: column; gap: 3px; }
-.treefoot {
-  margin-top: auto; padding: 10px 10px 0; border-top: 1px solid var(--line-soft);
-  font-size: 11.5px; color: var(--muted-2);
-}
-.treefoot button { color: var(--gold); background: none; border: 0; font: inherit; cursor: pointer; padding: 0; }
-.treefoot button:hover { text-decoration: underline; }
 
 /* 选中条目做成原型那张金底圆角卡（原来是左金条） */
 .navp { border: 1px solid transparent; border-radius: 8px; }

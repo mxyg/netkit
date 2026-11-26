@@ -174,36 +174,12 @@ const GROUPS = GROUP_ORDER.filter((g) => PAGES.some((p) => p.g === g && !p.pin))
 /* ── 新手 / 专家双模式 ──
  * 新手（默认）：只露没标 pro 的页 —— 树条目带一句人话说明（desc），不露裸名词。
  * 专家：全量展开；切回新手时人若停在专家页上，退回总览，不留悬空态。
+ *
+ * ★ 2026-11-26 按老板定的改：不再有「新手 / 专家」两个模式，也不放切换钮 ——
+ *   正常软件就该把功能分好类：每组先列常用页（带一句人话说明），
+ *   再用「高级」分隔条列出进阶页。新手照着常用页走，专家自己往「高级」里翻。
  */
-const MODE_KEY = 'netkit.mode';
-let mode = (() => {
-  try { return localStorage.getItem(MODE_KEY) === 'pro' ? 'pro' : 'simple'; } catch (_) { return 'simple'; }
-})();
-const inMode = (p) => !p.pro || mode === 'pro';
-function setMode(m) {
-  if (m === mode) return;
-  mode = m;
-  try { localStorage.setItem(MODE_KEY, m); } catch (_) { /* 存不上就这一趟不记住 */ }
-  const p = PAGES.find((x) => x.id === current);
-  if (m === 'simple' && p && p.pro) current = 'home';
-  renderModeSeg();
-  renderNav();
-  show();
-}
-function renderModeSeg() {
-  const seg = document.getElementById('modeseg');
-  if (!seg) return;
-  seg.innerHTML = '';
-  for (const [m, lbl] of [['simple', t('新手')], ['pro', t('专家')]]) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = lbl;
-    if (mode === m) b.classList.add('on');
-    b.title = m === 'simple' ? t('只露常用的页，每个条目带一句说明') : t('全部页面展开，右栏检查器常驻');
-    b.onclick = () => setMode(m);
-    seg.appendChild(b);
-  }
-}
+const inMode = () => true; // 模式没了：所有页面都在树上，分类交给「高级」分隔条
 
 /* ── 深浅色三态主题：跟随系统 / 深 / 浅 ──
  * 落点在 <html data-theme>：跟随系统 = 不写属性（theme.css 的媒体查询接手），
@@ -286,8 +262,9 @@ function navBtn(p) {
   main.className = 'main';
   main.textContent = p.name;
   b.appendChild(main);
-  // 新手模式的那一句人话说明就钉在条目第二行 —— 裸名词正是上一版「完全用不明白」的根。
-  if (mode === 'simple' && p.desc) {
+  // 那一句人话说明钉在条目第二行 —— 裸名词正是上一版「完全用不明白」的根。
+  // 模式没了，说明永远在：新手靠它挑，专家扫一眼也知道进哪页。
+  if (p.desc) {
     const d = document.createElement('span');
     d.className = 'desc';
     d.textContent = p.desc;
@@ -303,7 +280,8 @@ function navBtn(p) {
  * 选中态是金底卡片。底部一行新手模式提示。不再把全部入口平铺成一长列。
  */
 const RAIL_ICON = {
-  [t('开始')]: 'M8 1.6 14.4 7v7.4H1.6V7Z', // 房子（首页图标同款）
+  // 「开始」用四宫格 —— 房子留给钉死的首页，免得图标栏上下两颗一模一样。
+  [t('开始')]: 'M2.5 2.5h4.4v4.4H2.5ZM9.1 2.5h4.4v4.4H9.1ZM2.5 9.1h4.4v4.4H2.5ZM9.1 9.1h4.4v4.4H9.1Z',
   [t('网络')]: 'M1.5 6.5C4.5 3 11.5 3 14.5 6.5M3.6 9a6.4 6.4 0 0 1 8.8 0M6 11.4a3 3 0 0 1 4 0M8 13.6h.01',
   [t('设备')]: 'M1.8 3.6h12.4v7.2H1.8ZM5.6 13.6h4.8',
   [t('修复')]: 'M9.5 2.2a3.8 3.8 0 0 0-4.9 4.9L1.8 9.9v4.3h4.3l2.8-2.8a3.8 3.8 0 0 0 4.9-4.9L10.6 9.7 6.3 5.4Z',
@@ -356,26 +334,21 @@ function renderNav() {
   body.className = 'treebody';
   let proDone = false;
   for (const p of inGroup) {
-    if (p.pro && !proDone && mode === 'pro') { body.appendChild(proSep()); proDone = true; }
+    if (p.pro && !proDone) { body.appendChild(proSep()); proDone = true; }
     body.appendChild(navBtn(p));
   }
   nav.appendChild(body);
   const foot = document.createElement('div');
-  foot.className = 'treefoot';
-  foot.innerHTML = mode === 'simple'
-    ? `${esc(t('新手模式提示'))} <button id="topro">${esc(t('切到专家模式'))}</button>`
-    : `${esc(t('专家模式'))} · <button id="tosimple">${esc(t('切回新手'))}</button>`;
-  nav.appendChild(foot);
-  const tp = foot.querySelector('#topro');
-  if (tp) tp.onclick = () => setMode('pro');
-  const ts = foot.querySelector('#tosimple');
-  if (ts) ts.onclick = () => setMode('simple');
+  // 模式切换没了（高级功能就在树上「高级」一段里），底部不再放提示条。
 }
 
 function proSep() {
   const s = document.createElement('div');
   s.className = 'prosep';
-  s.textContent = 'PRO';
+  // 模式没了，进阶功能就在树上这一段 —— 新手知道常用页在上面就够，
+  // 专家要找高级功能往分隔条下面翻。
+  s.textContent = t('高级');
+  s.title = t('进阶功能：日常用不到，出了状况才请它们出场');
   return s;
 }
 
@@ -411,8 +384,6 @@ function renderStatusbar() {
   const dotCls = CONN_OK === true ? 'g' : CONN_OK === false ? 'r' : 'y';
   seg().innerHTML = `<span class="sdot ${dotCls}"></span> ${esc(CONN_TEXT)} · <b>${TOOLS.length}</b> ${esc(t('个工具'))}`;
   const sepEl = () => { const s = document.createElement('span'); s.className = 'sep'; s.textContent = '·'; bar.appendChild(s); };
-  sepEl();
-  seg().innerHTML = `${esc(t('模式'))} <b>${esc(mode === 'pro' ? t('专家') : t('新手'))}</b>`;
   sepEl();
   const p = PAGES.find((x) => x.id === current) || PAGES[0];
   const rec = PIDX[p.id] || PIDX[p.alias] || { tools: [] };
@@ -10913,7 +10884,6 @@ function renderPlaybooks(root) {
   // 主题快切钮：跟随系统 → 深 → 浅 三态循环（设置页里有带预览的三选）。
   const tb = document.getElementById('themebtn');
   if (tb) tb.onclick = () => cycleTheme();
-  renderModeSeg();
   API = await window.netkit.apiBase();
   // 连接态事实源：写进状态栏第一格（原型那颗「● 后端已连接」）。
   // ● 颜色三态：绿=已连上，黄=还在连，红=连不上。
