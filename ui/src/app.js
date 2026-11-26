@@ -53,39 +53,65 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<
  *   由 scripts/page-index.cjs 用 AST 量出来生成 page-index.js，--check 钉住不漂。
  *   再抄一份映射表就是第四副本，历史上「界面说没做、后端其实做了」就是这么来的。
  */
+/*
+ *   2026-11-26 再改：八个组一次铺开换成**六个一级入口 + 新手/专家双模式**
+ *   （docs/UI改版设计.md 第四节）。新手模式（默认）只露常用页，条目带一句人话说明；
+ *   专家模式全量展开。功能一个没删 —— 原来 8 组的 23 页全部还在，只是归进新树。
+ *   两个「任务视图」页是原有页的合体（页面本体不动，直接复用它们的 render）：
+ *     net-status ← renderConnect（连通性并进「网络状态」）
+ *     lan        ← renderScan + renderTopo（扫描与拓扑并进「局域网里有什么」）
+ *   alias 记的是能力表索引（page-index.js）落在哪一页 —— 右栏与相关页都从它兜底。
+ */
 const PAGES = [
-  { g: '', pin: true, id: 'home', name: t('总览'), render: renderHome },
+  { g: t('开始'), pin: true, id: 'home', name: t('总览'), render: renderHome,
+    desc: t('现在什么情况、下一步做什么') },
+  { g: t('开始'), id: 'welcome', name: t('第一次用'), render: renderWelcome,
+    desc: t('三步把它配成你的样子') },
 
-  { g: t('这台机器'), id: 'nic', name: t('网卡与路由'), render: renderNIC },
-  { g: t('这台机器'), id: 'dhcp', name: t('DHCP 分地址'), render: renderDHCP },
-  { g: t('这台机器'), id: 'local', name: t('本机端口与文件共享'), render: renderLocal },
+  { g: t('网络'), id: 'net-status', name: t('网络状态'), render: renderConnect, alias: 'connect',
+    desc: t('通不通、端口开不开，一眼见分晓') },
+  { g: t('网络'), id: 'capture', name: t('抓包看内容'), render: renderCapture,
+    desc: t('抓下来按流聚成一张能对账的表') },
+  { g: t('网络'), id: 'lan', name: t('局域网里有什么'), render: renderLan, alias: 'scan',
+    desc: t('扫一遍网段，合成一张拓扑图') },
+  { g: t('网络'), pro: true, id: 'connect', name: t('ping 与端口'), render: renderConnect },
+  { g: t('网络'), pro: true, id: 'nic', name: t('网卡与路由'), render: renderNIC },
+  { g: t('网络'), pro: true, id: 'dhcp', name: t('DHCP 分地址'), render: renderDHCP },
+  { g: t('网络'), pro: true, id: 'local', name: t('本机端口与文件共享'), render: renderLocal },
+  { g: t('网络'), pro: true, id: 'path', name: t('路径与质量'), render: renderPath },
+  { g: t('网络'), pro: true, id: 'name', name: t('域名与时间'), render: renderName },
+  { g: t('网络'), pro: true, id: 'service', name: t('网站与证书'), render: renderService },
+  { g: t('网络'), pro: true, id: 'thru', name: t('两台机器对测'), render: renderThru },
+  { g: t('网络'), pro: true, id: 'speed', name: t('出去公网有多快'), render: renderSpeed },
+  { g: t('网络'), pro: true, id: 'quality', name: t('盯一段时间'), render: renderQuality },
+  { g: t('网络'), pro: true, id: 'bandwidth', name: t('谁在吃流量'), render: renderBandwidth },
+  { g: t('网络'), pro: true, id: 'switch', name: t('交换机（SNMP）'), render: renderSwitch },
+  { g: t('网络'), pro: true, id: 'stream', name: t('摄像头取流'), render: renderStream },
+  { g: t('网络'), pro: true, id: 'scan', name: t('网段上有哪些地址'), render: renderScan },
+  { g: t('网络'), pro: true, id: 'topo', name: t('拓扑图'), render: renderTopo },
+  { g: t('网络'), pro: true, id: 'device', name: t('设备是谁'), render: renderDevice },
 
-  { g: t('通不通'), id: 'connect', name: t('ping 与端口'), render: renderConnect },
-  { g: t('通不通'), id: 'path', name: t('路径与质量'), render: renderPath },
-  { g: t('通不通'), id: 'name', name: t('域名与时间'), render: renderName },
-  { g: t('通不通'), id: 'service', name: t('网站与证书'), render: renderService },
+  { g: t('设备'), id: 'remote', name: t('远程设备与审计'), render: renderRemote,
+    desc: t('登记过的机器、刚才对哪台做过什么') },
+  { g: t('设备'), id: 'remote-work', name: t('连上去干活'), render: renderRemoteWork,
+    desc: t('敲命令、传文件、开桌面、跑剧本') },
+  { g: t('设备'), pro: true, id: 'mobile', name: t('手机互联与投屏'), render: renderMobile },
+  { g: t('设备'), pro: true, id: 'sessions', name: t('会话中心'), render: renderSessions },
+  { g: t('设备'), pro: true, id: 'batch', name: t('批量任务'), render: renderBatch },
+  { g: t('设备'), pro: true, id: 'bridge', name: t('Windows SSH 桥'), render: renderBridge },
 
-  { g: t('快不快'), id: 'thru', name: t('两台机器对测'), render: renderThru },
-  { g: t('快不快'), id: 'speed', name: t('出去公网有多快'), render: renderSpeed },
-  { g: t('快不快'), id: 'quality', name: t('盯一段时间'), render: renderQuality },
-  { g: t('快不快'), id: 'bandwidth', name: t('谁在吃流量'), render: renderBandwidth },
+  { g: t('修复'), id: 'trouble', name: t('按症状排查'), render: renderTrouble,
+    desc: t('说一句现象，按工程师的顺序查') },
+  { g: t('修复'), id: 'checkup', name: t('一键体检与诊断包'), render: renderCheckup,
+    desc: t('不用填东西，先查一遍，可打包发人') },
+  { g: t('修复'), pro: true, id: 'diaghist', name: t('诊断包历史'), render: renderDiaghist },
 
-  { g: t('谁在网里'), id: 'scan', name: t('网段上有哪些地址'), render: renderScan },
-  { g: t('谁在网里'), id: 'device', name: t('设备是谁'), render: renderDevice },
-  { g: t('谁在网里'), id: 'stream', name: t('摄像头取流'), render: renderStream },
-  { g: t('谁在网里'), id: 'switch', name: t('交换机（SNMP）'), render: renderSwitch },
+  { g: t('工具'), id: 'tools', name: t('算子网 / MAC / 编解码'), render: renderTools,
+    desc: t('算网段、看 MAC 来路、解编码') },
+  { g: t('工具'), pro: true, id: 'playbooks', name: t('剧本库'), render: renderPlaybooks },
 
-  { g: t('网长什么样'), id: 'topo', name: t('拓扑图'), render: renderTopo },
-
-  { g: t('出问题了'), id: 'checkup', name: t('一键体检与诊断包'), render: renderCheckup },
-  { g: t('出问题了'), id: 'trouble', name: t('按症状排查'), render: renderTrouble },
-  { g: t('出问题了'), id: 'capture', name: t('抓包看内容'), render: renderCapture },
-
-  { g: t('管别的机器'), id: 'remote', name: t('远程设备与审计'), render: renderRemote },
-  { g: t('管别的机器'), id: 'remote-work', name: t('连上去干活'), render: renderRemoteWork },
-  { g: t('管别的机器'), id: 'mobile', name: t('手机互联与投屏'), render: renderMobile },
-
-  { g: t('工具箱'), id: 'tools', name: t('算子网 / MAC / 编解码'), render: renderTools },
+  { g: t('设置'), id: 'settings', name: t('设置'), render: renderSettings,
+    desc: t('主题、语言、后端连接、关于') },
 ];
 
 /*
@@ -118,12 +144,89 @@ const PAGE_ASK = {
   'remote-work': t('连上一台干活：敲命令、传文件、发消息、开桌面、跑剧本'),
   mobile: t('手机扫码进来传文件、投屏，不装任何东西'),
   tools: t('算网段、看 MAC 来路、解编码 —— 不用开终端'),
+  welcome: t('第一次打开先把语言、主题配好，再跑一次体检 —— 三步，都能改'),
+  'net-status': t('这个地址答不答、这个端口开不开 —— 网络现在怎么样'),
+  lan: t('这个网段上现在有谁，这台机器眼里的网长什么样'),
+  sessions: t('正在开着的终端、传输、桌面窗口，一个地方全看见、能断'),
+  batch: t('同一件事对一批机器做一遍，不用一台一台点'),
+  bridge: t('不用装 SSH 客户端，把 Windows 机器也纳进来管'),
+  diaghist: t('打包过哪些诊断包、发给过谁 —— 事后能对账'),
+  playbooks: t('存下来的剧本：谁写的、跑过几回、改过没有'),
+  settings: t('主题、语言、后端连接、版本 —— 把它配成你的样子'),
 };
 
 // 卡片都是小表单的页才并排成两栏；带表格的一律单栏（并排是为了密度，不是为了好看）。
-const GRID = new Set(['connect', 'name', 'service', 'tools', 'speed', 'bandwidth', 'scan', 'device']);
+const GRID = new Set(['connect', 'name', 'service', 'tools', 'speed', 'bandwidth', 'scan', 'device', 'net-status']);
 
-const GROUPS = [...new Set(PAGES.filter((p) => !p.pin).map((p) => p.g))];
+/*
+ * 六个一级入口的先后顺序（docs/UI改版设计.md 4.1）。
+ * 组名是 t() 的返回值，语言切换重跑后仍是同一批 key。
+ */
+const GROUP_ORDER = [t('开始'), t('网络'), t('设备'), t('修复'), t('工具'), t('设置')];
+const GROUPS = GROUP_ORDER.filter((g) => PAGES.some((p) => p.g === g && !p.pin));
+
+/* ── 新手 / 专家双模式 ──
+ * 新手（默认）：只露没标 pro 的页 —— 树条目带一句人话说明（desc），不露裸名词。
+ * 专家：全量展开；切回新手时人若停在专家页上，退回总览，不留悬空态。
+ */
+const MODE_KEY = 'netkit.mode';
+let mode = (() => {
+  try { return localStorage.getItem(MODE_KEY) === 'pro' ? 'pro' : 'simple'; } catch (_) { return 'simple'; }
+})();
+const inMode = (p) => !p.pro || mode === 'pro';
+function setMode(m) {
+  if (m === mode) return;
+  mode = m;
+  try { localStorage.setItem(MODE_KEY, m); } catch (_) { /* 存不上就这一趟不记住 */ }
+  const p = PAGES.find((x) => x.id === current);
+  if (m === 'simple' && p && p.pro) current = 'home';
+  renderModeSeg();
+  renderNav();
+  show();
+}
+function renderModeSeg() {
+  const seg = document.getElementById('modeseg');
+  if (!seg) return;
+  seg.innerHTML = '';
+  for (const [m, lbl] of [['simple', t('新手')], ['pro', t('专家')]]) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = lbl;
+    if (mode === m) b.classList.add('on');
+    b.title = m === 'simple' ? t('只露常用的页，每个条目带一句说明') : t('全部页面展开，右栏检查器常驻');
+    b.onclick = () => setMode(m);
+    seg.appendChild(b);
+  }
+}
+
+/* ── 深浅色三态主题：跟随系统 / 深 / 浅 ──
+ * 落点在 <html data-theme>：跟随系统 = 不写属性（theme.css 的媒体查询接手），
+ * 深 = 'dark'，浅 = 'light'（显式浅色块与媒体查询里是同一组值，两处只许一起改）。
+ */
+const THEME_KEY = 'netkit.theme';
+let theme = (() => {
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    return ['system', 'dark', 'light'].includes(v) ? v : 'system';
+  } catch (_) { return 'system'; }
+})();
+function applyTheme() {
+  const root = document.documentElement;
+  if (theme === 'system') delete root.dataset.theme;
+  else root.dataset.theme = theme;
+  const btn = document.getElementById('themebtn');
+  if (btn) {
+    btn.textContent = theme === 'system' ? '◐' : theme === 'dark' ? '☾' : '☀';
+    btn.title = theme === 'system' ? t('主题：跟随系统') : theme === 'dark' ? t('主题：深色') : t('主题：浅色');
+  }
+}
+function setTheme(v) {
+  if (!['system', 'dark', 'light'].includes(v) || v === theme) return;
+  theme = v;
+  try { localStorage.setItem(THEME_KEY, v); } catch (_) { /* 存不上就这一趟不记住 */ }
+  applyTheme();
+}
+function cycleTheme() { setTheme(theme === 'system' ? 'dark' : theme === 'dark' ? 'light' : 'system'); }
 
 // ★ 换语言是整页重跑（i18n.js 的 setLang 里写了为什么必须重跑）。既然要重跑，
 //   就得把「人在哪一页」留住 —— 不然点一下语言钮，人就被扔回第一页，
@@ -144,12 +247,28 @@ let group = (PAGES.find((p) => p.id === current) || PAGES[0]).g;
 //   代不对就是人已经换页了 —— 那一趟的活作废，不许往已经拆掉的节点里写。
 let gen = 0;
 
+/* 组折叠状态记在本地：默认全开（新手第一次要一眼看全六个入口里都有什么）。 */
+const NAVOPEN_KEY = 'netkit.navopen';
+let navOpen = (() => {
+  try { return JSON.parse(localStorage.getItem(NAVOPEN_KEY) || 'null') || {}; } catch (_) { return {}; }
+})();
+
 function navBtn(p) {
   const b = document.createElement('button');
   b.type = 'button';
   b.className = 'navp' + (p.id === current ? ' on' : '');
-  b.textContent = p.name;
   b.title = PAGE_ASK[p.id] || '';
+  const main = document.createElement('span');
+  main.className = 'main';
+  main.textContent = p.name;
+  b.appendChild(main);
+  // 新手模式的那一句人话说明就钉在条目第二行 —— 裸名词正是上一版「完全用不明白」的根。
+  if (mode === 'simple' && p.desc) {
+    const d = document.createElement('span');
+    d.className = 'desc';
+    d.textContent = p.desc;
+    b.appendChild(d);
+  }
   b.onclick = () => goto(p.id);
   return b;
 }
@@ -159,18 +278,83 @@ function renderNav() {
   nav.innerHTML = '';
   const top = document.createElement('div');
   top.className = 'navtop';
-  for (const p of PAGES) if (p.pin) top.appendChild(navBtn(p));
+  for (const p of PAGES) if (p.pin && inMode(p)) top.appendChild(navBtn(p));
   nav.appendChild(top);
   for (const g of GROUPS) {
+    const items = PAGES.filter((p) => p.g === g && !p.pin && inMode(p));
+    if (!items.length) continue;
     const sec = document.createElement('div');
     sec.className = 'navgrp';
-    const h = document.createElement('div');
-    h.className = 'navgh';
-    h.textContent = g;
+    const h = document.createElement('button');
+    h.type = 'button';
+    h.className = 'navgh' + (navOpen[g] === false ? ' closed' : '');
+    const car = document.createElement('span');
+    car.className = 'car';
+    car.textContent = '▾';
+    h.appendChild(car);
+    h.appendChild(document.createTextNode(g));
+    h.onclick = () => {
+      navOpen[g] = navOpen[g] === false ? true : false;
+      try { localStorage.setItem(NAVOPEN_KEY, JSON.stringify(navOpen)); } catch (_) { /* 存不上就这一趟不记住 */ }
+      renderNav();
+    };
     sec.appendChild(h);
-    for (const p of PAGES) if (p.g === g) sec.appendChild(navBtn(p));
+    if (navOpen[g] !== false) {
+      let proDone = false;
+      for (const p of items) {
+        // PRO 分隔小标：往下是专家才露的条目（只有专家模式里会出现）。
+        if (p.pro && !proDone) { sec.appendChild(proSep()); proDone = true; }
+        sec.appendChild(navBtn(p));
+      }
+    }
     nav.appendChild(sec);
   }
+}
+
+function proSep() {
+  const s = document.createElement('div');
+  s.className = 'prosep';
+  s.textContent = 'PRO';
+  return s;
+}
+
+/* 面包屑：「入口 / 页名」。入口名不可点（入口是侧栏那一栏），页名是当前页 ——
+   都是只读的字，不放假按钮。 */
+function renderCrumbs(p) {
+  const el = document.getElementById('crumbs');
+  if (!el) return;
+  el.innerHTML = '';
+  if (p.g && p.g !== p.name) {
+    const g = document.createElement('span');
+    g.textContent = p.g;
+    const sep = document.createElement('span');
+    sep.className = 'sep';
+    sep.textContent = '/';
+    el.append(g, sep);
+  }
+  const here = document.createElement('span');
+  here.className = 'here';
+  here.textContent = p.name;
+  el.appendChild(here);
+}
+
+/* 底部状态栏：工具数 / 模式 / 所在页 / 后端地址，全是现算的事实。 */
+function renderStatusbar() {
+  const bar = document.getElementById('statusbar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  const seg = () => bar.appendChild(document.createElement('span'));
+  seg().innerHTML = `<b>${TOOLS.length}</b> ${esc(t('个工具'))}`;
+  const sepEl = () => { const s = document.createElement('span'); s.className = 'sep'; s.textContent = '·'; bar.appendChild(s); };
+  sepEl();
+  seg().innerHTML = `${esc(t('模式'))} <b>${esc(mode === 'pro' ? t('专家') : t('新手'))}</b>`;
+  sepEl();
+  const p = PAGES.find((x) => x.id === current) || PAGES[0];
+  seg().textContent = `${p.g ? p.g + ' / ' : ''}${p.name}`;
+  const f = document.createElement('span');
+  f.className = 'f';
+  f.innerHTML = `<code>${esc(API || '')}</code>`;
+  bar.appendChild(f);
 }
 
 /** 跳去某一页；opts.card / opts.ent 到了那一页再生效（见 applyPending）。 */
@@ -228,6 +412,8 @@ async function show() {
   bindEnts(main);
   decorate(main);
   renderRail(p);
+  renderCrumbs(p);
+  renderStatusbar();
   applyPending();
 }
 
@@ -237,7 +423,9 @@ function pageHead(p) {
   el.className = 'pagehead';
   const ask = PAGE_ASK[p.id];
   el.innerHTML = `<h2>${esc(p.name)}</h2>` + (ask ? `<p class="ask">${esc(ask)}</p>` : '');
-  const refs = ((typeof PAGE_INDEX === 'object' ? PAGE_INDEX[p.id] : null) || {}).refs || [];
+  const idx = (typeof PAGE_INDEX === 'object' && PAGE_INDEX) || {};
+  const rec = idx[p.id] || (p.alias ? idx[p.alias] : null) || {};
+  const refs = rec.refs || [];
   if (refs.length) {
     const row = document.createElement('div');
     row.className = 'rel';
@@ -677,7 +865,8 @@ function renderRail(p) {
   const rail = document.getElementById('rail');
   if (!rail) return;
   rail.innerHTML = '';
-  const rec = PIDX[p.id] || { tools: [], cards: [] };
+  // 任务视图页（net-status / lan）本体不在 page-index.js 里 —— 能力索引从 alias 兜到原页。
+  const rec = PIDX[p.id] || PIDX[p.alias] || { tools: [], cards: [] };
 
   const sec1 = document.createElement('div');
   sec1.className = 'railsec';
@@ -750,7 +939,7 @@ const FIND_KEY = (/Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAg
 function findItems() {
   const items = [];
   for (const p of PAGES) {
-    if (p.pin) continue;
+    if (p.pin || !inMode(p)) continue;
     items.push({ kind: 'page', page: p.id, title: p.name, sub: PAGE_ASK[p.id] || p.g, g: p.g });
   }
   for (const [pid, rec] of Object.entries(PIDX)) {
@@ -1074,7 +1263,7 @@ function homeQuestions() {
   const grid = document.createElement('div');
   grid.className = 'qgrid';
   for (const g of GROUPS) {
-    for (const p of PAGES.filter((x) => x.g === g)) {
+    for (const p of PAGES.filter((x) => x.g === g && !x.alias && !x.pin && inMode(x))) {
       const tile = document.createElement('div');
       tile.className = 'qtile';
       const t3 = document.createElement('h3');
@@ -9467,9 +9656,185 @@ async function renderTopo(root) {
   root.appendChild(topoCard());
 }
 
+/* ── 任务视图：局域网里有什么 = 网段扫描 + 拓扑图 ──
+ * 两个原页的 render 原样复用（卡片会依次排进同一屏）—— 不另抄一份逻辑，
+ * 抄了就会「界面说没做、后端其实做了」那种第二事实源。 */
+async function renderLan(root) {
+  await renderScan(root);
+  await renderTopo(root);
+}
+
+/* ── 第一次用：三步上手 ──
+ * 只做三件事：配外观（去设置）、跑一次体检、认识模式。每一颗钮都是导航或真工具入口。
+ */
+async function renderWelcome(root) {
+  root.appendChild($(`<div class="card">
+    <h2>${esc(t('三步把它配成你的样子'))}</h2>
+    <div class="row" style="flex-wrap:wrap;gap:10px">
+      <button class="btn" id="w-theme">① ${esc(t('选语言与主题'))}</button>
+      <button class="btn" id="w-check">② ${esc(t('先跑一次体检（约 20 秒，不用填东西）'))}</button>
+      <span class="hint" style="align-self:center">③ ${esc(t('用着顺手就不用再配；左边六个入口，想找什么也可以按搜索键直接打字'))}</span>
+    </div>
+    <p class="hint">${esc(t('界面上「新手 / 专家」随时可切：新手只露常用的页，专家把全部页面摊开 —— 功能一个不删，只是不糊在每个人脸上。'))}</p>
+  </div>`));
+  const c1 = root.lastElementChild;
+  c1.querySelector('#w-theme').onclick = () => goto('settings');
+  c1.querySelector('#w-check').onclick = () => goto('checkup');
+
+  root.appendChild($(`<div class="card">
+    <h2>${esc(t('四件事挑一件'))}</h2>
+    <div class="row" style="flex-wrap:wrap;gap:10px">
+      <button class="btn" data-go="net-status">${esc(t('网通不通？'))}</button>
+      <button class="btn" data-go="remote">${esc(t('连一台机器'))}</button>
+      <button class="btn" data-go="capture">${esc(t('抓个包看看'))}</button>
+      <button class="btn" data-go="trouble">${esc(t('出问题了'))}</button>
+    </div>
+  </div>`));
+  for (const b of root.lastElementChild.querySelectorAll('[data-go]')) b.onclick = () => goto(b.dataset.go);
+}
+
+/* ── 设置：外观与语言 / 连接与端口 / 批准记录 / 关于 ── */
+async function renderSettings(root) {
+  // 外观与语言
+  const c1 = $(`<div class="card">
+    <h2>${esc(t('外观与语言'))}</h2>
+    <div class="row" style="flex-wrap:wrap;gap:8px" id="th-row">
+      ${['system', 'dark', 'light'].map((v) =>
+        `<button class="btn sub" data-th="${v}">${esc(v === 'system' ? t('跟随系统') : v === 'dark' ? t('深色') : t('浅色'))}</button>`).join('')}
+    </div>
+    <p class="hint">${esc(t('深浅色立即生效；两套配色走同一份品牌令牌，界面里任何颜色都不写死。'))}</p>
+    <div class="row" style="flex-wrap:wrap;gap:8px" id="lg-row">
+      ${LANGS.map((l) => `<button class="btn sub" data-lg="${l.id}">${esc(l.name)}</button>`).join('')}
+    </div>
+    <p class="hint">${esc(t('换语言整页重跑；设备名、报文、命令回显这类原始数据不翻 —— 翻了反而认不出来。'))}</p>
+  </div>`);
+  root.appendChild(c1);
+  const paintTh = () => {
+    for (const b of c1.querySelectorAll('[data-th]')) b.classList.toggle('on', b.dataset.th === theme);
+  };
+  paintTh();
+  for (const b of c1.querySelectorAll('[data-th]')) b.onclick = () => { setTheme(b.dataset.th); paintTh(); };
+  for (const b of c1.querySelectorAll('[data-lg]')) {
+    if (b.dataset.lg === I18N.lang) b.classList.add('on');
+    b.onclick = () => setLang(b.dataset.lg);
+  }
+
+  // 连接与端口：后端地址、健康、能力表规模 —— 全部现读，不存副本。
+  const c2 = $(`<div class="card">
+    <h2>${esc(t('连接与端口'))}</h2>
+    <div class="out" id="st-conn"><span class="hint">${esc(t('正在问后端…'))}</span></div>
+  </div>`);
+  root.appendChild(c2);
+  try {
+    const r = await fetch(`${API}/ots`).then((x) => x.json());
+    c2.querySelector('#st-conn').innerHTML =
+      `<table>
+        <tr><td class="dim">${esc(t('后端地址'))}</td><td><code>${esc(API || '')}</code></td></tr>
+        <tr><td class="dim">${esc(t('规范版本'))}</td><td>${esc(r.specVersion || '—')}</td></tr>
+        <tr><td class="dim">${esc(t('一致性自检'))}</td><td>${esc(r.conformance || '—')}</td></tr>
+        <tr><td class="dim">${esc(t('工具数'))}</td><td>${TOOLS.length}</td></tr>
+      </table>`;
+  } catch (_) {
+    c2.querySelector('#st-conn').innerHTML = `<span class="hint">${esc(t('后端没连上 —— 上面这些就都答不出来。'))}</span>`;
+  }
+
+  // 批准记录：改系统的动作（后端能力表里 class=mutate 的那些）在界面执行前都要过批准框。
+  // 清单从能力表现算，不手抄 —— 加一个工具那天起屏上的话不许开始撒谎。
+  const muts = TOOLS.filter((x) => x.class === 'mutate');
+  const c3 = $(`<div class="card">
+    <h2>${esc(t('批准记录'))}</h2>
+    <p class="hint">${esc(t('下面这些动作会改系统：界面对它们只做一件事 —— 执行前弹批准框，点了才动。其余动作只读不写。'))}</p>
+    <div class="out" style="max-height:220px;overflow:auto">
+      ${muts.length ? muts.map((m) => `<div class="caprow"><code>${esc(m.name)}</code><span class="sum">${esc(m.summary || '')}</span></div>`).join('')
+        : `<span class="hint">${esc(t('后端没报出任何要批准的动作。'))}</span>`}
+    </div>
+  </div>`);
+  root.appendChild(c3);
+
+  // 关于
+  const c4 = $(`<div class="card">
+    <h2>${esc(t('关于'))}</h2>
+    <table>
+      <tr><td class="dim">${esc(t('产品'))}</td><td>${esc(t('昱弘网通 NetKit'))}</td></tr>
+      <tr><td class="dim">${esc(t('界面版本'))}</td><td>0.3.0</td></tr>
+      <tr><td class="dim">${esc(t('界面语言'))}</td><td>${esc((LANGS.find((l) => l.id === I18N.lang) || LANGS[0]).name)}</td></tr>
+      <tr><td class="dim">${esc(t('主题'))}</td><td>${esc(theme === 'system' ? t('跟随系统') : theme === 'dark' ? t('深色') : t('浅色'))}</td></tr>
+    </table>
+    <p class="hint">${esc(t('页面上每一个按钮，背后都是后端的同一个工具 —— 界面不算任何东西，也不藏任何能力。'))}</p>
+  </div>`);
+  root.appendChild(c4);
+}
+
+/* ── 等后端工具的骨架页 ──
+ * 规矩：界面不放假按钮。这些页对应的能力后端还没有工具（docs/UI改版设计.md 第五节），
+ * 骨架只说清「等什么、现在能去哪儿做」，一个会撒谎的钮都不放。
+ */
+function skelPage(root, spec) {
+  const card = $(`<div class="card">
+    <h2>${esc(spec.title)}</h2>
+    <p class="hint">${esc(spec.why)}</p>
+    <div class="out"><code>${esc(spec.tools)}</code></div>
+    <div class="row"><button class="btn primary">${esc(spec.go)}</button><span class="hint" style="align-self:center">${esc(t('现在能做的'))}</span></div>
+    <p class="hint">△ ${esc(t('这一页还没有自己的工具：界面不放假按钮，后端把工具补上（docs/UI改版设计.md 第五节）之后，这一页自己会长出来。'))}</p>
+  </div>`);
+  card.querySelector('button').onclick = () => goto(spec.to);
+  root.appendChild(card);
+}
+function renderSessions(root) {
+  skelPage(root, {
+    title: t('会话中心'),
+    why: t('正在开着的终端、文件传输、桌面窗口应该在一个地方全看见、随手能断 —— 这要等后端把会话管理做成工具。'),
+    tools: 'remote.sessions.*',
+    go: t('去看现在连着的设备'),
+    to: 'remote',
+  });
+}
+function renderBatch(root) {
+  skelPage(root, {
+    title: t('批量任务'),
+    why: t('同一批命令对一批机器各跑一遍、结果并成一摊能对账的表 —— 要等后端把批量执行做成工具。'),
+    tools: 'remote.exec.batch',
+    go: t('先对一台机器干活'),
+    to: 'remote-work',
+  });
+}
+function renderBridge(root) {
+  skelPage(root, {
+    title: t('Windows SSH 桥'),
+    why: t('Windows 机器不装 SSH 服务也能纳进来管：借一台已经连上的机器当跳板 —— 要等后端把桥接做成工具。'),
+    tools: 'remote.bridge.*',
+    go: t('先看已登记的设备'),
+    to: 'remote',
+  });
+}
+function renderDiaghist(root) {
+  skelPage(root, {
+    title: t('诊断包历史'),
+    why: t('打包过哪些诊断包、发给过谁 —— 事后能对账。这要等后端把诊断包台账做成工具；现在打包记录只活在当次操作里。'),
+    tools: 'diag.history',
+    go: t('去打一个诊断包'),
+    to: 'checkup',
+  });
+}
+function renderPlaybooks(root) {
+  skelPage(root, {
+    title: t('剧本库'),
+    why: t('剧本的独立管理页（谁写的、跑过几回）要等后端把剧本台账做成工具；现在剧本跟着「连上去干活」那台机器走。'),
+    tools: 'remote.playbook.*',
+    go: t('去跑一本剧本'),
+    to: 'remote-work',
+  });
+}
+
 // ── 起步 ──
 
 (async () => {
+  // 主题先落，别等后端：暗屋子里第一屏就是亮的才是事故。
+  applyTheme();
+  // 主题快切钮：跟随系统 → 深 → 浅 三态循环（设置页里有带预览的三选）。
+  const tb = document.getElementById('themebtn');
+  if (tb) tb.onclick = () => cycleTheme();
+  renderModeSeg();
   API = await window.netkit.apiBase();
   const c = document.getElementById('conn');
   // 这一格写的是 t() 的结果，换语言靠整页重跑过来（i18n.js 的 setLang），

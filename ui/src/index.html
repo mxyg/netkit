@@ -19,21 +19,35 @@
   <!-- 搜索钮：整副牌里唯一一处「想用什么直接打出来」的入口，所以放在顶栏正中偏左，
        不藏进菜单。文字与快捷键由 app.js 现填（要过词典）。 -->
   <button id="find" class="find" type="button"></button>
+  <!-- 新手 / 专家模式段：新手只露常用页（带一句人话说明），专家全量展开。
+       钮由 app.js 现填现挂（要按当前模式高亮，也要过词典）。 -->
+  <div class="modeseg" id="modeseg"></div>
   <span class="runstate" id="runstate"></span>
+  <!-- 主题快切钮：跟随系统 / 深 / 浅 三态循环，设置页里有带预览的完整三选。
+       同样由 app.js 现填。 -->
+  <button id="themebtn" class="themebtn" type="button"></button>
   <span class="state" id="conn" data-i18n>连接中…</span>
   <span id="lang"></span>
 </header>
 <!--
-  ★ 壳层三栏：侧栏是「全部功能一眼可见」的导航（23 页不再分两层按钮），
-    中间是内容，右边是这一页的上下文（用到哪几件事、最近问过什么）。
-    窄于 1240px 时右栏收起 —— 页头那一条「这一页回答什么」才是主理解路径，
-    它在任何宽度都在，右栏只是补充。
+  ★ 壳层三栏：侧栏是**六个一级入口**的任务树（开始 / 网络 / 设备 / 修复 / 工具 / 设置），
+    条目带一句人话说明；中间是内容，上方一条面包屑报出「你在哪个入口的哪一页」；
+    右边是这一页的上下文（用到哪几件事、最近问过什么）—— 专家模式的检查器。
+    窄于 1240px 时右栏收起。
 -->
 <div class="shell">
   <nav id="nav"></nav>
-  <main id="main"></main>
+  <div class="work">
+    <div id="crumbs"></div>
+    <main id="main"></main>
+  </div>
   <aside id="rail"></aside>
 </div>
+<!--
+  ★ 状态栏：工具数 / 当前模式 / 所在页 / 后端地址，全部由 app.js 从能力表现算 ——
+    写死一个数就是埋一颗雷（加一个工具那天起，屏上那句话开始撒谎）。
+-->
+<footer class="statusbar" id="statusbar"></footer>
 <!--
   ★★ 这里**不许**再写 <script src="app.js">：app.js 得等词典就位之后再解析。
     它顶部那三十多张判定码表存的是 t('中文') 的返回值，词典异步先到还是 app.js 先到
