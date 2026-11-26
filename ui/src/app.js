@@ -247,6 +247,24 @@ let group = (PAGES.find((p) => p.id === current) || PAGES[0]).g;
 //   代不对就是人已经换页了 —— 那一趟的活作废，不许往已经拆掉的节点里写。
 let gen = 0;
 
+/* 访问足迹：首页「接着上次干」和「快速入口」都从这儿量 —— 只记页 id 和点开次数，
+   不记内容、不记时间线；存不上（隐私模式）就当没有历史，四块照样齐全。
+   页的总量就三十来个，这一格不会长大。 */
+const SEEN_KEY = 'netkit.seen';
+let seen = (() => {
+  try {
+    const v = JSON.parse(localStorage.getItem(SEEN_KEY) || 'null');
+    return (v && Array.isArray(v.order) && v.count) ? v : { order: [], count: {} };
+  } catch (_) { return { order: [], count: {} }; }
+})();
+function noteSeen(id) {
+  const i = seen.order.indexOf(id);
+  if (i >= 0) seen.order.splice(i, 1);
+  seen.order.push(id);
+  seen.count[id] = (seen.count[id] || 0) + 1;
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch (_) { /* 存不上就算了 */ }
+}
+
 /* 组折叠状态记在本地：默认全开（新手第一次要一眼看全六个入口里都有什么）。 */
 const NAVOPEN_KEY = 'netkit.navopen';
 let navOpen = (() => {
@@ -401,6 +419,7 @@ async function show() {
   current = p.id;
   group = p.g;
   try { localStorage.setItem(PAGE_KEY, String(p.id)); } catch (_) { /* 存不上就这一趟不回页 */ }
+  noteSeen(p.id);
   main.className = GRID.has(p.id) ? 'grid' : '';
   main.innerHTML = '';
   if (p.id !== 'home') main.appendChild(pageHead(p));
@@ -1098,15 +1117,18 @@ function highlight(text, q) {
  *   只认后端给的判定码，不在界面里猜。
  */
 const RUN_CHECKS = [
-  { tool: 'net.capture.status', page: 'capture', word: t('本机抓包'), on: ['capture-running', 'capture-running-lossy'] },
-  { tool: 'net.capture.peer.status', page: 'capture', word: t('对端抓包'), on: ['capture-peer-running', 'capture-peer-stopping'] },
-  { tool: 'net.dhcp.leases', page: 'dhcp', word: t('在给设备分地址'), on: ['serving'] },
-  { tool: 'net.quality.status', page: 'quality', word: t('在盯质量'), on: ['quality-running'] },
-  { tool: 'net.throughput.status', page: 'thru', word: t('对测口开着'), on: ['thru-serving'] },
-  { tool: 'net.fileshare.status', page: 'local', word: t('文件共享开着'), on: ['share-serving'] },
-  { tool: 'net.portal.status', page: 'mobile', word: t('手机门户开着'), on: ['portal-serving'] },
+  { tool: 'net.capture.status', page: 'capture', word: t('本机抓包'), stop: 'net.capture.stop', on: ['capture-running', 'capture-running-lossy'] },
+  { tool: 'net.capture.peer.status', page: 'capture', word: t('对端抓包'), stop: 'net.capture.peer.stop', on: ['capture-peer-running', 'capture-peer-stopping'] },
+  { tool: 'net.dhcp.leases', page: 'dhcp', word: t('在给设备分地址'), stop: 'net.dhcp.stop', on: ['serving'] },
+  { tool: 'net.quality.status', page: 'quality', word: t('在盯质量'), stop: 'net.quality.stop', on: ['quality-running'] },
+  { tool: 'net.throughput.status', page: 'thru', word: t('对测口开着'), stop: 'net.throughput.stop', on: ['thru-serving'] },
+  { tool: 'net.fileshare.status', page: 'local', word: t('文件共享开着'), stop: 'net.fileshare.stop', on: ['share-serving'] },
+  { tool: 'net.portal.status', page: 'mobile', word: t('手机门户开着'), stop: 'net.portal.stop', on: ['portal-serving'] },
 ];
 let runTimer = null;
+// 最近一轮「在跑」的探针结果，任务中心和首页「接着上次干」都从这里读 ——
+// 两处不许各问一遍（七路探针每 5 秒一轮已经够勤了）。
+let runningNow = [];
 
 async function refreshRunning() {
   if (document.hidden) return;
@@ -1122,6 +1144,8 @@ async function refreshRunning() {
                      下一轮再问，这一排宁可少说一条，也不许把「问不到」画成「没在跑」。 */ }
   }));
   const host = document.getElementById('runstate');
+  runningNow = found;
+  paintTaskBadge();
   if (!host) return;
   host.innerHTML = '';
   for (const c of found) {
@@ -1140,23 +1164,150 @@ function startRunWatch() {
   runTimer = setInterval(refreshRunning, 5000);
 }
 
+/* ── 任务中心：谁在跑、跑到哪、怎么停 ──
+ *
+ * ★ 数据只来自两处，一处都不许编：
+ *   1) RUN_CHECKS 的探针判定（后端亲口说的「还在跑」，每 5 秒刷一轮）；
+ *   2) 本会话起过的批量任务（remote.task.status 现查进度）。
+ *   停的按钮只配在后端真有 stop 工具的那几项上；批量任务后端没有取消工具，
+ *   面板里就只报进度，不放假的「取消」钮。
+ *   探针有至多 5 秒的滞后 —— 面板自己写明这一点，不装实时。
+ */
+const BATCH_RUNS = [];   // 本会话起过的批量任务（后端没有列任务的工具，会话内登记是唯一诚实的来路）
+
+function paintTaskBadge() {
+  const btn = document.getElementById('taskbtn');
+  if (!btn) return;
+  const n = runningNow.length + BATCH_RUNS.filter((x) => !x.done).length;
+  btn.textContent = n ? t('任务中心（{0}）', [n]) : t('任务中心');
+}
+
+function closeTaskPanel() {
+  const old = document.getElementById('taskpanel');
+  if (old) old.remove();
+}
+
+async function buildTaskPanel(host) {
+  host.innerHTML = '';
+  const h = document.createElement('h3');
+  h.textContent = t('此刻在跑的长任务');
+  host.append(h);
+
+  if (!runningNow.length && !BATCH_RUNS.length) {
+    host.appendChild($(t('<p class="hint">{0}</p>', [t('此刻没有在跑的。抓包、DHCP、对测口这类开起来就一直在跑的事，都会出现在这里 —— 数据是后端亲口报的，每 5 秒刷一次。')])));
+    return;
+  }
+
+  // 后端在跑的：去看 / 停。停是 mutate —— 走 call() 的批准框，跟页内停是同一条路。
+  for (const c of runningNow) {
+    const row = document.createElement('div');
+    row.className = 'caprow';
+    const chip = document.createElement('span');
+    chip.className = 'runchip';
+    chip.textContent = c.word;
+    const page = PAGES.find((p) => p.id === c.page);
+    const sum = document.createElement('span');
+    sum.className = 'sum';
+    sum.textContent = page ? page.name : c.page;
+    row.append(chip, sum);
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'btn sub';
+    go.textContent = t('去看');
+    go.onclick = () => { closeTaskPanel(); goto(c.page); };
+    row.appendChild(go);
+    if (c.stop) {
+      const stop = document.createElement('button');
+      stop.type = 'button';
+      stop.className = 'btn sub';
+      stop.textContent = t('停');
+      stop.onclick = async () => {
+        stop.disabled = true;
+        const r = await call(c.stop);
+        stop.disabled = false;
+        if (!r.ok) alert(t('停不下来：{0}', [r.message || r.error || '']));
+        await refreshRunning();
+        buildTaskPanel(host);
+      };
+      row.appendChild(stop);
+    }
+    host.appendChild(row);
+  }
+
+  // 批量任务：只报进度。后端没有取消工具，这里就不放取消钮 —— 界面不编能力。
+  if (BATCH_RUNS.length) {
+    const sub = document.createElement('h3');
+    sub.textContent = t('批量任务（这一会话起过的）');
+    host.appendChild(sub);
+    for (const tsk of BATCH_RUNS) {
+      const row = document.createElement('div');
+      row.className = 'caprow';
+      const code = document.createElement('code');
+      code.textContent = tsk.id;
+      const sum = document.createElement('span');
+      sum.className = 'sum';
+      try {
+        const s = await call('remote.task.status', { task: tsk.id });
+        if (s.ok) {
+          const v = s.values || {};
+          tsk.done = !!v.done;
+          sum.textContent = `${(v.command || '').slice(0, 40)} · ${v.finished ?? 0}/${v.total ?? 0} ${t('台')} · ${v.ok ?? 0} ${t('成功')}${v.done ? '' : ' · ' + t('还在跑…')}`;
+        } else {
+          sum.textContent = t('进度问不到：') + (s.message || '');
+        }
+      } catch (_) { sum.textContent = t('进度问不到。'); }
+      row.append(code, sum);
+      const go = document.createElement('button');
+      go.type = 'button';
+      go.className = 'btn sub';
+      go.textContent = t('去看');
+      go.onclick = () => { closeTaskPanel(); goto('batch'); };
+      row.appendChild(go);
+      host.appendChild(row);
+    }
+    paintTaskBadge();
+  }
+}
+
+function toggleTaskPanel() {
+  const old = document.getElementById('taskpanel');
+  if (old) { old.remove(); return; }
+  const panel = document.createElement('div');
+  panel.id = 'taskpanel';
+  panel.className = 'taskpanel';
+  panel.innerHTML = `<p class="hint">${esc(t('结果最多滞后 5 秒 —— 以各页自己那块为准。'))}</p>`;
+  document.body.appendChild(panel);
+  buildTaskPanel(panel);
+  // 点面板外面就收起；面板自己点掉的不算。
+  setTimeout(() => {
+    const away = (e) => {
+      if (!panel.contains(e.target) && e.target !== document.getElementById('taskbtn')
+        && !document.getElementById('taskbtn').contains(e.target)) {
+        closeTaskPanel();
+        document.removeEventListener('mousedown', away);
+      }
+    };
+    document.addEventListener('mousedown', away);
+  }, 0);
+}
+
 /*
  * ── 总览：新用户的第一屏 ──
  *
- * ★★ 这一页不许自己攒清单 —— 四块内容全部是**现量出来的**：
- *   · 此刻的结论：net.checkup 给的判定码（人话用 CK_TOP，和体检页同一套词，不在这里另编一套）；
- *   · 按问题找：PAGES + PAGE_ASK，卡片名从 page-index.js 来（那份是由各 render 函数的源码量出来的）；
- *   · 能力清单：GET /tools 此刻报的那一张表，并如实标出哪一项界面里还没有入口。
- *   历史上「界面说后端没做、其实后端做了」就是手抄清单抄出来的；这里一个数都不抄，
- *   所有「多少页 / 多少卡 / 多少项」都由这几个数组当场算。
+ * 按设计文档第三节瘦身：不再铺导航的复制品，只留四块 ——
+ *   1) 这台机器的体检结论（homeHero，一键重测）；
+ *   2) 接着上次干（还在跑的 + 最近用过的页 + 最近问过的，全部现量）；
+ *   3) 所有设备一览（本机 + remote.device.list 现拉的远程设备）；
+ *   4) 快速入口（按点开次数排的前六页，次数不够按导航顺序补）。
+ * ★ 四块没有一块自己攒清单 —— 结论来自 net.checkup，在跑来自 RUN_CHECKS 探针，
+ *   设备来自后端名单，次数来自本机访问足迹。任何一样都另有一处事实源，
+ *   这里只做拼装，不设第二本账。
  */
 async function renderHome(root) {
   root.appendChild(homeHero());
-  root.appendChild(homeSteps());
-  root.appendChild(homeQuestions());
-  root.appendChild(homeCapabilities());
-  const h = homeHistory();
-  if (h) root.appendChild(h);
+  root.appendChild(await homeResume());
+  root.appendChild(homeQuick());
+  root.appendChild(await homeDevices());
 }
 
 /** 第一块：这台机器此刻怎么样。进来就自动问一遍 —— 新用户不知道该点哪儿，先给他一个结论。 */
@@ -1219,173 +1370,190 @@ function homeHero() {
   return card;
 }
 
-const CARD_COUNT = () => Object.values(PIDX).reduce((n, rec) => n + ((rec.cards || []).length), 0);
-const PAGE_COUNT = () => PAGES.filter((p) => !p.pin).length;
 
-function homeSteps() {
-  const card = document.createElement('div');
-  card.className = 'card';
-  const items = [
-    [t('先说症状，别先说工具'),
-      t('「网页打不开」「摄像头没画面」这种话，「按症状排查」那一页已经替工程师排好了顺序 —— 从那条路进去，别自己凑工具。')],
-    [t('手里有一个地址或 MAC，就点它'),
-      t('扫出来的表、流表、设备列表里那些数是入口：ping 它、探它的端口、只抓它的包、查它的来路，点一下直接摆出来，不用复制粘贴换页。')],
-    [t('叫不出名字就打一个字'),
-      t('顶栏那颗搜索（{0}）把 {1} 个页面、{2} 张卡片和后端此刻报出的能力一起搜，结果上写明每一项在哪个页的哪张卡。',
-        [FIND_KEY, PAGE_COUNT(), CARD_COUNT()])],
-  ];
-  const ol = document.createElement('ol');
-  ol.className = 'steps';
-  for (const [b, s] of items) {
-    const li = document.createElement('li');
-    const strong = document.createElement('b');
-    strong.textContent = b;
-    const span = document.createElement('span');
-    span.textContent = s;
-    li.append(strong, span);
-    ol.appendChild(li);
-  }
-  const h = document.createElement('h2');
-  h.textContent = t('这个软件怎么用：三步');
-  card.append(h, ol);
-  return card;
-}
-
-/** 按问题找：把 8 个组当成 8 类问题摊开，每张卡一个直达落点。 */
-function homeQuestions() {
+/** 接着上次干：还在跑的 + 最近用过的页 + 最近问过的。
+ *  三样全现量：在跑的复用顶栏七路探针的最近一轮（不多问一遍），
+ *  足迹只记页 id 和次数（存不上就当没有历史），
+ *  问过的用 call() 的 HIST —— 任何一样都不在首页另记一份账。 */
+async function homeResume() {
   const card = document.createElement('div');
   card.className = 'card';
   const h = document.createElement('h2');
-  h.textContent = t('按你现在想问的那件事找');
-  const hint = document.createElement('p');
-  hint.className = 'hint';
-  hint.textContent = t('左边一栏是全的（{0} 个页面），这里按「问题的归类」重排一遍 —— 点下面的卡片名直接落到那张卡。', [PAGE_COUNT()]);
-  const grid = document.createElement('div');
-  grid.className = 'qgrid';
-  for (const g of GROUPS) {
-    for (const p of PAGES.filter((x) => x.g === g && !x.alias && !x.pin && inMode(x))) {
-      const tile = document.createElement('div');
-      tile.className = 'qtile';
-      const t3 = document.createElement('h3');
-      t3.textContent = p.name;
-      const ask = document.createElement('p');
-      ask.className = 'ask';
-      ask.textContent = PAGE_ASK[p.id] || '';
-      const ul = document.createElement('ul');
-      const cards = (PIDX[p.id] || {}).cards || [];
-      for (const c of cards.slice(0, 4)) {
-        const li = document.createElement('li');
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.textContent = t(c.t);
-        b.onclick = () => { if (p.id === current) focusCard(cardEl(t(c.t)), c.t); else goto(p.id, { card: c.t }); };
-        li.appendChild(b);
-        ul.appendChild(li);
-      }
-      if (cards.length > 4) {
-        const li = document.createElement('li');
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.textContent = t('还有 {0} 张', [cards.length - 4]);
-        b.onclick = () => goto(p.id);
-        li.appendChild(b);
-        ul.appendChild(li);
-      }
-      const grp = document.createElement('div');
-      grp.className = 'railh';
-      grp.textContent = g;
-      tile.append(grp, t3, ask, ul);
-      grid.appendChild(tile);
+  h.textContent = t('接着上次干');
+  card.appendChild(h);
+
+  const live = document.createElement('div');
+  live.className = 'row';
+  live.style.cssText = 'flex-wrap:wrap;gap:8px;margin-bottom:10px';
+  if (runningNow.length) {
+    for (const c of runningNow) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'runchip';
+      b.textContent = c.word;
+      b.title = t('这一项正在跑，点过去看');
+      b.onclick = () => goto(c.page);
+      live.appendChild(b);
     }
+  } else {
+    const s = document.createElement('span');
+    s.className = 'hint';
+    s.textContent = t('此刻没有在跑的 —— 抓包、DHCP、共享这类开起来就一直在跑的事，会出现在这儿。');
+    live.appendChild(s);
   }
-  card.append(h, hint, grid);
-  return card;
-}
+  card.appendChild(live);
 
-/** 全部能力：后端此刻报的那一张表。★ 没有入口的那几项如实标出来，不藏。 */
-function homeCapabilities() {
-  const card = document.createElement('div');
-  card.className = 'card';
-  const h = document.createElement('h2');
-  h.textContent = t('这台机器能问的全部事情');
-  const hostCount = TOOLS.filter((x) => HOST[x.name]).length;
-  const hint = document.createElement('p');
-  hint.className = 'hint';
-  hint.textContent = TOOLS.length
-    ? t('后端此刻报出 {0} 项，界面里 {1} 项有入口 —— 点一行跳到用它的那张卡。', [TOOLS.length, hostCount])
-    : t('后端没报出能力表（{0} 打不通 /tools）—— 这里宁可空着，也不替它编一份。', [FIND_KEY]);
-  card.append(h, hint);
-
-  const order = new Map(PAGES.map((p, i) => [p.id, i]));
-  const byPage = new Map();
-  for (const tool of TOOLS) {
-    const h2 = HOST[tool.name];
-    const key = h2 ? h2.page : '';
-    if (!byPage.has(key)) byPage.set(key, []);
-    byPage.get(key).push(tool);
+  const recents = seen.order.filter((id) => id !== 'home' && PAGES.some((p) => p.id === id)).slice(-6).reverse();
+  const lbl = document.createElement('div');
+  lbl.className = 'railh';
+  lbl.textContent = t('最近用过的页');
+  card.appendChild(lbl);
+  if (recents.length) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.cssText = 'flex-wrap:wrap;gap:8px';
+    for (const id of recents) {
+      const p = PAGES.find((x) => x.id === id);
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn';
+      b.textContent = p.name;
+      b.title = PAGE_ASK[id] || '';
+      b.onclick = () => goto(id);
+      row.appendChild(b);
+    }
+    card.appendChild(row);
+  } else {
+    const s = document.createElement('p');
+    s.className = 'hint';
+    s.textContent = t('还没有足迹 —— 从下面挑一件事开始。');
+    card.appendChild(s);
   }
-  const keys = [...byPage.keys()].sort((a, b) => (order.get(a) ?? 99) - (order.get(b) ?? 99));
-  for (const key of keys) {
-    const page = PAGES.find((p) => p.id === key);
-    const sec = document.createElement('div');
-    const lbl = document.createElement('div');
-    lbl.className = 'railh';
-    lbl.textContent = page ? page.name : t('界面里还没有入口的');
-    sec.appendChild(lbl);
+
+  if (HIST.length) {
+    const lbl2 = document.createElement('div');
+    lbl2.className = 'railh';
+    lbl2.style.marginTop = '10px';
+    lbl2.textContent = t('最近问过的（只留工具名、判定码和钟点 —— 填过的地址、口令一概不存）');
+    card.appendChild(lbl2);
     const list = document.createElement('div');
     list.className = 'caplist';
-    for (const tool of byPage.get(key).sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const rec of HIST.slice(0, 5)) {
+      const page = PAGES.find((p) => p.id === rec.page);
       const row = document.createElement('button');
       row.type = 'button';
-      row.className = 'caprow' + (HOST[tool.name] ? '' : ' orphan') + (tool.class === 'mutate' ? ' mut' : '');
-      // ★ 后端那句 summary 是给 AI 看的说明书，也是中文写死的 —— 进 title，不进正文。
-      row.title = tool.summary || '';
+      row.className = 'caprow';
+      row.onclick = () => goto(rec.page);
       const code = document.createElement('code');
-      code.textContent = tool.name;
+      code.textContent = rec.tool;
       const sum = document.createElement('span');
       sum.className = 'sum';
-      const host = HOST[tool.name];
-      sum.textContent = host
-        ? [t('用在'), page ? page.name : '', t('的'), (host.card && t(host.card)) || ''].filter(Boolean).join(' ')
-          + (tool.class === 'mutate' ? ' ' + t('（会改动，要点确认）') : '')
-        : t('后端有这一项，界面里还没给它入口');
+      sum.textContent = [stampOf(rec.at), page ? page.name : rec.page, rec.verdict].filter(Boolean).join(' · ');
       row.append(code, sum);
-      if (host) row.onclick = () => { if (host.page === current) focusCard(cardEl(t(host.card)), host.card); else goto(host.page, { card: host.card }); };
       list.appendChild(row);
     }
-    sec.appendChild(list);
-    card.appendChild(sec);
+    card.appendChild(list);
   }
   return card;
 }
 
-/** 今天问过什么（只有工具名、判定码和时间 —— 参数里有凭据，一份都不存）。 */
-function homeHistory() {
-  if (!HIST.length) return null;
+/** 快速入口：按点开次数排的前六页。次数不够（新机器）时剩下的名额按导航顺序补齐 ——
+ *  补的是真页，不是编出来的「热门」；想找别的用顶栏搜索。 */
+function homeQuick() {
   const card = document.createElement('div');
   card.className = 'card';
   const h = document.createElement('h2');
-  h.textContent = t('这台机器最近问过的那些（这一台电脑上）');
+  h.textContent = t('快速入口');
   const hint = document.createElement('p');
   hint.className = 'hint';
-  hint.textContent = t('只留工具名、判定码和钟点 —— 填过的地址、口令一概不存。点一行回到那一页。');
+  hint.textContent = t('按你点开的次数排；次数还不够时先按导航的顺序补齐 —— 想找别的用搜索。');
+  card.append(h, hint);
+  const pages = PAGES.filter((p) => !p.pin && p.id !== 'home' && !p.alias && inMode(p));
+  pages.sort((a, b) => (seen.count[b.id] || 0) - (seen.count[a.id] || 0));
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.style.cssText = 'flex-wrap:wrap;gap:8px';
+  for (const p of pages.slice(0, 6)) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn';
+    const n = seen.count[p.id] || 0;
+    b.innerHTML = n ? `${esc(p.name)} <span class="dim">${n}</span>` : esc(p.name);
+    b.title = PAGE_ASK[p.id] || '';
+    b.onclick = () => goto(p.id);
+    row.appendChild(b);
+  }
+  card.appendChild(row);
+  return card;
+}
+
+/** 所有设备一览：本机一行 + 已登记的远程设备（remote.device.list 现拉）。
+ *  本机不另起名字 —— 正在用的就是它；名单拉不到就照实说，不装「没有设备」。 */
+async function homeDevices() {
+  const card = document.createElement('div');
+  card.className = 'card';
+  const h = document.createElement('h2');
+  h.textContent = t('所有设备一览');
+  card.appendChild(h);
   const list = document.createElement('div');
   list.className = 'caplist';
-  for (const rec of HIST.slice(0, 10)) {
-    const page = PAGES.find((p) => p.id === rec.page);
+  const me = document.createElement('button');
+  me.type = 'button';
+  me.className = 'caprow';
+  me.onclick = () => goto('net-status');
+  const meCode = document.createElement('code');
+  meCode.textContent = t('本机');
+  const meSum = document.createElement('span');
+  meSum.className = 'sum';
+  meSum.textContent = t('正在用的这一台 —— 网络状态、体检、抓包都问它');
+  me.append(meCode, meSum);
+  list.appendChild(me);
+  card.appendChild(list);
+
+  const r = await call('remote.device.list');
+  if (!r.ok) {
+    const s = document.createElement('p');
+    s.className = 'hint';
+    s.textContent = t('远程设备名单拉不到：') + (r.message || '');
+    card.appendChild(s);
+    return card;
+  }
+  const devices = r.values.devices || [];
+  if (!devices.length) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn';
+    b.textContent = t('去登记第一台设备');
+    b.onclick = () => goto('remote');
+    card.appendChild(b);
+    return card;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'caplist';
+  for (const d of devices) {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'caprow';
-    row.onclick = () => goto(rec.page);
+    row.onclick = () => { rememberSel(d.id); goto('remote-work'); };
     const code = document.createElement('code');
-    code.textContent = rec.tool;
+    code.textContent = d.name || d.id;
     const sum = document.createElement('span');
     sum.className = 'sum';
-    sum.textContent = [stampOf(rec.at), page ? page.name : rec.page, rec.verdict].filter(Boolean).join(' · ');
+    sum.textContent = [OS_LABEL[d.os] || t('系统未知'), (d.tags || []).join('、') || t('无标签')].filter(Boolean).join(' · ');
     row.append(code, sum);
-    list.appendChild(row);
+    grid.appendChild(row);
   }
-  card.append(h, hint, list);
+  card.appendChild(grid);
+  const foot = document.createElement('div');
+  foot.className = 'row';
+  foot.style.cssText = 'margin-top:10px';
+  const more = document.createElement('button');
+  more.type = 'button';
+  more.className = 'btn sub';
+  more.textContent = t('到设备中心管理（加、删、标签）');
+  more.onclick = () => goto('remote');
+  foot.appendChild(more);
+  card.appendChild(foot);
   return card;
 }
 
@@ -10219,6 +10387,9 @@ function renderBatch(root) {
       const rr = await call('remote.task.run', { devices: targets, command: cmd, timeoutSec: Number(card.querySelector('#wait').value) });
       if (!rr.ok) { prog.innerHTML = `<div class="empty">${esc(t('起不了：') + rr.message)}</div>`; return; }
       prog.innerHTML = t('<p class="hint">{0}</p>', [rr.note]);
+      // 登记进任务中心：后端没有「列任务」的工具，会话内登记是唯一诚实的来路。
+      BATCH_RUNS.push({ id: rr.values.task, at: Date.now() });
+      paintTaskBadge();
       poll(rr.values.task);
     };
 
@@ -10309,6 +10480,10 @@ function renderPlaybooks(root) {
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openFind(); }
   });
+
+  // 任务中心钮：文字在这儿现填（要过词典）。
+  const tk = document.getElementById('taskbtn');
+  if (tk) tk.onclick = () => toggleTaskPanel();
 
   // ★ 能力表先到手，第一屏才敢报数、搜索才搜得到工具名 —— 这一步失败也只是清单空着，
   //   界面照样起（总览那一块写明是「后端没报出能力表」，不拿空表冒充「这台没功能」）。

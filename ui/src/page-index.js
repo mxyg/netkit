@@ -6,14 +6,185 @@
 const PAGE_INDEX = {
  "home": {
   "tools": [
-   "net.checkup"
+   "net.checkup",
+   "netkit.sel",
+   "remote.device.list"
   ],
   "refs": [
+   "net-status",
    "quality",
-   "speed",
-   "trouble"
+   "remote",
+   "speed"
   ],
   "cards": []
+ },
+ "welcome": {
+  "tools": [],
+  "refs": [],
+  "cards": []
+ },
+ "net-status": {
+  "tools": [
+   "net.ping",
+   "net.ports.scan",
+   "net.tcp.probe",
+   "net.udp.probe"
+  ],
+  "refs": [
+   "connect",
+   "name",
+   "nic",
+   "path"
+  ],
+  "cards": [
+   {
+    "t": "ping 一个地址",
+    "tools": [
+     "net.ping",
+     "net.tcp.probe"
+    ]
+   },
+   {
+    "t": "扫一片端口",
+    "tools": [
+     "net.ports.scan"
+    ]
+   },
+   {
+    "t": "探 UDP 端口",
+    "tools": [
+     "net.udp.probe"
+    ]
+   }
+  ]
+ },
+ "capture": {
+  "tools": [
+   "net.capture.flow",
+   "net.capture.flows",
+   "net.capture.open",
+   "net.capture.peer.probe",
+   "net.capture.peer.start",
+   "net.capture.peer.status",
+   "net.capture.peer.stop",
+   "net.capture.start",
+   "net.capture.status",
+   "net.capture.stop",
+   "net.interfaces",
+   "remote.device.list"
+  ],
+  "refs": [
+   "quality"
+  ],
+  "cards": [
+   {
+    "t": "开一路抓包",
+    "tools": [
+     "net.capture.start",
+     "net.capture.status",
+     "net.capture.stop",
+     "net.interfaces"
+    ]
+   },
+   {
+    "t": "这一张流表",
+    "tools": [
+     "net.capture.flows"
+    ]
+   },
+   {
+    "t": "某一条流的明细",
+    "tools": [
+     "net.capture.flow"
+    ]
+   },
+   {
+    "t": "打开一份现成的抓包文件",
+    "tools": [
+     "net.capture.open"
+    ]
+   },
+   {
+    "t": "在对端那台机器上开一路抓包",
+    "tools": [
+     "net.capture.peer.probe",
+     "net.capture.peer.start",
+     "net.capture.peer.status",
+     "net.capture.peer.stop",
+     "remote.device.list"
+    ]
+   }
+  ]
+ },
+ "lan": {
+  "tools": [
+   "net.device.identify",
+   "net.neighbors",
+   "net.ping",
+   "net.subnet.scan",
+   "net.topology.build"
+  ],
+  "refs": [
+   "connect",
+   "device",
+   "nic"
+  ],
+  "cards": [
+   {
+    "t": "扫一个网段",
+    "tools": [
+     "net.subnet.scan"
+    ]
+   },
+   {
+    "t": "本机邻居表",
+    "tools": [
+     "net.neighbors"
+    ]
+   },
+   {
+    "t": "这台在网里的形状",
+    "tools": [
+     "net.device.identify",
+     "net.ping",
+     "net.topology.build"
+    ]
+   }
+  ]
+ },
+ "connect": {
+  "tools": [
+   "net.ping",
+   "net.ports.scan",
+   "net.tcp.probe",
+   "net.udp.probe"
+  ],
+  "refs": [
+   "name",
+   "nic",
+   "path"
+  ],
+  "cards": [
+   {
+    "t": "ping 一个地址",
+    "tools": [
+     "net.ping",
+     "net.tcp.probe"
+    ]
+   },
+   {
+    "t": "扫一片端口",
+    "tools": [
+     "net.ports.scan"
+    ]
+   },
+   {
+    "t": "探 UDP 端口",
+    "tools": [
+     "net.udp.probe"
+    ]
+   }
+  ]
  },
  "nic": {
   "tools": [
@@ -55,7 +226,9 @@ const PAGE_INDEX = {
    "net.dhcp.stop",
    "net.interfaces"
   ],
-  "refs": [],
+  "refs": [
+   "settings"
+  ],
   "cards": [
    {
     "t": "把这台电脑变成 DHCP 服务器",
@@ -107,40 +280,6 @@ const PAGE_INDEX = {
    }
   ]
  },
- "connect": {
-  "tools": [
-   "net.ping",
-   "net.ports.scan",
-   "net.tcp.probe",
-   "net.udp.probe"
-  ],
-  "refs": [
-   "name",
-   "nic",
-   "path"
-  ],
-  "cards": [
-   {
-    "t": "ping 一个地址",
-    "tools": [
-     "net.ping",
-     "net.tcp.probe"
-    ]
-   },
-   {
-    "t": "扫一片端口",
-    "tools": [
-     "net.ports.scan"
-    ]
-   },
-   {
-    "t": "探 UDP 端口",
-    "tools": [
-     "net.udp.probe"
-    ]
-   }
-  ]
- },
  "path": {
   "tools": [
    "net.mtr",
@@ -152,7 +291,8 @@ const PAGE_INDEX = {
    "connect",
    "name",
    "nic",
-   "service"
+   "service",
+   "settings"
   ],
   "cards": [
    {
@@ -318,108 +458,6 @@ const PAGE_INDEX = {
    }
   ]
  },
- "scan": {
-  "tools": [
-   "net.neighbors",
-   "net.subnet.scan"
-  ],
-  "refs": [
-   "connect",
-   "device"
-  ],
-  "cards": [
-   {
-    "t": "扫一个网段",
-    "tools": [
-     "net.subnet.scan"
-    ]
-   },
-   {
-    "t": "本机邻居表",
-    "tools": [
-     "net.neighbors"
-    ]
-   }
-  ]
- },
- "device": {
-  "tools": [
-   "net.device.identify",
-   "net.discover",
-   "net.wol"
-  ],
-  "refs": [
-   "connect",
-   "nic",
-   "scan"
-  ],
-  "cards": [
-   {
-    "t": "问一遍：这些地址是哪台设备",
-    "tools": [
-     "net.device.identify"
-    ]
-   },
-   {
-    "t": "听谁在应答（找没配网的设备）",
-    "tools": [
-     "net.discover"
-    ]
-   },
-   {
-    "t": "Wake-on-LAN 唤醒",
-    "tools": [
-     "net.wol"
-    ]
-   }
-  ]
- },
- "stream": {
-  "tools": [
-   "media.gb28181.probe",
-   "media.gb28181.register",
-   "media.hls.probe",
-   "media.onvif.info",
-   "media.rtmp.probe",
-   "media.rtsp.probe"
-  ],
-  "refs": [
-   "connect"
-  ],
-  "cards": [
-   {
-    "t": "问一台 ONVIF 设备",
-    "tools": [
-     "media.onvif.info"
-    ]
-   },
-   {
-    "t": "取流探测",
-    "tools": [
-     "media.rtsp.probe"
-    ]
-   },
-   {
-    "t": "拉一路 HLS（m3u8）",
-    "tools": [
-     "media.hls.probe"
-    ]
-   },
-   {
-    "t": "问一路 RTMP 推流",
-    "tools": [
-     "media.rtmp.probe"
-    ]
-   },
-   {
-    "t": "问一路国标（GB28181）信令",
-    "tools": [
-     "media.gb28181.probe",
-     "media.gb28181.register"
-    ]
-   }
-  ]
- },
  "switch": {
   "tools": [
    "net.snmp.lldp",
@@ -470,6 +508,76 @@ const PAGE_INDEX = {
    }
   ]
  },
+ "stream": {
+  "tools": [
+   "media.gb28181.probe",
+   "media.gb28181.register",
+   "media.hls.probe",
+   "media.onvif.info",
+   "media.rtmp.probe",
+   "media.rtsp.probe"
+  ],
+  "refs": [
+   "connect"
+  ],
+  "cards": [
+   {
+    "t": "问一台 ONVIF 设备",
+    "tools": [
+     "media.onvif.info"
+    ]
+   },
+   {
+    "t": "取流探测",
+    "tools": [
+     "media.rtsp.probe"
+    ]
+   },
+   {
+    "t": "拉一路 HLS（m3u8）",
+    "tools": [
+     "media.hls.probe"
+    ]
+   },
+   {
+    "t": "问一路 RTMP 推流",
+    "tools": [
+     "media.rtmp.probe"
+    ]
+   },
+   {
+    "t": "问一路国标（GB28181）信令",
+    "tools": [
+     "media.gb28181.probe",
+     "media.gb28181.register"
+    ]
+   }
+  ]
+ },
+ "scan": {
+  "tools": [
+   "net.neighbors",
+   "net.subnet.scan"
+  ],
+  "refs": [
+   "connect",
+   "device"
+  ],
+  "cards": [
+   {
+    "t": "扫一个网段",
+    "tools": [
+     "net.subnet.scan"
+    ]
+   },
+   {
+    "t": "本机邻居表",
+    "tools": [
+     "net.neighbors"
+    ]
+   }
+  ]
+ },
  "topo": {
   "tools": [
    "net.device.identify",
@@ -490,114 +598,45 @@ const PAGE_INDEX = {
    }
   ]
  },
- "checkup": {
+ "device": {
   "tools": [
-   "net.checkup",
-   "net.diag.bundle"
-  ],
-  "refs": [
-   "name"
-  ],
-  "cards": [
-   {
-    "t": "一键体检",
-    "tools": [
-     "net.checkup"
-    ]
-   },
-   {
-    "t": "导出诊断包",
-    "tools": [
-     "net.diag.bundle"
-    ]
-   }
-  ]
- },
- "trouble": {
-  "tools": [
-   "net.troubleshoot"
+   "net.device.identify",
+   "net.discover",
+   "net.wol"
   ],
   "refs": [
    "connect",
-   "dhcp",
-   "name",
    "nic",
-   "service",
-   "stream"
+   "scan"
   ],
   "cards": [
    {
-    "t": "按症状排查",
+    "t": "问一遍：这些地址是哪台设备",
     "tools": [
-     "net.troubleshoot"
-    ]
-   }
-  ]
- },
- "capture": {
-  "tools": [
-   "net.capture.flow",
-   "net.capture.flows",
-   "net.capture.open",
-   "net.capture.peer.probe",
-   "net.capture.peer.start",
-   "net.capture.peer.status",
-   "net.capture.peer.stop",
-   "net.capture.start",
-   "net.capture.status",
-   "net.capture.stop",
-   "net.interfaces",
-   "remote.device.list"
-  ],
-  "refs": [
-   "quality",
-   "remote"
-  ],
-  "cards": [
-   {
-    "t": "开一路抓包",
-    "tools": [
-     "net.capture.start",
-     "net.capture.status",
-     "net.capture.stop",
-     "net.interfaces"
+     "net.device.identify"
     ]
    },
    {
-    "t": "这一张流表",
+    "t": "听谁在应答（找没配网的设备）",
     "tools": [
-     "net.capture.flows"
+     "net.discover"
     ]
    },
    {
-    "t": "某一条流的明细",
+    "t": "Wake-on-LAN 唤醒",
     "tools": [
-     "net.capture.flow"
-    ]
-   },
-   {
-    "t": "打开一份现成的抓包文件",
-    "tools": [
-     "net.capture.open"
-    ]
-   },
-   {
-    "t": "在对端那台机器上开一路抓包",
-    "tools": [
-     "net.capture.peer.probe",
-     "net.capture.peer.start",
-     "net.capture.peer.status",
-     "net.capture.peer.stop",
-     "remote.device.list"
+     "net.wol"
     ]
    }
   ]
  },
  "remote": {
   "tools": [
+   "netkit.sel",
    "remote.audit.tail",
    "remote.config.set",
    "remote.device.add",
+   "remote.device.group",
    "remote.device.list",
    "remote.device.probe",
    "remote.device.remove",
@@ -605,7 +644,9 @@ const PAGE_INDEX = {
    "remote.winssh.status",
    "remote.winssh.stop"
   ],
-  "refs": [],
+  "refs": [
+   "remote-work"
+  ],
   "cards": [
    {
     "t": "网线那头开 SSH",
@@ -624,6 +665,7 @@ const PAGE_INDEX = {
    {
     "t": "登记的设备",
     "tools": [
+     "remote.device.group",
      "remote.device.probe",
      "remote.device.remove"
     ]
@@ -634,32 +676,37 @@ const PAGE_INDEX = {
      "remote.device.add",
      "remote.device.probe"
     ]
-   },
-   {
-    "t": "审计日志",
-    "tools": [
-     "remote.audit.tail"
-    ]
    }
   ]
  },
  "remote-work": {
   "tools": [
+   "netkit.sel",
+   "netkit.tab",
+   "remote.audit.tail",
+   "remote.desk.clipboard",
+   "remote.desk.clipboard.set",
    "remote.desk.close",
-   "remote.desk.frame",
-   "remote.desk.input",
-   "remote.desk.open",
+   "remote.desk.options",
    "remote.device.forget-hostkey",
    "remote.device.list",
    "remote.exec",
+   "remote.file.list",
+   "remote.file.mkdir",
    "remote.file.pull",
    "remote.file.push",
+   "remote.file.remove",
+   "remote.file.rename",
    "remote.msg.send",
    "remote.playbook.delete",
    "remote.playbook.list",
    "remote.playbook.run",
    "remote.playbook.save",
-   "remote.sessions"
+   "remote.sessions",
+   "remote.shell.close",
+   "remote.shell.open",
+   "remote.shell.read",
+   "remote.shell.write"
   ],
   "refs": [
    "remote"
@@ -702,6 +749,87 @@ const PAGE_INDEX = {
    }
   ]
  },
+ "sessions": {
+  "tools": [
+   "netkit.sel",
+   "remote.audit.tail",
+   "remote.shell.close",
+   "remote.shell.read"
+  ],
+  "refs": [
+   "remote-work"
+  ],
+  "cards": []
+ },
+ "batch": {
+  "tools": [
+   "remote.device.list",
+   "remote.task.run",
+   "remote.task.status"
+  ],
+  "refs": [
+   "remote"
+  ],
+  "cards": []
+ },
+ "bridge": {
+  "tools": [],
+  "refs": [],
+  "cards": []
+ },
+ "trouble": {
+  "tools": [
+   "net.troubleshoot"
+  ],
+  "refs": [
+   "connect",
+   "dhcp",
+   "name",
+   "nic",
+   "service",
+   "settings",
+   "stream"
+  ],
+  "cards": [
+   {
+    "t": "按症状排查",
+    "tools": [
+     "net.troubleshoot"
+    ]
+   }
+  ]
+ },
+ "checkup": {
+  "tools": [
+   "net.checkup",
+   "net.diag.bundle"
+  ],
+  "refs": [
+   "name",
+   "settings"
+  ],
+  "cards": [
+   {
+    "t": "一键体检",
+    "tools": [
+     "net.checkup"
+    ]
+   },
+   {
+    "t": "导出诊断包",
+    "tools": [
+     "net.diag.bundle"
+    ]
+   }
+  ]
+ },
+ "diaghist": {
+  "tools": [
+   "diag.history"
+  ],
+  "refs": [],
+  "cards": []
+ },
  "tools": {
   "tools": [
    "net.codec.convert",
@@ -710,7 +838,8 @@ const PAGE_INDEX = {
    "net.subnet.calc"
   ],
   "refs": [
-   "name"
+   "name",
+   "settings"
   ],
   "cards": [
    {
@@ -738,5 +867,15 @@ const PAGE_INDEX = {
     ]
    }
   ]
+ },
+ "playbooks": {
+  "tools": [],
+  "refs": [],
+  "cards": []
+ },
+ "settings": {
+  "tools": [],
+  "refs": [],
+  "cards": []
  }
 };

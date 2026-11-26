@@ -224,6 +224,30 @@ header .runstate:empty { display: none; }
 @keyframes live { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
 @media (prefers-reduced-motion: reduce) { .runchip::before { animation: none } }
 
+/* 任务中心钮：常驻入口（没有东西在跑也在这儿 —— 「去看谁在跑」这个动作本身
+   不该因为此刻空闲而消失）。有在跑的由 app.js 在文字里带计数。 */
+header .taskbtn {
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--line); border-radius: 6px;
+  font: inherit; font-size: 12.5px; padding: 2px 9px; cursor: pointer; flex: none;
+  white-space: nowrap;
+}
+header .taskbtn:hover { border-color: var(--gold-dim); color: var(--text); }
+
+/* 任务中心面板：贴着顶栏弹下来的小账本。宽窄自己长，行长不超屏。 */
+.taskpanel {
+  position: fixed; top: 42px; right: 12px; z-index: 60;
+  min-width: 340px; max-width: min(520px, calc(100vw - 24px));
+  max-height: min(60vh, 480px); overflow: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px; box-shadow: 0 8px 28px rgba(0, 0, 0, .35);
+}
+.taskpanel h3 { margin: 4px 0 8px; font-size: 13px; }
+.taskpanel .caprow { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
+.taskpanel .caprow .runchip { flex: none; }
+.taskpanel .caprow .sum { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.taskpanel .caprow .btn { flex: none; padding: 1px 8px; font-size: 12px; }
+
 /* 语言钮：不常用的功能不许占默认版面 —— 挨着状态那格，用现成的面板色与描边，
  * 不自带颜色（文件头那条规矩：颜色是品牌资产，这里一律 var()）。 */
 header #lang { display: flex; align-items: center; }
