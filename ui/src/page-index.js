@@ -6,15 +6,20 @@
 const PAGE_INDEX = {
  "home": {
   "tools": [
+   "net.bandwidth.top",
    "net.checkup",
+   "net.interfaces",
    "netkit.sel",
-   "remote.device.list"
+   "remote.audit.tail",
+   "remote.device.list",
+   "remote.task.status"
   ],
   "refs": [
-   "net-status",
+   "files",
+   "playbook",
    "quality",
-   "remote",
-   "speed"
+   "speed",
+   "term"
   ],
   "cards": []
  },
@@ -74,6 +79,7 @@ const PAGE_INDEX = {
    "remote.device.list"
   ],
   "refs": [
+   "files",
    "quality"
   ],
   "cards": [
@@ -262,7 +268,9 @@ const PAGE_INDEX = {
    "net.fileshare.stop",
    "net.port.process"
   ],
-  "refs": [],
+  "refs": [
+   "files"
+  ],
   "cards": [
    {
     "t": "这个端口被谁占了",
@@ -289,6 +297,7 @@ const PAGE_INDEX = {
   ],
   "refs": [
    "connect",
+   "files",
    "name",
    "nic",
    "service",
@@ -402,7 +411,8 @@ const PAGE_INDEX = {
    "net.speed.test"
   ],
   "refs": [
-   "connect"
+   "connect",
+   "files"
   ],
   "cards": [
    {
@@ -420,7 +430,9 @@ const PAGE_INDEX = {
    "net.quality.stop",
    "net.quality.watch"
   ],
-  "refs": [],
+  "refs": [
+   "files"
+  ],
   "cards": [
    {
     "t": "盯一段时间",
@@ -443,6 +455,7 @@ const PAGE_INDEX = {
    "net.bandwidth.top"
   ],
   "refs": [
+   "files",
    "local",
    "nic",
    "quality",
@@ -467,7 +480,8 @@ const PAGE_INDEX = {
    "net.snmp.probe"
   ],
   "refs": [
-   "connect"
+   "connect",
+   "term"
   ],
   "cards": [
    {
@@ -518,7 +532,8 @@ const PAGE_INDEX = {
    "media.rtsp.probe"
   ],
   "refs": [
-   "connect"
+   "connect",
+   "files"
   ],
   "cards": [
    {
@@ -606,6 +621,7 @@ const PAGE_INDEX = {
   ],
   "refs": [
    "connect",
+   "files",
    "nic",
    "scan"
   ],
@@ -645,6 +661,7 @@ const PAGE_INDEX = {
    "remote.winssh.stop"
   ],
   "refs": [
+   "files",
    "remote-work"
   ],
   "cards": [
@@ -690,6 +707,7 @@ const PAGE_INDEX = {
    "remote.desk.options",
    "remote.device.forget-hostkey",
    "remote.device.list",
+   "remote.device.probe",
    "remote.exec",
    "remote.file.list",
    "remote.file.mkdir",
@@ -709,12 +727,86 @@ const PAGE_INDEX = {
    "remote.shell.write"
   ],
   "refs": [
+   "files",
+   "playbook",
+   "remote",
+   "term"
+  ],
+  "cards": [
+   {
+    "t": "体检剧本",
+    "tools": [
+     "remote.playbook.delete",
+     "remote.playbook.list",
+     "remote.playbook.run",
+     "remote.playbook.save"
+    ]
+   }
+  ]
+ },
+ "term": {
+  "tools": [
+   "netkit.sel",
+   "remote.device.list",
+   "remote.shell.close",
+   "remote.shell.open",
+   "remote.shell.read",
+   "remote.shell.write"
+  ],
+  "refs": [
    "remote"
   ],
   "cards": [
    {
-    "t": "这一页要对哪台干活",
-    "tools": []
+    "t": "先挑一台机器",
+    "tools": [
+     "remote.device.list"
+    ]
+   }
+  ]
+ },
+ "files": {
+  "tools": [
+   "netkit.sel",
+   "remote.device.list",
+   "remote.file.list",
+   "remote.file.mkdir",
+   "remote.file.pull",
+   "remote.file.push",
+   "remote.file.remove",
+   "remote.file.rename"
+  ],
+  "refs": [
+   "remote"
+  ],
+  "cards": [
+   {
+    "t": "先挑一台机器",
+    "tools": [
+     "remote.device.list"
+    ]
+   }
+  ]
+ },
+ "playbook": {
+  "tools": [
+   "netkit.sel",
+   "remote.device.list",
+   "remote.playbook.delete",
+   "remote.playbook.list",
+   "remote.playbook.run",
+   "remote.playbook.save"
+  ],
+  "refs": [
+   "files",
+   "remote"
+  ],
+  "cards": [
+   {
+    "t": "先挑一台机器",
+    "tools": [
+     "remote.device.list"
+    ]
    },
    {
     "t": "体检剧本",
@@ -735,7 +827,10 @@ const PAGE_INDEX = {
    "net.portal.status",
    "net.portal.stop"
   ],
-  "refs": [],
+  "refs": [
+   "files",
+   "playbook"
+  ],
   "cards": [
    {
     "t": "手机互联与投屏",
@@ -757,7 +852,8 @@ const PAGE_INDEX = {
    "remote.shell.read"
   ],
   "refs": [
-   "remote-work"
+   "remote-work",
+   "term"
   ],
   "cards": []
  },
@@ -784,11 +880,13 @@ const PAGE_INDEX = {
   "refs": [
    "connect",
    "dhcp",
+   "files",
    "name",
    "nic",
    "service",
    "settings",
-   "stream"
+   "stream",
+   "term"
   ],
   "cards": [
    {
@@ -805,6 +903,7 @@ const PAGE_INDEX = {
    "net.diag.bundle"
   ],
   "refs": [
+   "files",
    "name",
    "settings"
   ],
@@ -838,6 +937,7 @@ const PAGE_INDEX = {
    "net.subnet.calc"
   ],
   "refs": [
+   "files",
    "name",
    "settings"
   ],
@@ -870,7 +970,9 @@ const PAGE_INDEX = {
  },
  "playbooks": {
   "tools": [],
-  "refs": [],
+  "refs": [
+   "playbook"
+  ],
   "cards": []
  },
  "settings": {

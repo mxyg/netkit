@@ -95,6 +95,12 @@ const PAGES = [
     desc: t('登记过的机器、标签、刚才对哪台做过什么') },
   { g: t('设备'), id: 'remote-work', name: t('设备详情'), render: renderRemoteWork,
     desc: t('概览 / 终端 / 文件 / 桌面 / 剧本 / 审计') },
+  { g: t('设备'), id: 'term', name: t('终端'), render: renderTermPage,
+    desc: t('在远端敲命令') },
+  { g: t('设备'), id: 'files', name: t('文件'), render: renderFilesPage,
+    desc: t('传上来、传下去') },
+  { g: t('设备'), id: 'playbook', name: t('剧本'), render: renderPlaybookPage,
+    desc: t('一串命令一次跑完') },
   { g: t('设备'), pro: true, id: 'mobile', name: t('手机互联与投屏'), render: renderMobile },
   { g: t('设备'), pro: true, id: 'sessions', name: t('会话中心'), render: renderSessions },
   { g: t('设备'), pro: true, id: 'batch', name: t('批量任务'), render: renderBatch },
@@ -1375,7 +1381,7 @@ function toggleTaskPanel() {
  * ── 总览：新用户的第一屏 ──
  *
  * 按设计文档第三节瘦身：不再铺导航的复制品，只留四块 ——
- *   1) 这台机器的体检结论（homeHero，一键重测）；
+ *   1) 网络健康（net.checkup + net.bandwidth.top 现量，判定词进环心 —— 没有的数不编）；
  *   2) 接着上次干（还在跑的 + 最近用过的页 + 最近问过的，全部现量）；
  *   3) 所有设备一览（本机 + remote.device.list 现拉的远程设备）；
  *   4) 快速入口（按点开次数排的前六页，次数不够按导航顺序补）。
@@ -1383,260 +1389,304 @@ function toggleTaskPanel() {
  *   设备来自后端名单，次数来自本机访问足迹。任何一样都另有一处事实源，
  *   这里只做拼装，不设第二本账。
  */
-async function renderHome(root) {
-  root.appendChild(homeHero());
-  root.appendChild(await homeResume());
-  root.appendChild(homeQuick());
-  root.appendChild(await homeDevices());
+/*
+ * ── 总览：原型版式（docs/原型 V.home）──
+ *
+ * 四张任务卡 + 网络健康环 + 正在跑 + 设备一览 + 最近动作。
+ * ★ 数据规则不变：健康环中心是 net.checkup 的判定词（没有数字分就不编一个），
+ *   四行指标全部来自 checkup / bandwidth.top 的真实返回；正在跑复用顶栏探针；
+ *   设备表与审计表现拉。宁可少一块，不许假一格。
+ */
+const HOME_TASKS = [
+  { id: 'checkup', d: 'M2 8h12M8 2c2 2 2 10 0 12M8 2c-2 2-2 10 0 12', title: t('网通不通？'), sub: t('查本机地址、路由、出网，30 秒出结论'), page: 'checkup' },
+  { id: 'devices', d: 'M1.8 3.6h12.4v7.2H1.8zM5.6 13.6h4.8', title: t('连一台机器'), sub: t('终端、文件、桌面，都在这一扇窗里'), page: 'remote-work' },
+  { id: 'capture', d: 'M8 2v7m0 0 3-3m-3 3L5 6M2 12h12', title: t('抓个包看看'), sub: t('不用懂过滤语法，先看清楚再说'), page: 'capture' },
+  { id: 'trouble', d: 'M8 1.8 13 3.8v4.4c0 3.1-2.4 4.8-5 5.2-2.6-.4-5-2.1-5-5.2V3.8z', title: t('出问题了'), sub: t('说一句现象，按症状一步步查'), page: 'trouble' },
+];
+function taskIco(d) {
+  return `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg>`;
 }
 
-/** 第一块：这台机器此刻怎么样。进来就自动问一遍 —— 新用户不知道该点哪儿，先给他一个结论。 */
-function homeHero() {
+async function renderHome(root) {
+  // 快捷条
+  const qb = document.createElement('div');
+  qb.className = 'quickbar';
+  qb.innerHTML = `<span>${esc(t('快捷'))}</span>`
+    + `<button class="qb" data-go="checkup">${esc(t('重新体检'))}</button>`
+    + `<button class="qb" data-go="capture">${esc(t('开一路抓包'))}</button>`
+    + `<button class="qb" data-go="remote-work">${esc(t('连设备'))}</button>`
+    + `<button class="qb" id="qbfind">⌘K ${esc(t('搜一切'))}</button>`;
+  qb.querySelectorAll('button[data-go]').forEach((b) => { b.onclick = () => goto(b.dataset.go); });
+  const f = qb.querySelector('#qbfind');
+  if (f) f.onclick = () => openFind();
+  root.appendChild(qb);
+
+  // 从这里开始：四张任务卡
+  const head = document.createElement('div');
+  head.style.cssText = 'display:flex;align-items:baseline;gap:10px;margin:2px 0 10px';
+  head.innerHTML = `<b style="font-size:13.5px">${esc(t('从这里开始'))}</b><span class="hint" style="margin:0">${esc(t('四件事挑一件，剩下的它带你走'))}</span>`;
+  root.appendChild(head);
+  const cards = document.createElement('div');
+  cards.className = 'taskcards';
+  for (const x of HOME_TASKS) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'taskcard';
+    b.innerHTML = `<span class="ti-ic">${taskIco(x.d)}</span><b>${esc(x.title)}</b><span>${esc(x.sub)}</span><span class="go">${esc(t('开始 ›'))}</span>`;
+    b.onclick = () => goto(x.page);
+    cards.appendChild(b);
+  }
+  root.appendChild(cards);
+
+  // 第二排：网络健康 + 正在跑
+  const g1 = document.createElement('div');
+  g1.className = 'row';
+  g1.style.cssText = 'margin-top:14px;align-items:stretch';
+  g1.style.flexWrap = 'wrap';
+  g1.style.gap = '12px';
+  g1.appendChild(await homeHealth());
+  g1.appendChild(homeRunning());
+  root.appendChild(g1);
+
+  // 第三排：设备一览 + 最近动作
+  const g2 = document.createElement('div');
+  g2.className = 'row';
+  g2.style.cssText = 'margin-top:12px;align-items:stretch;flex-wrap:wrap;gap:12px';
+  g2.appendChild(await homeDeviceTable());
+  g2.appendChild(await homeAudit());
+  root.appendChild(g2);
+}
+
+/** 网络健康卡：环中心是判定词（原型那个 87 分后端没有 —— 没有的数不编），
+ *  四行指标：出网 RTT / 丢包 / 流量占用 / 时钟偏差，全部 checkup·bandwidth 现量。 */
+async function homeHealth() {
   const card = document.createElement('div');
-  card.className = 'card hero';
-  const say = document.createElement('div');
-  say.className = 'say';
-  const verdict = document.createElement('p');
-  verdict.className = 'verdict';
-  const body = document.createElement('div');
-  say.append(verdict, body);
+  card.className = 'card';
+  card.style.cssText = 'flex:1.1 1 380px;min-width:0';
+  const ch = document.createElement('div');
+  ch.className = 'ch';
+  const title = document.createElement('span');
+  title.textContent = t('网络健康');
+  const pill = document.createElement('span');
+  pill.className = 'pill';
+  pill.style.marginLeft = 'auto';
+  const retest = document.createElement('button');
+  retest.type = 'button';
+  retest.className = 'btn sm ghost';
+  retest.textContent = t('重新测');
+  retest.onclick = async () => { retest.disabled = true; await draw(); retest.disabled = false; };
+  ch.append(title, pill, retest);
+  const cb = document.createElement('div');
+  cb.className = 'cb';
+  const load = document.createElement('div');
+  load.className = 'hint';
+  load.textContent = t('测着呢…（约 20 秒，不用填东西）');
+  cb.appendChild(load);
+  card.append(ch, cb);
 
-  const again = document.createElement('button');
-  again.type = 'button';
-  again.className = 'btn primary';
-  again.textContent = t('再问一遍');
-  const detail = document.createElement('button');
-  detail.type = 'button';
-  detail.className = 'btn';
-  detail.textContent = t('逐项看');
-  detail.onclick = () => goto('checkup');
-  card.append(say, again, detail);
+  const draw = async () => {
+    const [ck, bw] = await Promise.all([
+      call('net.checkup').catch(() => null),
+      call('net.bandwidth.top', { seconds: 1 }).catch(() => null),
+    ]);
+    cb.innerHTML = '';
+    const [title2, cls] = ck && ck.ok ? (CK_TOP[ck.verdict] || [ck.verdict, '']) : [t('体检问不到'), ''];
+    // 环心只放短词：判定全文在卡片头的 pill 里（104px 的环装不下一句话）。
+    const short = ck && ck.ok ? (ck.verdict.startsWith('broken') ? t('故障') : ck.verdict === 'all-good' ? t('良好') : ck.verdict === 'degraded' ? t('注意') : ck.verdict) : t('—');
+    pill.className = 'pill ' + (cls === 'warn' ? 'warn' : cls === 'bad' ? 'bad' : cls === 'ok' ? 'ok' : '');
+    pill.textContent = title2;
+    const v = (ck && ck.ok && ck.values) || {};
+    const byStep = {};
+    for (const it of v.items || []) byStep[it.step] = it;
+    const gw = (byStep.gateway && byStep.gateway.facts && byStep.gateway.facts.ipv4) || {};
+    const clk = (byStep.clock && byStep.clock.facts) || {};
+    const egr = (byStep.egress && byStep.egress.facts && byStep.egress.facts.ipv4) || {};
+    // 流量占用：出口网卡的收+发（bandwidth.top 现量；问不到就不画这一行）。
+    let bwVal = null, bwPct = null;
+    if (bw && bw.ok) {
+      const ifs = (bw.values && bw.values.interfaces) || [];
+      const main = ifs.find((x) => x.name === (v.egressIface || (ifs[0] || {}).name));
+      if (main && (main.rxMbps != null)) {
+        bwVal = (main.rxMbps + (main.txMbps || 0));
+        bwPct = Math.min(100, Math.round(bwVal / 10)); // 1 Gbps 满量程的示意刻度 —— 刻度写死在界面上，数字是真的
+      }
+    }
+    const pct = (val, cap) => Math.max(2, Math.min(100, Math.round((val / cap) * 100)));
+    const ringPill = cls === 'ok' ? 'ok' : cls === 'warn' ? 'warn' : cls === 'bad' ? 'bad' : '';
+    cb.innerHTML = t(`<div class="gauge">
+      <div class="ring">
+        <svg width="104" height="104" viewBox="0 0 104 104">
+          <circle cx="52" cy="52" r="44" fill="none" stroke="var(--sunken)" stroke-width="8"/>
+          <circle cx="52" cy="52" r="44" fill="none" stroke="var(--gold)" stroke-width="8" stroke-dasharray="276" stroke-dashoffset="36" stroke-linecap="round"/>
+        </svg>
+        <div class="num"><div><b>{0}</b><i>体检判定</i></div></div>
+      </div>
+      <div style="flex:1;min-width:0">
+        <div class="ifrow"><span class="nm">出网</span><div class="meter"><i style="width:{1}%"></i></div><span class="val">{2} ms</span></div>
+        <div class="ifrow"><span class="nm">丢包</span><div class="meter"><i style="width:{3}%"></i></div><span class="val">{4}%</span></div>
+        {5}
+        <div class="ifrow"><span class="nm">时钟偏差</span><div class="meter"><i style="width:{6}%"></i></div><span class="val">{7} ms</span></div>
+      </div>
+    </div>
+    <table class="softcap" style="margin-top:8px"><tr><th>接口</th><th>地址</th><th>流量</th><th></th></tr>{8}</table>`, [
+      esc(short),
+      pct(egr.rttMs || gw.rttMedianMs || 0, 500),
+      egr.rttMs != null ? egr.rttMs : (gw.rttMedianMs != null ? Math.round(gw.rttMedianMs * 10) / 10 : '—'),
+      gw.lossPercent != null ? pct(gw.lossPercent, 100) : 2,
+      gw.lossPercent != null ? gw.lossPercent : '—',
+      bwVal != null ? `<div class="ifrow"><span class="nm">${esc(t('流量占用'))}</span><div class="meter"><i style="width:${bwPct}%"></i></div><span class="val">${bwVal.toFixed(1)} Mbps</span></div>` : '',
+      clk.offsetMs != null ? pct(Math.abs(clk.offsetMs), 2000) : 2,
+      clk.offsetMs != null ? clk.offsetMs : '—',
+      (bw && bw.ok ? (bw.values.interfaces || []).filter((x) => x.counts).slice(0, 1).map((x) => `<tr><td>${esc(x.name)}</td><td class="mono">${esc(v.egressIface || x.name)}</td><td class="mono">${(x.rxMbps + (x.txMbps || 0)).toFixed(1)} Mbps</td><td><span class="pill ok">${esc(t('在测'))}</span></td></tr>`).join('') : '') || `<tr><td colspan="4" class="dim">${esc(t('流量表问不到 —— 界面宁可空着'))}</td></tr>`,
+    ]);
+    // 接口地址：interfaces 现拉（不占 checkup 的份额）。
+    try {
+      const ir = await call('net.interfaces');
+      if (ir.ok) {
+        const main = (ir.values.interfaces || []).find((x) => x.name === v.egressIface) || (ir.values.interfaces || []).find((x) => x.addrs.some((a) => a.family === 'ipv4'));
+        if (main) {
+          const a = main.addrs.find((x) => x.family === 'ipv4');
+          const td = cb.querySelector('table tr:nth-child(2) td:nth-child(2)');
+          if (td && a) td.textContent = a.addr;
+          const dot = cb.querySelector('table tr:nth-child(2) td:last-child');
+          if (dot) dot.innerHTML = `<span class="pill ok">${esc(t('在用'))}</span>`;
+        }
+      }
+    } catch (_) { /* 名单问不到就保持 — */ }
+  };
+  await draw();
+  return card;
+}
 
-  // 换页不停在这里，这一趟回来的结果就不该再画到屏上 —— 记一代，回来先对代。
-  const myGen = ++gen;
-  const run = async () => {
-    if (myGen !== gen) return;   // ★ 换页（或重问）之后这一趟的活就作废，别再往已经拆掉的节点里写
-    again.disabled = true;
-    verdict.textContent = t('正在按老手的排查顺序问这一台机器…');
-    body.innerHTML = '';
-    const r = await call('net.checkup', {});
-    if (myGen !== gen) return;
-    again.disabled = false;
-    if (!r.ok) {
-      verdict.textContent = t('这一刻问不出结论');
-      body.innerHTML = adviceBox('bad', esc(t('后端没答上这一问：{0}', [esc(r.message || '')])));
+/** 正在跑卡：复用顶栏探针（runningNow）+ 本会话批量任务，两处不另问一遍。 */
+function homeRunning() {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.style.cssText = 'flex:1 1 320px;min-width:0';
+  const ch = document.createElement('div');
+  ch.className = 'ch';
+  const title = document.createElement('span');
+  title.textContent = t('正在跑');
+  const pill = document.createElement('span');
+  pill.className = 'pill gold';
+  pill.style.marginLeft = 'auto';
+  ch.append(title, pill);
+  const cb = document.createElement('div');
+  cb.className = 'cb tasklist';
+  card.append(ch, cb);
+  const paint = () => {
+    const live = runningNow.map((c) => ({ name: c.word, page: c.page, dot: 'y' }));
+    const batches = BATCH_RUNS.map((t2) => ({ name: (t2.command || t2.id).slice(0, 40), batch: t2, dot: t2.done ? 'g' : 'y' }));
+    pill.textContent = String(live.length + batches.filter((x) => !x.batch.done).length);
+    cb.innerHTML = '';
+    if (!live.length && !batches.length) {
+      cb.innerHTML = t('<p class="hint" style="margin:0">{0}</p>', [t('此刻没有在跑的 —— 抓包、DHCP、共享这类开着就一直跑的事会出现在这儿，顶栏「任务中心」也能看。')]);
       return;
     }
-    const v = r.values || {};
-    const [title, cls, advice] = CK_TOP[r.verdict] || [r.verdict || '—', '', ''];
-    verdict.innerHTML = `<span class="pill ${cls}">${esc(title)}</span>`;
-    body.innerHTML = advice ? adviceBox(cls, esc(advice)) : '';
-    if (v.first) {
-      const line = document.createElement('p');
-      line.className = 'hint';
-      line.style.marginTop = '10px';
-      line.textContent = t('顺序是从这一步开始的：{0}', [CK_STEP[v.first] || v.first]);
-      body.appendChild(line);
-    }
-    const go = document.createElement('button');
-    go.type = 'button';
-    go.className = 'btn';
-    go.textContent = t('照这个症状排下去');
-    go.onclick = () => goto('trouble');
-    body.appendChild(go);
-  };
-  again.onclick = run;
-  run();
-  return card;
-}
-
-
-/** 接着上次干：还在跑的 + 最近用过的页 + 最近问过的。
- *  三样全现量：在跑的复用顶栏七路探针的最近一轮（不多问一遍），
- *  足迹只记页 id 和次数（存不上就当没有历史），
- *  问过的用 call() 的 HIST —— 任何一样都不在首页另记一份账。 */
-async function homeResume() {
-  const card = document.createElement('div');
-  card.className = 'card';
-  const h = document.createElement('h2');
-  h.textContent = t('接着上次干');
-  card.appendChild(h);
-
-  const live = document.createElement('div');
-  live.className = 'row';
-  live.style.cssText = 'flex-wrap:wrap;gap:8px;margin-bottom:10px';
-  if (runningNow.length) {
-    for (const c of runningNow) {
+    for (const x of live) {
+      const row = document.createElement('div');
+      row.className = 'ti2';
+      row.innerHTML = `<span class="sdot ${x.dot}"></span><span class="nm">${esc(x.name)}</span>`;
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = 'runchip';
-      b.textContent = c.word;
-      b.title = t('这一项正在跑，点过去看');
-      b.onclick = () => goto(c.page);
-      live.appendChild(b);
-    }
-  } else {
-    const s = document.createElement('span');
-    s.className = 'hint';
-    s.textContent = t('此刻没有在跑的 —— 抓包、DHCP、共享这类开起来就一直在跑的事，会出现在这儿。');
-    live.appendChild(s);
-  }
-  card.appendChild(live);
-
-  const recents = seen.order.filter((id) => id !== 'home' && PAGES.some((p) => p.id === id)).slice(-6).reverse();
-  const lbl = document.createElement('div');
-  lbl.className = 'railh';
-  lbl.textContent = t('最近用过的页');
-  card.appendChild(lbl);
-  if (recents.length) {
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.style.cssText = 'flex-wrap:wrap;gap:8px';
-    for (const id of recents) {
-      const p = PAGES.find((x) => x.id === id);
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'btn';
-      b.textContent = p.name;
-      b.title = PAGE_ASK[id] || '';
-      b.onclick = () => goto(id);
+      b.className = 'btn sm ghost';
+      b.textContent = t('去看');
+      b.onclick = () => goto(x.page);
       row.appendChild(b);
+      cb.appendChild(row);
     }
-    card.appendChild(row);
-  } else {
-    const s = document.createElement('p');
-    s.className = 'hint';
-    s.textContent = t('还没有足迹 —— 从下面挑一件事开始。');
-    card.appendChild(s);
-  }
-
-  if (HIST.length) {
-    const lbl2 = document.createElement('div');
-    lbl2.className = 'railh';
-    lbl2.style.marginTop = '10px';
-    lbl2.textContent = t('最近问过的（只留工具名、判定码和钟点 —— 填过的地址、口令一概不存）');
-    card.appendChild(lbl2);
-    const list = document.createElement('div');
-    list.className = 'caplist';
-    for (const rec of HIST.slice(0, 5)) {
-      const page = PAGES.find((p) => p.id === rec.page);
-      const row = document.createElement('button');
-      row.type = 'button';
-      row.className = 'caprow';
-      row.onclick = () => goto(rec.page);
-      const code = document.createElement('code');
-      code.textContent = rec.tool;
-      const sum = document.createElement('span');
-      sum.className = 'sum';
-      sum.textContent = [stampOf(rec.at), page ? page.name : rec.page, rec.verdict].filter(Boolean).join(' · ');
-      row.append(code, sum);
-      list.appendChild(row);
+    for (const x of batches) {
+      const row = document.createElement('div');
+      row.className = 'ti2';
+      const done = x.batch.done;
+      row.innerHTML = `<span class="sdot ${x.dot}"></span><span class="nm">${esc(x.name)}</span>`;
+      if (!done) {
+        const bar = document.createElement('div');
+        bar.className = 'pbar';
+        bar.innerHTML = '<i style="width:35%"></i>';
+        row.appendChild(bar);
+        call('remote.task.status', { task: x.batch.id }).then((s) => {
+          if (s.ok) {
+            const v2 = s.values || {};
+            x.batch.done = !!v2.done;
+            bar.innerHTML = `<i style="width:${v2.total ? Math.round(((v2.finished ?? 0) / v2.total) * 100) : 0}%"></i>`;
+            const mono = document.createElement('span');
+            mono.className = 'mono';
+            mono.style.color = 'var(--muted-2)';
+            mono.textContent = `${v2.finished ?? 0}/${v2.total ?? 0}`;
+            row.appendChild(mono);
+            paintTaskBadge();
+          }
+        }).catch(() => { });
+      } else {
+        const p2 = document.createElement('span');
+        p2.className = 'pill ok';
+        p2.textContent = t('完成');
+        row.appendChild(p2);
+      }
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn sm ghost';
+      b.textContent = t('去看');
+      b.onclick = () => goto('batch');
+      row.appendChild(b);
+      cb.appendChild(row);
     }
-    card.appendChild(list);
-  }
+  };
+  paint();
   return card;
 }
 
-/** 快速入口：按点开次数排的前六页。次数不够（新机器）时剩下的名额按导航顺序补齐 ——
- *  补的是真页，不是编出来的「热门」；想找别的用顶栏搜索。 */
-function homeQuick() {
+/** 设备一览表：remote.device.list 现拉，状态点按最近探测的远近给（远就黄，没连过就灰）—— 不编「在线」。 */
+async function homeDeviceTable() {
   const card = document.createElement('div');
   card.className = 'card';
-  const h = document.createElement('h2');
-  h.textContent = t('快速入口');
-  const hint = document.createElement('p');
-  hint.className = 'hint';
-  hint.textContent = t('按你点开的次数排；次数还不够时先按导航的顺序补齐 —— 想找别的用搜索。');
-  card.append(h, hint);
-  const pages = PAGES.filter((p) => !p.pin && p.id !== 'home' && !p.alias && inMode(p));
-  pages.sort((a, b) => (seen.count[b.id] || 0) - (seen.count[a.id] || 0));
-  const row = document.createElement('div');
-  row.className = 'row';
-  row.style.cssText = 'flex-wrap:wrap;gap:8px';
-  for (const p of pages.slice(0, 6)) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'btn';
-    const n = seen.count[p.id] || 0;
-    b.innerHTML = n ? `${esc(p.name)} <span class="dim">${n}</span>` : esc(p.name);
-    b.title = PAGE_ASK[p.id] || '';
-    b.onclick = () => goto(p.id);
-    row.appendChild(b);
-  }
-  card.appendChild(row);
-  return card;
-}
-
-/** 所有设备一览：本机一行 + 已登记的远程设备（remote.device.list 现拉）。
- *  本机不另起名字 —— 正在用的就是它；名单拉不到就照实说，不装「没有设备」。 */
-async function homeDevices() {
-  const card = document.createElement('div');
-  card.className = 'card';
-  const h = document.createElement('h2');
-  h.textContent = t('所有设备一览');
-  card.appendChild(h);
-  const list = document.createElement('div');
-  list.className = 'caplist';
-  const me = document.createElement('button');
-  me.type = 'button';
-  me.className = 'caprow';
-  me.onclick = () => goto('net-status');
-  const meCode = document.createElement('code');
-  meCode.textContent = t('本机');
-  const meSum = document.createElement('span');
-  meSum.className = 'sum';
-  meSum.textContent = t('正在用的这一台 —— 网络状态、体检、抓包都问它');
-  me.append(meCode, meSum);
-  list.appendChild(me);
-  card.appendChild(list);
-
+  card.style.cssText = 'flex:1 1 380px;min-width:0';
+  const ch = document.createElement('div');
+  ch.className = 'ch';
+  ch.innerHTML = `${esc(t('设备一览'))} <span class="sub">${esc(t('本机 + 远程登记'))}</span><button class="btn sm ghost" style="margin-left:auto">${esc(t('打开'))} →</button>`;
+  ch.querySelector('button').onclick = () => goto('remote');
+  const cb = document.createElement('div');
+  cb.className = 'cb flush';
+  card.append(ch, cb);
   const r = await call('remote.device.list');
-  if (!r.ok) {
-    const s = document.createElement('p');
-    s.className = 'hint';
-    s.textContent = t('远程设备名单拉不到：') + (r.message || '');
-    card.appendChild(s);
-    return card;
-  }
+  if (!r.ok) { cb.innerHTML = t('<div class="empty" style="padding:12px">{0}</div>', [t('远程设备名单拉不到：') + esc(r.message)]); return card; }
   const devices = r.values.devices || [];
-  if (!devices.length) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'btn';
-    b.textContent = t('去登记第一台设备');
-    b.onclick = () => goto('remote');
-    card.appendChild(b);
-    return card;
-  }
-  const grid = document.createElement('div');
-  grid.className = 'caplist';
-  for (const d of devices) {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'caprow';
-    row.onclick = () => { rememberSel(d.id); goto('remote-work'); };
-    const code = document.createElement('code');
-    code.textContent = d.name || d.id;
-    const sum = document.createElement('span');
-    sum.className = 'sum';
-    sum.textContent = [OS_LABEL[d.os] || t('系统未知'), (d.tags || []).join('、') || t('无标签')].filter(Boolean).join(' · ');
-    row.append(code, sum);
-    grid.appendChild(row);
-  }
-  card.appendChild(grid);
-  const foot = document.createElement('div');
-  foot.className = 'row';
-  foot.style.cssText = 'margin-top:10px';
-  const more = document.createElement('button');
-  more.type = 'button';
-  more.className = 'btn sub';
-  more.textContent = t('到设备中心管理（加、删、标签）');
-  more.onclick = () => goto('remote');
-  foot.appendChild(more);
-  card.appendChild(foot);
+  const rows = devices.map((d) => {
+    const dot = d.lastSeen ? (Date.now() - new Date(d.lastSeen).getTime() < 30 * 60000 ? 'g' : 'y') : 'd';
+    return `<tr data-id="${esc(d.id)}" style="cursor:pointer"><td><span class="sdot ${dot}"></span></td><td><b>${esc(d.name || d.id)}</b><br><span class="mono" style="color:var(--muted-2)">${esc(d.host)}</span></td><td>${esc(OS_LABEL[d.os] || t('系统未知'))}</td><td class="mono dim">${d.lastSeen ? agoStr(d.lastSeen) : '—'}</td></tr>`;
+  }).join('');
+  cb.innerHTML = `<table class="hoverable softcap"><tr><th></th><th>${esc(t('设备'))}</th><th>${esc(t('系统'))}</th><th>${esc(t('最近'))}</th></tr>${rows || ''}</table>`
+    + (devices.length ? '' : t('<div class="empty" style="padding:14px">{0}</div>', [t('还没有登记的设备。')]));
+  cb.querySelectorAll('tr[data-id]').forEach((tr) => {
+    tr.onclick = () => { rememberSel(tr.dataset.id); goto('remote-work'); };
+  });
   return card;
 }
 
+/** 最近动作卡：remote.audit.tail 现拉，点行去审计页。 */
+async function homeAudit() {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.style.cssText = 'flex:1 1 380px;min-width:0';
+  const ch = document.createElement('div');
+  ch.className = 'ch';
+  ch.innerHTML = `${esc(t('最近动作'))} <span class="sub">${esc(t('审计'))}</span><button class="btn sm ghost" style="margin-left:auto">${esc(t('打开'))} →</button>`;
+  ch.querySelector('button').onclick = () => goto('audit');
+  const cb = document.createElement('div');
+  cb.className = 'cb flush';
+  card.append(ch, cb);
+  const r = await call('remote.audit.tail', { limit: 5 }).catch(() => null);
+  if (!r || !r.ok) { cb.innerHTML = t('<div class="empty" style="padding:12px">{0}</div>', [t('审计问不到 —— 这台机器还没开远程')]); return card; }
+  const es = r.values.entries || [];
+  const cls = (s2) => /exit=0/.test(s2) ? 'ok' : /denied|refused|error|fail/i.test(s2) ? 'bad' : 'warn';
+  cb.innerHTML = `<table class="hoverable softcap"><tr><th>${esc(t('时间'))}</th><th>${esc(t('动作'))}</th><th>${esc(t('结果'))}</th></tr>
+    ${es.map((e2) => `<tr data-id="audit" style="cursor:pointer"><td class="mono dim">${esc(String(e2.at).slice(11, 19))}</td><td><code>${esc(e2.action)}</code><br><span class="dim" style="font-size:11px">${esc((e2.detail || '').slice(0, 44))}</span></td><td class="mono ${cls(e2.result || '') === 'bad' ? 'bad' : ''}" style="font-size:11px;color:${cls(e2.result || '') === 'ok' ? 'var(--green-text)' : 'inherit'}">${esc((e2.result || '').slice(0, 24))}</td></tr>`).join('')}</table>`;
+  cb.querySelectorAll('tr[data-id]').forEach((tr) => { tr.onclick = () => goto('audit'); });
+  return card;
+}
+
+// ── 本机网络 ──
 // ── 本机网络 ──
 
 /*
@@ -5698,52 +5748,275 @@ let remoteTab = (() => {
   } catch { return 'overview'; }
 })();
 
+// 「x min / x h / x d」这类纯数字+单位不进词典（各语言写法一致）。
+function agoStr(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!(ms >= 0)) return t('刚刚');
+  const m = Math.round(ms / 60000);
+  if (m < 1) return t('刚刚');
+  if (m < 60) return m + ' min';
+  const h = Math.round(m / 60);
+  if (h < 24) return h + ' h';
+  return Math.round(h / 24) + ' d';
+}
+// 系统缩写（设备头像格里那两个字母）：真实字段是 os，不是猜的。
+function osShort(os) {
+  return { linux: 'Lx', windows: 'Wi', mac: 'mac', unknown: '?' }[os] || '?';
+}
+
 async function renderRemoteWork(root) {
   const r = await call('remote.device.list');
-  if (!r.ok) { root.appendChild($(t('<div class=\"card\">远程功能不可用：{0}</div>', [esc(r.message)]))); return; }
+  if (!r.ok) { root.appendChild($(t('<div class="card">远程功能不可用：{0}</div>', [esc(r.message)]))); return; }
   const devices = r.values.devices || [];
-  const sel = devices.find((d) => d.id === remoteSel) || null;
-  if (!sel) {
-    root.appendChild(devicePickCard(devices));
-    return;
-  }
-  // 子页签条：改的是本模块状态，切签不走整页重绘（终端会话不能断）。
+  const sel = () => devices.find((d) => d.id === remoteSel) || null;
+
+  // ── 原型 split 版式：左列设备名单（过滤 / 探测 / ＋），右侧详情（子页签 + 内容）──
+  const wrap = document.createElement('div');
+  wrap.className = 'devsplit';
+
+  const dlist = document.createElement('div');
+  dlist.className = 'dlist';
+  const dfilter = document.createElement('div');
+  dfilter.className = 'dfilter';
+  const tagf = document.createElement('select');
+  tagf.innerHTML = `<option value="">${esc(t('（全部）'))}</option>`
+    + allTags(devices).map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join('');
+  const probeB = document.createElement('button');
+  probeB.type = 'button';
+  probeB.className = 'btn sm';
+  probeB.textContent = t('探测');
+  probeB.title = t('连一次选中的那台，把系统、地址探回来');
+  const addB = document.createElement('button');
+  addB.type = 'button';
+  addB.className = 'btn sm';
+  addB.textContent = '＋';
+  addB.title = t('登记、删除、打标签在设备中心');
+  addB.onclick = () => goto('remote');
+  dfilter.append(tagf, probeB, addB);
+  const drows = document.createElement('div');
+  drows.className = 'drows';
+  const dfoot = document.createElement('div');
+  dfoot.className = 'dfoot';
+  const batchB = document.createElement('button');
+  batchB.type = 'button';
+  batchB.className = 'btn sm';
+  batchB.textContent = t('批量命令');
+  batchB.onclick = () => goto('batch');
+  dfoot.appendChild(batchB);
+  dlist.append(dfilter, drows, dfoot);
+
+  const paintRows = () => {
+    const f = tagf.value;
+    const list = f ? devices.filter((d) => (d.tags || []).includes(f)) : devices;
+    drows.innerHTML = '';
+    if (!list.length) {
+      drows.innerHTML = t('<div class="empty" style="padding:18px 12px">{0}</div>',
+        [f ? t('没有打了「{0}」标签的设备。', [f]) : t('还没有登记的设备 —— 右上角 ＋ 去登记。')]);
+      return;
+    }
+    for (const d of list) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'drow' + (d.id === remoteSel ? ' on' : '');
+      const av = document.createElement('span');
+      av.className = 'av';
+      av.textContent = osShort(d.os);
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      const nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = d.name || d.id;
+      const ip = document.createElement('span');
+      ip.className = 'ip';
+      ip.textContent = `${d.host}${d.port && d.port !== 22 ? ':' + d.port : ''}`;
+      meta.append(nm, ip);
+      const rt = document.createElement('span');
+      rt.className = 'rt';
+      rt.textContent = d.lastSeen ? agoStr(d.lastSeen) : '—';
+      row.append(av, meta, rt);
+      row.onclick = () => {
+        if (remoteSel !== d.id) { rememberSel(d.id); paintRows(); drawDetail(); }
+      };
+      drows.appendChild(row);
+    }
+  };
+  tagf.onchange = paintRows;
+  probeB.onclick = async () => {
+    const d = sel();
+    if (!d) { alert(t('先在左边挑一台')); return; }
+    probeB.disabled = true;
+    const rr = await call('remote.device.probe', { device: d.id });
+    probeB.disabled = false;
+    alert(rr.ok ? rr.note : t('探测失败：') + rr.message);
+    show();
+  };
+
+  // ── 右：子页签条 + 内容 ──
+  const pane = document.createElement('div');
+  pane.className = 'detailpane';
   const bar = document.createElement('div');
-  bar.className = 'devtabs';
+  bar.className = 'subtabs';
   bar.innerHTML = REMOTE_TABS.map(([id, name, tip]) =>
-    `<button class="devtab${remoteTab === id ? ' on' : ''}" data-tab="${id}" title="${esc(t(tip))}">${esc(t(name))}</button>`).join('');
-  const body = document.createElement('div');
-  body.style.marginTop = '12px';
-  bar.querySelectorAll('.devtab').forEach((b) => {
+    `<button class="${remoteTab === id ? 'on' : ''}" data-tab="${id}" title="${esc(t(tip))}">${esc(t(name))}</button>`).join('');
+  const dpane = document.createElement('div');
+  dpane.className = 'dpane';
+  bar.querySelectorAll('button[data-tab]').forEach((b) => {
     b.onclick = () => {
       remoteTab = b.dataset.tab;
       try { localStorage.setItem('netkit.tab', remoteTab); } catch { }
-      bar.querySelectorAll('.devtab').forEach((x) => x.classList.toggle('on', x === b));
+      bar.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
       drawTab();
     };
   });
-  const drawTab = async () => {
-    body.innerHTML = '';
-    if (remoteTab === 'overview') body.appendChild(remoteOps(sel));
-    else if (remoteTab === 'term') body.appendChild(shellCard(sel));
-    else if (remoteTab === 'files') body.appendChild(filesCard(sel));
-    else if (remoteTab === 'desk') body.appendChild(deskCard(sel));
-    else if (remoteTab === 'playbook') body.appendChild(playbookCard([sel], sel));
-    else if (remoteTab === 'audit') body.appendChild(auditCard(sel.id));
+  pane.append(bar, dpane);
+
+  const drawDetail = async () => {
+    const d = sel();
+    dpane.innerHTML = '';
+    if (!d) {
+      // 没选机器：给引导，不装内容 —— 数据一个不编。
+      dpane.appendChild($(t(`<div class="emptybox">
+        <div class="ei"><svg viewBox="0 0 16 16" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1.8 3.6h12.4v7.2H1.8zM5.6 13.6h4.8"/></svg></div>
+        <h3>从左边挑一台机器</h3>
+        <p>选中之后，概览、终端、文件、桌面、剧本、审计都在这一扇窗里 —— 换页不会断会话。</p>
+        <div class="acts"><button class="btn primary" id="goadd">去设备中心登记</button></div>
+      </div>`)));
+      dpane.querySelector('#goadd').onclick = () => goto('remote');
+      return;
+    }
+    if (remoteTab === 'overview') dpane.appendChild(overviewPane(d, drawDetail));
+    else if (remoteTab === 'term') dpane.appendChild(shellCard(d));
+    else if (remoteTab === 'files') dpane.appendChild(filesCard(d));
+    else if (remoteTab === 'desk') dpane.appendChild(deskCard(d));
+    else if (remoteTab === 'playbook') dpane.appendChild(playbookCard([d], d));
+    else if (remoteTab === 'audit') dpane.appendChild(auditCard(d.id));
   };
-  root.appendChild(bar);
-  root.appendChild(body);
-  await drawTab();
+
+  wrap.append(dlist, pane);
+  root.appendChild(wrap);
+  paintRows();
+  await drawDetail();
 }
 
-function devicePickCard(devices) {
-  const card = $(t('<div class=\"card\">\n    <h2>这一页要对哪台干活</h2>\n    <p class=\"hint\">登记、删除、打标签在「设备中心」那页。这里挑一台，进去之后按「干什么」分子页。</p>\n    <div class=\"row\" style=\"align-items:flex-end\">\n      <div style=\"min-width:280px\"><label>设备</label>\n        <select id=\"pick\">{0}</select></div>\n      <button class=\"btn primary\" id=\"go\"{1}>就这台</button>\n      <button class=\"btn\" id=\"clr\"{2}>取消选择</button>\n    </div>\n  </div>', [devices.length
-          ? devices.map((d) => `<option value="${esc(d.id)}" ${d.id === remoteSel ? 'selected' : ''}>${esc(d.name || d.id)} · ${esc(OS_LABEL[d.os] || t('系统未知'))}</option>`).join('')
-          : t('<option value=\"\">（还没有登记的设备）</option>'), devices.length ? '' : ' disabled', remoteSel ? '' : ' disabled']));
-  card.querySelector('#go').onclick = () => { rememberSel(card.querySelector('#pick').value); show(); };
-  card.querySelector('#clr').onclick = () => { rememberSel(null); show(); };
-  return card;
+/** 概览子页：四格状态 + 身份与通道 + 审计留痕，下面接快速干活与剧本（全现量，不编一格数）。 */
+function overviewPane(d) {
+  const box = document.createElement('div');
+  const seen = d.lastSeen ? agoStr(d.lastSeen) : t('还没连过');
+  const idn = d.identity || {};
+  const stat = document.createElement('div');
+  stat.innerHTML = t(`<div class="stat4">
+    <div class="s"><div class="l">最近探测</div><div class="v">{0}</div></div>
+    <div class="s"><div class="l">系统</div><div class="v">{1}</div></div>
+    <div class="s"><div class="l">地址</div><div class="v">{2}</div></div>
+    <div class="s"><div class="l">通道</div><div class="v">SSH {3} · {4}</div></div>
+  </div>`, [seen, esc(OS_LABEL[d.os] || t('系统未知')), esc(`${d.host}${d.port && d.port !== 22 ? ':' + d.port : ''}`), esc(d.port || 22), d.auth === 'key' ? t('密钥') : t('口令')]);
+  box.appendChild(stat);
+
+  const grid = document.createElement('div');
+  grid.className = 'row';
+  grid.style.alignItems = 'stretch';
+
+  // 身份与通道：字段全部来自 remote.device.list 的返回。
+  const c1 = document.createElement('div');
+  c1.className = 'card';
+  c1.style.cssText = 'flex:1 1 200px;min-width:0';
+  c1.innerHTML = t(`<div class="ch">身份与通道</div><div class="cb">
+    <div class="kv">
+      <span class="k">主机名</span><span class="v2">{0}</span>
+      <span class="k">系统</span><span class="v2">{1}</span>
+      <span class="k">账号</span><span class="v2">{2}</span>
+      <span class="k">开着的端口</span><span class="v2">{3}</span>
+      <span class="k">时区</span><span class="v2">{4}</span>
+      <span class="k">标签</span><span class="v2">{5}</span>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn primary sm" data-go="term">开终端</button>
+      <button class="btn sm" data-go="files">管文件</button>
+      <button class="btn sm" data-go="desk">开桌面</button>
+    </div>
+  </div>`, [
+    esc(idn.hostname || d.host),
+    esc(idn.osDetail || OS_LABEL[d.os] || t('系统未知，先探测')),
+    esc(`${d.user} · ${d.auth === 'key' ? t('密钥') : t('口令')}`),
+    esc((idn.listening || []).join(', ') || '—'),
+    esc(idn.timezone || '—'),
+    (d.tags || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(' ') || `<span class="dim">${esc(t('无标签'))}</span>`,
+  ]);
+  c1.querySelectorAll('button[data-go]').forEach((b) => {
+    b.onclick = () => {
+      remoteTab = b.dataset.go;
+      try { localStorage.setItem('netkit.tab', remoteTab); } catch { }
+      const bar = document.querySelector('.detailpane .subtabs');
+      if (bar) bar.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x.dataset.tab === remoteTab));
+      const pane2 = document.querySelector('.detailpane .dpane');
+      if (pane2) {
+        pane2.innerHTML = '';
+        if (remoteTab === 'term') pane2.appendChild(shellCard(d));
+        else if (remoteTab === 'files') pane2.appendChild(filesCard(d));
+        else if (remoteTab === 'desk') pane2.appendChild(deskCard(d));
+      }
+    };
+  });
+  grid.appendChild(c1);
+
+  // 审计留痕：remote.audit.tail 现拉这台的最近几条（探测历史没有单独的工具，留痕是唯一诚实的来路）。
+  const c2 = document.createElement('div');
+  c2.className = 'card';
+  c2.style.cssText = 'flex:1 1 200px;min-width:0';
+  c2.innerHTML = t(`<div class="ch">审计留痕<button class="btn sm ghost" style="margin-left:auto">全部留痕 →</button></div>
+    <div class="cb"><div class="load">读取中…</div></div>`);
+  c2.querySelector('.ch button').onclick = () => {
+    remoteTab = 'audit';
+    try { localStorage.setItem('netkit.tab', remoteTab); } catch { }
+    show();
+  };
+  grid.appendChild(c2);
+  box.appendChild(grid);
+
+  (async () => {
+    const rr = await call('remote.audit.tail', { device: d.id, limit: 6 });
+    const host = c2.querySelector('.cb');
+    if (!rr.ok) { host.innerHTML = t('<div class="empty" style="padding:10px 12px">{0}</div>', [t('留痕问不到：') + esc(rr.message)]); return; }
+    const es = rr.values.entries || [];
+    host.innerHTML = es.length
+      ? `<table class="hoverable" style="table-layout:fixed"><tr><th style="width:64px">${esc(t('时间'))}</th><th style="width:38%">${esc(t('动作'))}</th><th>${esc(t('结果'))}</th></tr>${es.map((e2) => `<tr><td class="dim">${esc(String(e2.at).slice(11, 19))}</td><td style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><code>${esc(e2.action)}</code></td><td class="dim" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((e2.result || '').slice(0, 60))}</td></tr>`).join('')}</table>`
+      : t('<div class="empty" style="padding:10px 12px">{0}</div>', [t('这台还没有留痕。')]);
+  })();
+
+  // 快速干活与剧本照旧（这两个卡里的每个按钮都有真工具撑着）。
+  box.appendChild(remoteOps(d));
+  box.appendChild(playbookCard([d], d));
+  return box;
 }
+
+// ── 独立的 终端 / 文件 / 剧本 页（设计 4.1 的导航条目；原型里详情子页签跳的就是这些页）──
+// 没选中机器时先挑一台 —— 挑的是真登记簿，不编默认值。
+async function devPageShell(root, build) {
+  const r = await call('remote.device.list');
+  if (!r.ok) { root.appendChild($(t('<div class="card">远程功能不可用：{0}</div>', [esc(r.message)]))); return; }
+  const devices = r.values.devices || [];
+  const d = devices.find((x) => x.id === remoteSel) || null;
+  if (!d) {
+    const card = $(t(`<div class="card">
+      <h2>先挑一台机器</h2>
+      <p class="hint">这一页对选中的那台干活。登记、删除、打标签在「设备中心」。</p>
+      <div class="row" style="align-items:flex-end">
+        <div style="min-width:280px"><label>设备</label>
+          <select id="pick">{0}</select></div>
+        <button class="btn primary" id="go"{1}>就这台</button>
+      </div>
+    </div>`, [devices.length
+      ? devices.map((x) => `<option value="${esc(x.id)}">${esc(x.name || x.id)} · ${esc(OS_LABEL[x.os] || t('系统未知'))}</option>`).join('')
+      : t('<option value="">（还没有登记的设备）</option>'), devices.length ? '' : ' disabled']));
+    card.querySelector('#go').onclick = () => { rememberSel(card.querySelector('#pick').value); show(); };
+    root.appendChild(card);
+    return;
+  }
+  root.appendChild(build(d));
+}
+async function renderTermPage(root) { await devPageShell(root, (d) => shellCard(d)); }
+async function renderFilesPage(root) { await devPageShell(root, (d) => filesCard(d)); }
+async function renderPlaybookPage(root) { await devPageShell(root, (d) => playbookCard([d], d)); }
 
 // 剧本的状态码 → 界面中文。后端只给码（和判定与账同源的那套规矩一致）。
 const PLAYBOOK_STEP = {
