@@ -301,12 +301,14 @@ header select.lang:hover { color: var(--text); border-color: var(--gold-dim); }
  */
 .shell {
   flex: 1; min-height: 0;
-  display: grid; grid-template-columns: 244px minmax(0, 1fr) 300px;
+  /* 左栏双栏（原型）：44px 图标栏 + 页面树 + 内容 + 检查器 */
+  display: grid; grid-template-columns: 44px 228px minmax(0, 1fr) 300px;
 }
 nav {
   overflow: auto; padding: 10px 8px 20px;
   background: var(--panel); border-right: 1px solid var(--line);
 }
+#nav { display: flex; flex-direction: column; }
 main { overflow: auto; padding: 14px 18px 44px; min-width: 0 }
 #rail {
   overflow: auto; padding: 12px 12px 24px;
@@ -314,13 +316,14 @@ main { overflow: auto; padding: 14px 18px 44px; min-width: 0 }
 }
 
 @media (max-width: 1240px) {
-  .shell { grid-template-columns: 232px minmax(0, 1fr); }
+  .shell { grid-template-columns: 44px 224px minmax(0, 1fr); }
   #rail { display: none; }
 }
-/* 窄到放不下侧栏时，侧栏横过来当一条可滑的页签，主内容仍占满 ——
+/* 窄到放不下侧栏时，图标栏横过来当一条可滑的页签，主内容仍占满 ——
    宁可退化成一条带，也不把导航收进汉堡里（收进去就等于又找不着了）。 */
 @media (max-width: 880px) {
   .shell { display: block; }
+  #railnav { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--line); }
   nav { display: flex; gap: 4px; overflow-x: auto; border-right: 0;
         border-bottom: 1px solid var(--line); padding: 8px; }
   nav .navgrp { display: contents; }
@@ -806,3 +809,84 @@ table.hoverable tr:hover td { background: var(--hover); }
 .emptybox h3 { font-size: 13px; margin: 0 0 6px; color: var(--text); }
 .emptybox p { font-size: 11.5px; color: var(--muted); line-height: 1.7; max-width: 380px; margin: 0 auto 14px; }
 .emptybox .acts { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+
+/* ═══════════ 原型对齐 · 外壳（docs/原型 V.shell）═══════════
+ * 顶栏 = ‹ 返回 + 面包屑 + 新手/专家段 + 搜索 + 任务胶囊；
+ * 左栏 = 图标栏 + 当前组的页面树；状态栏 = ● 连接态 · 工具数 · 模式 · 页工具。 */
+
+/* 顶栏返回钮：原型 toolbar 左一的 ‹ */
+header .backbtn {
+  flex: none; width: 24px; height: 24px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--panel-2);
+  color: var(--muted); font-size: 15px; line-height: 1;
+  display: grid; place-items: center; cursor: pointer;
+}
+header .backbtn:hover { border-color: var(--gold-dim); color: var(--text); }
+/* 面包屑挪进顶栏后：去掉它原来当独立条带的底、框 */
+header #crumbs { padding: 0; border: 0; background: none; font-size: 13px; }
+header .hspacer { flex: 1 1 auto; }
+
+/* 左栏第一列：图标栏。每组一颗，当前入口金底；首页（房子）钉在最上。 */
+#railnav {
+  display: flex; flex-direction: column; gap: 4px; align-items: center;
+  padding: 10px 6px; background: var(--panel); border-right: 1px solid var(--line);
+}
+.railbtn {
+  width: 30px; height: 30px; border-radius: 8px; flex: none;
+  display: grid; place-items: center; color: var(--muted); cursor: pointer;
+  border: 1px solid transparent; background: none;
+}
+.railbtn:hover { background: var(--sunken); color: var(--text); }
+.railbtn.on { background: var(--gold-bg); color: var(--gold); border-color: var(--gold-dim); }
+
+/* 页面树：树头（组名 + N 个页面）+ 条目 + 底部模式提示 */
+.treehead {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 2px 10px 8px;
+}
+.treehead span:first-child { font-weight: 650; font-size: 13.5px; color: var(--text); }
+.treehead .cnt { font-size: 11px; color: var(--muted-2); }
+.treebody { display: flex; flex-direction: column; gap: 3px; }
+.treefoot {
+  margin-top: auto; padding: 10px 10px 0; border-top: 1px solid var(--line-soft);
+  font-size: 11.5px; color: var(--muted-2);
+}
+.treefoot button { color: var(--gold); background: none; border: 0; font: inherit; cursor: pointer; padding: 0; }
+.treefoot button:hover { text-decoration: underline; }
+
+/* 选中条目做成原型那张金底圆角卡（原来是左金条） */
+.navp { border: 1px solid transparent; border-radius: 8px; }
+.navp:hover { background: var(--sunken); border-color: var(--line-soft); }
+.navp.on { border-color: var(--gold-dim); background: var(--gold-bg); color: var(--gold); }
+
+/* 任务胶囊：原型顶栏右一的「● N 个任务在跑」 */
+header .taskbtn.busy {
+  background: var(--gold-bg); color: var(--gold);
+  border-color: var(--gold-dim); border-radius: 99px;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+header .taskbtn.busy .tdot {
+  width: 6px; height: 6px; border-radius: 99px; background: var(--gold);
+  animation: live 1.6s ease-in-out infinite;
+}
+
+/* 状态栏：原型的一排小字（● 已连接 · N 个工具 · 模式 · 当前页工具） */
+.statusbar .seg { display: inline-flex; align-items: center; gap: 6px; }
+.statusbar .sdot { width: 7px; height: 7px; border-radius: 99px; flex: none; }
+.statusbar .sdot.g { background: var(--green); }
+.statusbar .sdot.y { background: var(--gold); }
+.statusbar .sdot.r { background: var(--red); }
+.statusbar .hint { font-size: 12px; color: var(--muted-2); }
+.statusbar .hint kbd {
+  font-size: 10.5px; border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 4px; background: var(--panel-2); color: var(--muted-2);
+}
+.statusbar .f { display: inline-flex; align-items: center; gap: 14px; }
+
+/* 「连一台机器」推荐卡：原型给它金框 + 角标 —— 新手第一件事就该点它 */
+.taskcard.rec { border-color: var(--gold-dim); }
+.taskcard .rec-tag {
+  font-style: normal; font-size: 10.5px; color: var(--gold);
+  background: var(--gold-bg); border: 1px solid var(--gold-dim);
+  border-radius: 99px; padding: 0 7px; margin-left: 7px; vertical-align: 1px;
+}

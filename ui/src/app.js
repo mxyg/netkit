@@ -297,42 +297,79 @@ function navBtn(p) {
   return b;
 }
 
+/*
+ * 左栏双栏（原型版式）：最左一条窄图标栏（railnav），按一级入口切换；
+ * 旁边一棵树只画**当前入口**的页面 —— 组名 + 页面数做树头，条目是页名 + 一句人话说明，
+ * 选中态是金底卡片。底部一行新手模式提示。不再把全部入口平铺成一长列。
+ */
+const RAIL_ICON = {
+  [t('开始')]: 'M8 1.6 14.4 7v7.4H1.6V7Z', // 房子（首页图标同款）
+  [t('网络')]: 'M1.5 6.5C4.5 3 11.5 3 14.5 6.5M3.6 9a6.4 6.4 0 0 1 8.8 0M6 11.4a3 3 0 0 1 4 0M8 13.6h.01',
+  [t('设备')]: 'M1.8 3.6h12.4v7.2H1.8ZM5.6 13.6h4.8',
+  [t('修复')]: 'M9.5 2.2a3.8 3.8 0 0 0-4.9 4.9L1.8 9.9v4.3h4.3l2.8-2.8a3.8 3.8 0 0 0 4.9-4.9L10.6 9.7 6.3 5.4Z',
+  [t('工具')]: 'M10.4 2.1a4 4 0 0 0-4.9 5L2 10.6v3.4h3.4l3.5-3.5a4 4 0 0 0 5-4.9L11.5 8 8 4.5Z',
+  [t('设置')]: 'M8 5.4A2.6 2.6 0 1 0 8 10.6 2.6 2.6 0 0 0 8 5.4ZM8 1.5l.7 2 2-.5 1.4 1.4-.5 2 2 .7v.4l-2 .7.5 2-1.4 1.4-2-.5-.7 2h-.4l-.7-2-2 .5L3 11.7l.5-2-2-.7v-.4l2-.7-.5-2L4.4 3l2 .5.7-2Z',
+};
+function railIco(k) {
+  return `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="${RAIL_ICON[k] || RAIL_ICON[t('工具')]}"/></svg>`;
+}
 function renderNav() {
+  const railnav = document.getElementById('railnav');
   const nav = document.getElementById('nav');
-  nav.innerHTML = '';
-  const top = document.createElement('div');
-  top.className = 'navtop';
-  for (const p of PAGES) if (p.pin && inMode(p)) top.appendChild(navBtn(p));
-  nav.appendChild(top);
-  for (const g of GROUPS) {
-    const items = PAGES.filter((p) => p.g === g && !p.pin && inMode(p));
-    if (!items.length) continue;
-    const sec = document.createElement('div');
-    sec.className = 'navgrp';
-    const h = document.createElement('button');
-    h.type = 'button';
-    h.className = 'navgh' + (navOpen[g] === false ? ' closed' : '');
-    const car = document.createElement('span');
-    car.className = 'car';
-    car.textContent = '▾';
-    h.appendChild(car);
-    h.appendChild(document.createTextNode(g));
-    h.onclick = () => {
-      navOpen[g] = navOpen[g] === false ? true : false;
-      try { localStorage.setItem(NAVOPEN_KEY, JSON.stringify(navOpen)); } catch (_) { /* 存不上就这一趟不记住 */ }
-      renderNav();
-    };
-    sec.appendChild(h);
-    if (navOpen[g] !== false) {
-      let proDone = false;
-      for (const p of items) {
-        // PRO 分隔小标：往下是专家才露的条目（只有专家模式里会出现）。
-        if (p.pro && !proDone) { sec.appendChild(proSep()); proDone = true; }
-        sec.appendChild(navBtn(p));
-      }
+  if (railnav) {
+    railnav.innerHTML = '';
+    // 首页是钉死的第一颗图标（原型 rail 顶上那颗房子），下面按入口排。
+    const home = PAGES.find((x) => x.pin);
+    if (home) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'railbtn' + (current === home.id ? ' on' : '');
+      b.title = home.name;
+      b.innerHTML = railIco(home.g);
+      b.onclick = () => goto(home.id);
+      railnav.appendChild(b);
     }
-    nav.appendChild(sec);
+    for (const g of GROUPS) {
+      if (!PAGES.some((x) => x.g === g && inMode(x))) continue;
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'railbtn' + (group === g && current !== (home || {}).id ? ' on' : '');
+      b.title = g;
+      b.innerHTML = railIco(g);
+      b.onclick = () => {
+        const first = PAGES.find((x) => x.g === g && inMode(x) && !x.pro) || PAGES.find((x) => x.g === g && inMode(x));
+        if (first) goto(first.id);
+      };
+      railnav.appendChild(b);
+    }
   }
+  if (!nav) return;
+  nav.innerHTML = '';
+  const g = group || PAGES[0].g;
+  const inGroup = PAGES.filter((x) => x.g === g && inMode(x));
+  if (!inGroup.length) return;
+  const head = document.createElement('div');
+  head.className = 'treehead';
+  head.innerHTML = `<span>${esc(g)}</span><span class="cnt">${inGroup.length} ${esc(t('个页面'))}</span>`;
+  nav.appendChild(head);
+  const body = document.createElement('div');
+  body.className = 'treebody';
+  let proDone = false;
+  for (const p of inGroup) {
+    if (p.pro && !proDone && mode === 'pro') { body.appendChild(proSep()); proDone = true; }
+    body.appendChild(navBtn(p));
+  }
+  nav.appendChild(body);
+  const foot = document.createElement('div');
+  foot.className = 'treefoot';
+  foot.innerHTML = mode === 'simple'
+    ? `${esc(t('新手模式提示'))} <button id="topro">${esc(t('切到专家模式'))}</button>`
+    : `${esc(t('专家模式'))} · <button id="tosimple">${esc(t('切回新手'))}</button>`;
+  nav.appendChild(foot);
+  const tp = foot.querySelector('#topro');
+  if (tp) tp.onclick = () => setMode('pro');
+  const ts = foot.querySelector('#tosimple');
+  if (ts) ts.onclick = () => setMode('simple');
 }
 
 function proSep() {
@@ -362,36 +399,50 @@ function renderCrumbs(p) {
   el.appendChild(here);
 }
 
-/* 底部状态栏：工具数 / 模式 / 所在页 / 后端地址，全是现算的事实。 */
+/* 底部状态栏：对齐原型 —— ● 连接态 · 工具数 / 模式 / 当前页工具 / 快捷键 / 后端地址。
+   连接态是 boot 里的 fetch 事实，工具数从能力表现算 —— 写死一个数就是埋一颗雷。 */
+let CONN_TEXT = t('连接中…');
+let CONN_OK = null; // null=还在连，true=已连上，false=连不上
 function renderStatusbar() {
   const bar = document.getElementById('statusbar');
   if (!bar) return;
   bar.innerHTML = '';
-  const seg = () => bar.appendChild(document.createElement('span'));
-  seg().innerHTML = `<b>${TOOLS.length}</b> ${esc(t('个工具'))}`;
+  const seg = () => { const s = document.createElement('span'); s.className = 'seg'; bar.appendChild(s); return s; };
+  const dotCls = CONN_OK === true ? 'g' : CONN_OK === false ? 'r' : 'y';
+  seg().innerHTML = `<span class="sdot ${dotCls}"></span> ${esc(CONN_TEXT)} · <b>${TOOLS.length}</b> ${esc(t('个工具'))}`;
   const sepEl = () => { const s = document.createElement('span'); s.className = 'sep'; s.textContent = '·'; bar.appendChild(s); };
   sepEl();
   seg().innerHTML = `${esc(t('模式'))} <b>${esc(mode === 'pro' ? t('专家') : t('新手'))}</b>`;
   sepEl();
   const p = PAGES.find((x) => x.id === current) || PAGES[0];
-  seg().textContent = `${p.g ? p.g + ' / ' : ''}${p.name}`;
+  const rec = PIDX[p.id] || PIDX[p.alias] || { tools: [] };
+  seg().textContent = `${t('当前页')} ${(rec.tools || []).length} ${t('个工具')}`;
   const f = document.createElement('span');
   f.className = 'f';
-  f.innerHTML = `<code>${esc(API || '')}</code>`;
+  // 快捷键提示（⌘K 搜一切）。⌘/ 快捷键面板是原型里的件，产品还没这页 —— 没有的不放假按钮。
+  f.innerHTML = `<span class="hint"><kbd>⌘K</kbd> ${esc(t('搜一切'))}</span><code>${esc(API || '')}</code>`;
   bar.appendChild(f);
 }
 
 /** 跳去某一页；opts.card / opts.ent 到了那一页再生效（见 applyPending）。 */
 let pending = null;
+/* 页面级后退栈：顶栏那颗 ‹ 用（原型 toolbar 左一）。只记页 id，不记参数。 */
+const BACKS = [];
 function goto(id, opts) {
   const p = PAGES.find((x) => x.id === id);
   if (!p) return;
   pending = opts || null;
   if (id === current) { show(); return; }
+  BACKS.push(current);
+  if (BACKS.length > 50) BACKS.shift();
   current = id;
   group = p.g;
   renderNav();
   show();
+}
+function goBack() {
+  const prev = BACKS.pop();
+  if (prev) goto(prev);
 }
 
 /** 换页要断掉的轮询。★ 少断一个，就是拿别人的屏幕当轮询靶子（下面逐条写了为什么）。 */
@@ -428,7 +479,14 @@ async function show() {
   noteSeen(p.id);
   main.className = GRID.has(p.id) ? 'grid' : '';
   main.innerHTML = '';
-  if (p.id !== 'home') main.appendChild(pageHead(p));
+  main.appendChild(pageHead(p));
+  // ★ 外壳（导航/检查器/面包屑/状态栏）先画，页面内容后填 ——
+  //   总览的健康环要等约 20 秒的体检，等它回来才画面包屑的话，
+  //   人会盯着一条没有地址、没有状态的空壳子发呆。
+  renderNav();
+  renderRail(p);
+  renderCrumbs(p);
+  renderStatusbar();
   try {
     await p.render(main);
   } catch (e) {
@@ -436,9 +494,6 @@ async function show() {
   }
   bindEnts(main);
   decorate(main);
-  renderRail(p);
-  renderCrumbs(p);
-  renderStatusbar();
   applyPending();
 }
 
@@ -448,6 +503,25 @@ function pageHead(p) {
   el.className = 'pagehead';
   const ask = PAGE_ASK[p.id];
   el.innerHTML = `<h2>${esc(p.name)}</h2>` + (ask ? `<p class="ask">${esc(ask)}</p>` : '');
+  // 原型首页也有页头：页名 + 说明，右侧「一键体检 / 导出诊断包」。
+  if (p.id === 'home') {
+    el.style.cssText = 'display:flex;align-items:baseline;gap:12px';
+    const askEl = el.querySelector('.ask');
+    if (askEl) askEl.style.margin = '0';
+    const acts = document.createElement('div');
+    acts.style.cssText = 'display:flex;align-items:center;gap:8px;margin-left:auto';
+    const b1 = document.createElement('button');
+    b1.type = 'button'; b1.className = 'btn';
+    b1.textContent = t('一键体检');
+    b1.onclick = () => goto('checkup');
+    const b2 = document.createElement('button');
+    b2.type = 'button'; b2.className = 'btn pri';
+    b2.textContent = t('导出诊断包');
+    b2.onclick = () => goto('checkup');
+    acts.append(b1, b2);
+    el.appendChild(acts);
+    return el;
+  }
   const idx = (typeof PAGE_INDEX === 'object' && PAGE_INDEX) || {};
   const rec = idx[p.id] || (p.alias ? idx[p.alias] : null) || {};
   const refs = rec.refs || [];
@@ -1209,7 +1283,14 @@ function paintTaskBadge() {
   const btn = document.getElementById('taskbtn');
   if (!btn) return;
   const n = runningNow.length + BATCH_RUNS.filter((x) => !x.done).length;
-  btn.textContent = n ? t('任务中心（{0}）', [n]) : t('任务中心');
+  // 原型顶栏那颗任务胶囊：有在跑的 = 「● N 个任务在跑」金字；空闲 = 「任务中心」普通钮。
+  if (n) {
+    btn.classList.add('busy');
+    btn.innerHTML = `<span class="tdot"></span>${esc(t('{0} 个任务在跑', [n]))}`;
+  } else {
+    btn.classList.remove('busy');
+    btn.textContent = t('任务中心');
+  }
 }
 
 function closeTaskPanel() {
@@ -1399,7 +1480,7 @@ function toggleTaskPanel() {
  */
 const HOME_TASKS = [
   { id: 'checkup', d: 'M2 8h12M8 2c2 2 2 10 0 12M8 2c-2 2-2 10 0 12', title: t('网通不通？'), sub: t('查本机地址、路由、出网，30 秒出结论'), page: 'checkup' },
-  { id: 'devices', d: 'M1.8 3.6h12.4v7.2H1.8zM5.6 13.6h4.8', title: t('连一台机器'), sub: t('终端、文件、桌面，都在这一扇窗里'), page: 'remote-work' },
+  { id: 'devices', rec: true, d: 'M1.8 3.6h12.4v7.2H1.8zM5.6 13.6h4.8', title: t('连一台机器'), sub: t('终端、文件、桌面，都在这一扇窗里'), page: 'remote-work' },
   { id: 'capture', d: 'M8 2v7m0 0 3-3m-3 3L5 6M2 12h12', title: t('抓个包看看'), sub: t('不用懂过滤语法，先看清楚再说'), page: 'capture' },
   { id: 'trouble', d: 'M8 1.8 13 3.8v4.4c0 3.1-2.4 4.8-5 5.2-2.6-.4-5-2.1-5-5.2V3.8z', title: t('出问题了'), sub: t('说一句现象，按症状一步步查'), page: 'trouble' },
 ];
@@ -1431,12 +1512,21 @@ async function renderHome(root) {
   for (const x of HOME_TASKS) {
     const b = document.createElement('button');
     b.type = 'button';
-    b.className = 'taskcard';
-    b.innerHTML = `<span class="ti-ic">${taskIco(x.d)}</span><b>${esc(x.title)}</b><span>${esc(x.sub)}</span><span class="go">${esc(t('开始 ›'))}</span>`;
+    b.className = 'taskcard' + (x.rec ? ' rec' : '');
+    b.innerHTML = `<span class="ti-ic">${taskIco(x.d)}</span><b>${esc(x.title)}${x.rec ? `<i class="rec-tag">${esc(t('推荐'))}</i>` : ''}</b><span>${esc(x.sub)}</span><span class="go">${esc(t('开始 ›'))}</span>`;
     b.onclick = () => goto(x.page);
     cards.appendChild(b);
   }
   root.appendChild(cards);
+
+  // ★ 先挂卡再填数：健康/设备/审计都是后走网络的事（体检约 20 秒），
+  //   等回来才挂节点的话，头 20 秒页面下半区是一片空白 —— 先占位，回来再填。
+  const skel = () => {
+    const d = document.createElement('div');
+    d.className = 'hint';
+    d.textContent = t('问着呢…');
+    return d;
+  };
 
   // 第二排：网络健康 + 正在跑
   const g1 = document.createElement('div');
@@ -1444,25 +1534,40 @@ async function renderHome(root) {
   g1.style.cssText = 'margin-top:14px;align-items:stretch';
   g1.style.flexWrap = 'wrap';
   g1.style.gap = '12px';
-  g1.appendChild(await homeHealth());
-  g1.appendChild(homeRunning());
+  const healthCard = document.createElement('div');
+  healthCard.className = 'card';
+  healthCard.style.cssText = 'flex:1.1 1 380px;min-width:0';
+  healthCard.appendChild(skel());
+  g1.append(healthCard, homeRunning());
   root.appendChild(g1);
+  homeHealth(healthCard).catch((e) => { healthCard.innerHTML = `<p class="hint">${esc(String(e && e.message || e))}</p>`; });
 
   // 第三排：设备一览 + 最近动作
   const g2 = document.createElement('div');
   g2.className = 'row';
   g2.style.cssText = 'margin-top:12px;align-items:stretch;flex-wrap:wrap;gap:12px';
-  g2.appendChild(await homeDeviceTable());
-  g2.appendChild(await homeAudit());
+  const devCard = document.createElement('div');
+  devCard.className = 'card';
+  devCard.style.cssText = 'flex:1.2 1 420px;min-width:0';
+  devCard.appendChild(skel());
+  const audCard = document.createElement('div');
+  audCard.className = 'card';
+  audCard.style.cssText = 'flex:1 1 320px;min-width:0';
+  audCard.appendChild(skel());
+  g2.append(devCard, audCard);
   root.appendChild(g2);
+  homeDeviceTable(devCard).catch((e) => { devCard.innerHTML = `<p class="hint">${esc(String(e && e.message || e))}</p>`; });
+  homeAudit(audCard).catch((e) => { audCard.innerHTML = `<p class="hint">${esc(String(e && e.message || e))}</p>`; });
 }
 
 /** 网络健康卡：环中心是判定词（原型那个 87 分后端没有 —— 没有的数不编），
- *  四行指标：出网 RTT / 丢包 / 流量占用 / 时钟偏差，全部 checkup·bandwidth 现量。 */
-async function homeHealth() {
-  const card = document.createElement('div');
+ *  四行指标：出网 RTT / 丢包 / 流量占用 / 时钟偏差，全部 checkup·bandwidth 现量。
+ *  host 由调用方先挂好（骨架先行），这里只往里填。 */
+async function homeHealth(host) {
+  const card = host || document.createElement('div');
   card.className = 'card';
   card.style.cssText = 'flex:1.1 1 380px;min-width:0';
+  card.innerHTML = '';
   const ch = document.createElement('div');
   ch.className = 'ch';
   const title = document.createElement('span');
@@ -1638,10 +1743,11 @@ function homeRunning() {
 }
 
 /** 设备一览表：remote.device.list 现拉，状态点按最近探测的远近给（远就黄，没连过就灰）—— 不编「在线」。 */
-async function homeDeviceTable() {
-  const card = document.createElement('div');
+async function homeDeviceTable(host) {
+  const card = host || document.createElement('div');
   card.className = 'card';
   card.style.cssText = 'flex:1 1 380px;min-width:0';
+  card.innerHTML = '';
   const ch = document.createElement('div');
   ch.className = 'ch';
   ch.innerHTML = `${esc(t('设备一览'))} <span class="sub">${esc(t('本机 + 远程登记'))}</span><button class="btn sm ghost" style="margin-left:auto">${esc(t('打开'))} →</button>`;
@@ -1665,10 +1771,11 @@ async function homeDeviceTable() {
 }
 
 /** 最近动作卡：remote.audit.tail 现拉，点行去审计页。 */
-async function homeAudit() {
-  const card = document.createElement('div');
+async function homeAudit(host) {
+  const card = host || document.createElement('div');
   card.className = 'card';
   card.style.cssText = 'flex:1 1 380px;min-width:0';
+  card.innerHTML = '';
   const ch = document.createElement('div');
   ch.className = 'ch';
   ch.innerHTML = `${esc(t('最近动作'))} <span class="sub">${esc(t('审计'))}</span><button class="btn sm ghost" style="margin-left:auto">${esc(t('打开'))} →</button>`;
@@ -10808,14 +10915,15 @@ function renderPlaybooks(root) {
   if (tb) tb.onclick = () => cycleTheme();
   renderModeSeg();
   API = await window.netkit.apiBase();
-  const c = document.getElementById('conn');
-  // 这一格写的是 t() 的结果，换语言靠整页重跑过来（i18n.js 的 setLang），
-  // 所以这里只要起步时填一次 —— 不需要再留一个「换语言时重画顶栏」的钩子。
+  // 连接态事实源：写进状态栏第一格（原型那颗「● 后端已连接」）。
+  // ● 颜色三态：绿=已连上，黄=还在连，红=连不上。
   const setConn = async () => {
     try {
       const r = await fetch(`${API}/ots`).then((x) => x.json());
-      c.textContent = t('已连接 · {0} · 规范 {1}', [r.conformance, r.specVersion]);
-    } catch { c.textContent = t('后端没连上'); }
+      CONN_TEXT = t('已连接 · {0} · 规范 {1}', [r.conformance, r.specVersion]);
+      CONN_OK = true;
+    } catch { CONN_TEXT = t('后端没连上'); CONN_OK = false; }
+    renderStatusbar();
   };
   await setConn();
 
@@ -10837,6 +10945,10 @@ function renderPlaybooks(root) {
   // 任务中心钮：文字在这儿现填（要过词典）。
   const tk = document.getElementById('taskbtn');
   if (tk) tk.onclick = () => toggleTaskPanel();
+
+  // 顶栏返回钮：页面级后退（BACKS 在 goto 里记账）。
+  const bb = document.getElementById('backbtn');
+  if (bb) { bb.title = t('返回上一页'); bb.onclick = () => goBack(); }
 
   // ★ 能力表先到手，第一屏才敢报数、搜索才搜得到工具名 —— 这一步失败也只是清单空着，
   //   界面照样起（总览那一块写明是「后端没报出能力表」，不拿空表冒充「这台没功能」）。
