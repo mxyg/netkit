@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -37,7 +38,16 @@ func Serve(addr, token string) error {
 			http.Error(w, "no", http.StatusUnauthorized)
 			return
 		}
-		jpg, err := FrameJPEG()
+		// 画质/宽度走查询参数（q 30–95，maxw 480 起）。旧版被控端不认识这两个
+		// 参数也不会炸 —— ServeMux 只分发路径，不碰查询串。
+		quality, maxWidth := 82, 1280
+		if v, err := strconv.Atoi(r.URL.Query().Get("q")); err == nil && v > 0 {
+			quality = v
+		}
+		if v, err := strconv.Atoi(r.URL.Query().Get("maxw")); err == nil && v > 0 {
+			maxWidth = v
+		}
+		jpg, err := FrameJPEGOpts(quality, maxWidth)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

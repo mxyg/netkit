@@ -30,6 +30,10 @@ func RegisterRemote(r *ots.Registry) {
 		remoteConfigGetTool, remoteConfigSetTool, remoteAuditTool,
 		winsshStartTool, winsshStatusTool, winsshStopTool,
 		deskOpenTool, deskFrameTool, deskInputTool, deskDropTool, deskCloseTool,
+		deskOptionsTool, deskClipboardTool, deskClipboardSetTool,
+		shellOpenTool, shellReadTool, shellWriteTool, shellCloseTool,
+		fileListTool, fileMkdirTool, fileRemoveTool, fileRenameTool,
+		deviceGroupTool, taskRunTool, taskStatusTool,
 	)
 }
 

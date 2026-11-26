@@ -24,6 +24,7 @@ type Device struct {
 	HostKey string `json:"hostKey,omitempty"`
 
 	OS       string    `json:"os,omitempty"` // windows / linux / darwin / unknown
+	Tags     []string  `json:"tags,omitempty"`
 	Identity *Identity `json:"identity,omitempty"`
 	AddedAt  time.Time `json:"addedAt"`
 	LastSeen time.Time `json:"lastSeen,omitempty"`
@@ -52,6 +53,7 @@ func (d *Device) Public() map[string]any {
 		"id": d.ID, "name": d.Name, "host": d.Host, "port": d.Port, "user": d.User,
 		"auth":     authKind(d),
 		"os":       d.OS,
+		"tags":     d.Tags,
 		"addedAt":  d.AddedAt.Format(time.RFC3339),
 		"identity": d.Identity,
 	}

@@ -66,12 +66,28 @@ type bitmapInfoHeader struct {
 }
 
 // FrameJPEG 抓当前屏幕，缩到不超过 1280 宽，压成 JPEG。
-func FrameJPEG() ([]byte, error) {
+func FrameJPEG() ([]byte, error) { return FrameJPEGOpts(82, 1280) }
+
+// FrameJPEGOpts 抓当前屏幕，缩到不超过 maxWidth 宽，按 quality 压 JPEG。
+// quality 30–95、maxWidth 480–屏幕原宽之外的范围都收敛进边界 —— 控制端传什么都不炸。
+func FrameJPEGOpts(quality, maxWidth int) ([]byte, error) {
 	w, _, _ := procGetMetrics.Call(0)
 	h, _, _ := procGetMetrics.Call(1)
 	width, height := int(w), int(h)
 	if width < 16 || height < 16 {
 		return nil, errors.New("拿不到屏幕尺寸")
+	}
+	if quality < 30 {
+		quality = 30
+	}
+	if quality > 95 {
+		quality = 95
+	}
+	if maxWidth < 480 {
+		maxWidth = 480
+	}
+	if maxWidth > width {
+		maxWidth = width
 	}
 	hwnd, _, _ := procGetDesktop.Call()
 	hdc, _, _ := procGetDC.Call(hwnd)
@@ -99,8 +115,8 @@ func FrameJPEG() ([]byte, error) {
 	procBitBlt.Call(mem, 0, 0, uintptr(width), uintptr(height), hdc, 0, 0, srcCopy)
 	raw := unsafe.Slice((*byte)(unsafe.Pointer(bits)), width*height*4)
 	step := 1
-	if width > 1920 {
-		step = (width + 1919) / 1920
+	if width > maxWidth {
+		step = (width + maxWidth - 1) / maxWidth
 	}
 	outW, outH := width/step, height/step
 	out := image.NewRGBA(image.Rect(0, 0, outW, outH))
@@ -115,7 +131,7 @@ func FrameJPEG() ([]byte, error) {
 		}
 	}
 	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: 82}); err != nil {
+	if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: quality}); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

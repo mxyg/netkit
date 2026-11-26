@@ -28,6 +28,10 @@ var deskSessions = struct {
 type deskSession struct {
 	Host  string
 	Token string
+
+	// 画质参数（remote.desk.options 改这里；旧版被控端会忽略，照旧默认画质）。
+	quality  int // JPEG 质量 30–95
+	maxWidth int // 画面最大宽度像素
 }
 
 func init() {
@@ -73,7 +77,7 @@ var deskOpenTool = ots.Tool{
 			return nil, ots.Errf(ots.ErrUnreachable, "%s", err)
 		}
 		deskSessions.mu.Lock()
-		deskSessions.m[d.ID] = deskSession{Host: d.Host, Token: token}
+		deskSessions.m[d.ID] = deskSession{Host: d.Host, Token: token, quality: 82, maxWidth: 1280}
 		deskSessions.mu.Unlock()
 		mgr.Audit(ots.CallerFrom(ctx), "desk.open", d.ID, d.Host, "ok")
 		return ots.Verdict{Code: "desk-open", Values: map[string]any{"device": d.ID, "host": d.Host},
@@ -98,7 +102,12 @@ var deskFrameTool = ots.Tool{
 		if !ok {
 			return nil, ots.Errf(ots.ErrInvalidArgument, "这台还没打开画面，先 remote.desk.open")
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:%d/frame.jpg", s.Host, desk.Port), nil)
+		// 会话上记的画质参数随帧走；旧版被控端不认识这两个参数，会照旧默认画质。
+		url := fmt.Sprintf("http://%s:%d/frame.jpg", s.Host, desk.Port)
+		if s.quality > 0 && s.maxWidth > 0 {
+			url += fmt.Sprintf("?q=%d&maxw=%d", s.quality, s.maxWidth)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, ots.Errf(ots.ErrInternal, "%s", err)
 		}
