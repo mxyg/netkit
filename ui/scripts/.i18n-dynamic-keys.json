@@ -1,3 +1,12 @@
 {
- "src/i18n.js:91  t(el.dataset.zh)": "index.html 里带 data-i18n 的元素文字，运行时才当作键（applyStatic 把 textContent 存进 data-zh 再 t()）。它对应的每一句中文原文已经被 scripts/i18n-audit.cjs 的 htmlKeys() 从 HTML 里读出来并进了字面量分母，所以这一处动态键不再藏覆盖率；漏标 data-i18n 的中文文字则由同处的 unmarked 判据直接报红。"
+ "src/app.js  t(spec.card)": "fillEnt 拿 spec.card（entActions 给的卡片中文键）经 t() 找当页译名卡片：键本身不直接上屏，漏译时 t() 回落原键，卡片定位不炸",
+ "src/app.js  t(q.card)": "applyPending 对 pending.card（同样来自 entActions/⌘K 记录的卡片中文键）做同一件事；键身份来自卡片索引，不新增分母",
+ "src/app.js  t(c)": "renderRail 的 c 取自 HOST[tn].card，即 page-index 生成时卡片标题的中文原文；t() 找译名上屏，与卡片 h2 同键同词典",
+ "src/app.js  t(c.t)": "⌘K 候选项 title: t(c.t)：c.t 是 page-index 卡片标题中文原文（page-index.js 生成），动态来源，键在词典里由卡片 h2 那份承担",
+ "src/app.js  t(h.card || '')": "工具候选行副标题：h.card 是工具挂在哪张卡的中文原文（HOST 索引），空串时 t('') 回落空串",
+ "src/app.js  t(it.card)": "⌘K pick 时按候选记录里的卡片键 t() 定位卡片，同上",
+ "src/app.js  t(h.card)": "⌘K pick 工具分支：按 HOST 记录的卡片键 t() 定位，同上",
+ "src/app.js  t(tip)": "REMOTE_TABS 常量三元组 [id,name,tip]，tip 是子页签提示的中文原文键；常量定义在 IIFE 之外提取器看不见，键本身已进词典（子页签文案在分片里）",
+ "src/app.js  t(name)": "REMOTE_TABS 常量的子页签名，同 tip：中文原文当键，t() 找译名上屏",
+ "src/i18n.js  t(el.dataset.zh)": "index.html 里带 data-i18n 的元素文字，运行时才当作键（applyStatic 把 textContent 存进 data-zh 再 t()）。它对应的每一句中文原文已经被 scripts/i18n-audit.cjs 的 htmlKeys() 从 HTML 里读出来并进了字面量分母，所以这一处动态键不再藏覆盖率；漏标 data-i18n 的中文文字则由同处的 unmarked 判据直接报红。"
 }

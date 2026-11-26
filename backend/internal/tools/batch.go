@@ -107,19 +107,19 @@ type batchTask struct {
 }
 
 type batchResult struct {
-	Device   string `json:"device"`
-	OK       bool   `json:"ok"`
-	Code     string `json:"code"`
-	ExitCode int    `json:"exitCode,omitempty"`
-	Stdout   string `json:"stdout,omitempty"`
-	Stderr   string `json:"stderr,omitempty"`
-	Err      string `json:"err,omitempty"`
+	Device   string  `json:"device"`
+	OK       bool    `json:"ok"`
+	Code     string  `json:"code"`
+	ExitCode int     `json:"exitCode,omitempty"`
+	Stdout   string  `json:"stdout,omitempty"`
+	Stderr   string  `json:"stderr,omitempty"`
+	Err      string  `json:"err,omitempty"`
 	Seconds  float64 `json:"seconds,omitempty"`
 }
 
 var batchTasks = struct {
-	mu sync.Mutex
-	m  map[string]*batchTask
+	mu    sync.Mutex
+	m     map[string]*batchTask
 	order []string
 }{m: map[string]*batchTask{}}
 
@@ -177,9 +177,9 @@ var taskRunTool = ots.Tool{
 			return nil, err
 		}
 		var a struct {
-			Devices   []string
-			Tag       string
-			Command   string
+			Devices    []string
+			Tag        string
+			Command    string
 			TimeoutSec int
 		}
 		if err := json.Unmarshal(nonEmpty(raw), &a); err != nil {
@@ -295,8 +295,8 @@ func hasTag(tags []string, want string) bool {
 // ── remote.task.status（read）──
 
 var taskStatusTool = ots.Tool{
-	Name:  "remote.task.status",
-	Class: ots.ClassRead,
+	Name:    "remote.task.status",
+	Class:   ots.ClassRead,
 	Summary: "拉一个批量任务的进度：跑完几台、每台的退出码和输出。done=true 就是全部跑完。",
 	Schema: json.RawMessage(`{
 	  "type": "object", "additionalProperties": false, "required": ["task"],

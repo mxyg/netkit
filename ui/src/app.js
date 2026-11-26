@@ -758,20 +758,20 @@ function entActions(kind, value) {
   const ip = bare(value);
   if (kind === 'mac') {
     return [
-      [t('查这个 MAC 的来路'), { page: 'tools', card: 'MAC 地址', kind: 'mac', value }],
-      [t('把它叫醒（Wake-on-LAN）'), { page: 'device', card: 'Wake-on-LAN 唤醒', kind: 'mac', value }],
-      [t('只抓它的包'), { page: 'capture', card: '这一张流表', kind: 'filter', value }],
+      [t('查这个 MAC 的来路'), { page: 'tools', card: 'MAC 地址', kind: 'mac', value }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('把它叫醒（Wake-on-LAN）'), { page: 'device', card: 'Wake-on-LAN 唤醒', kind: 'mac', value }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('只抓它的包'), { page: 'capture', card: '这一张流表', kind: 'filter', value }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
     ];
   }
   if (kind === 'addr') {
     return [
-      [t('ping 它'), { page: 'connect', card: 'ping 一个地址', kind: 'addr', value: ip }],
-      [t('探它的端口'), { page: 'connect', card: '扫一片端口', kind: 'addr', value: ip }],
-      [t('看它中间走几跳'), { page: 'path', card: '路径追踪', kind: 'addr', value: ip }],
-      [t('它是哪台设备'), { page: 'device', card: '问一遍：这些地址是哪台设备', kind: 'addr', value: ip }],
-      [t('去它走哪块网卡'), { page: 'nic', card: '路由表', kind: 'addr', value: ip }],
-      [t('当网站问一次'), { page: 'service', card: '网页 / 接口探测', kind: 'url', value: `http://${ip}/` }],
-      [t('只抓它的包'), { page: 'capture', card: '这一张流表', kind: 'filter', value: ip }],
+      [t('ping 它'), { page: 'connect', card: 'ping 一个地址', kind: 'addr', value: ip }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('探它的端口'), { page: 'connect', card: '扫一片端口', kind: 'addr', value: ip }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('看它中间走几跳'), { page: 'path', card: '路径追踪', kind: 'addr', value: ip }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('它是哪台设备'), { page: 'device', card: '问一遍：这些地址是哪台设备', kind: 'addr', value: ip }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('去它走哪块网卡'), { page: 'nic', card: '路由表', kind: 'addr', value: ip }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('当网站问一次'), { page: 'service', card: '网页 / 接口探测', kind: 'url', value: `http://${ip}/` }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
+      [t('只抓它的包'), { page: 'capture', card: '这一张流表', kind: 'filter', value: ip }], // i18n:source-match（卡片键：拿去和卡片索引的中文原文对身份，上屏另有 t() 那份）
     ];
   }
   return [];

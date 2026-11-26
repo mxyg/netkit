@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"os/exec"
 	"runtime"
@@ -368,11 +369,28 @@ func Test超时把已走到的跳带回来(t *testing.T) {
 func skipWithoutTrace(t *testing.T) {
 	t.Helper()
 	for _, argv := range traceCommands(runtime.GOOS, "v4", 5, 1, "127.0.0.1") {
-		if _, err := exec.LookPath(argv[0]); err == nil {
+		if _, err := exec.LookPath(argv[0]); err != nil {
+			continue
+		}
+		// ★ LookPath 只证明「文件在」，不证明「跑得起来」：macOS 的 traceroute
+		//   是 setuid 二进制，在被管控的会话里 exec 会 EPERM（operation not permitted）
+		//   —— 只查路径的机器测一回挂一回，出包闸门也跟着卡死。真试跑一次才算数。
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+		cancel()
+		if err == nil || isTraceExitErr(err) {
+			// 跑通了（或命令真的执行了只是返回非零，比如对回环不响应）→ 这台机器能测
 			return
 		}
 	}
-	t.Skip("这台机器上没有可用的追踪命令")
+	t.Skip("这台机器上没有真的能跑的追踪命令（不在、或跑不动）")
+}
+
+// isTraceExitErr 区分「命令真执行了但退出非零」与「根本没执行成」：
+// 前者说明 exec 本身没问题（退出码的差异由被测逻辑兜），后者才跳过。
+func isTraceExitErr(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
 }
 
 func Test追本机(t *testing.T) {

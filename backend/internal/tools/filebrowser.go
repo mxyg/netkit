@@ -121,8 +121,8 @@ var fileListTool = ots.Tool{
 // ── remote.file.mkdir（mutate）──
 
 var fileMkdirTool = ots.Tool{
-	Name:  "remote.file.mkdir",
-	Class: ots.ClassMutate,
+	Name:    "remote.file.mkdir",
+	Class:   ots.ClassMutate,
 	Summary: "在远端建目录（连带父目录一起建，MkdirAll 语义）。",
 	Schema: json.RawMessage(`{
 	  "type": "object", "additionalProperties": false, "required": ["device", "path"],
@@ -245,8 +245,8 @@ var fileRemoveTool = ots.Tool{
 // ── remote.file.rename（mutate）──
 
 var fileRenameTool = ots.Tool{
-	Name:  "remote.file.rename",
-	Class: ots.ClassMutate,
+	Name:    "remote.file.rename",
+	Class:   ots.ClassMutate,
 	Summary: "远端改名/挪位置（同盘 rename）。目标名已存在时拒绝 —— 不悄悄覆盖。",
 	Schema: json.RawMessage(`{
 	  "type": "object", "additionalProperties": false, "required": ["device", "from", "to"],
