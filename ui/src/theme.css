@@ -605,3 +605,25 @@ header .themebtn:hover { color: var(--text); border-color: var(--gold-dim); }
 .statusbar b { color: var(--text); font-weight: 600; }
 .statusbar .f { margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
 .statusbar code { font-size: 11.5px; color: var(--muted-2); }
+
+/* 设备详情的子页签条：概览 / 终端 / 文件 / 桌面 / 剧本 / 审计。
+   切签不走整页重绘 —— 终端会话在切走时照跑。 */
+.devtabs {
+  display: flex; gap: 6px; flex-wrap: wrap;
+  border-bottom: 1px solid var(--line-soft); padding-bottom: 10px;
+}
+.devtab {
+  border: 1px solid var(--line); border-radius: 7px;
+  background: var(--panel-2); color: var(--muted);
+  font: inherit; font-size: 13px; padding: 5px 14px; cursor: pointer;
+}
+.devtab:hover { color: var(--text); border-color: var(--gold-dim); }
+.devtab.on { background: var(--gold-bg); color: var(--gold); border-color: var(--gold-dim); font-weight: 600; }
+
+/* 终端子页的那块输出：等宽、可滚、随主题走。 */
+.term {
+  background: var(--sunken); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px;
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.5;
+  height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+}

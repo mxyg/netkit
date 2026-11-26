@@ -91,10 +91,10 @@ const PAGES = [
   { g: t('网络'), pro: true, id: 'topo', name: t('拓扑图'), render: renderTopo },
   { g: t('网络'), pro: true, id: 'device', name: t('设备是谁'), render: renderDevice },
 
-  { g: t('设备'), id: 'remote', name: t('远程设备与审计'), render: renderRemote,
-    desc: t('登记过的机器、刚才对哪台做过什么') },
-  { g: t('设备'), id: 'remote-work', name: t('连上去干活'), render: renderRemoteWork,
-    desc: t('敲命令、传文件、开桌面、跑剧本') },
+  { g: t('设备'), id: 'remote', name: t('设备中心'), render: renderRemote,
+    desc: t('登记过的机器、标签、刚才对哪台做过什么') },
+  { g: t('设备'), id: 'remote-work', name: t('设备详情'), render: renderRemoteWork,
+    desc: t('概览 / 终端 / 文件 / 桌面 / 剧本 / 审计') },
   { g: t('设备'), pro: true, id: 'mobile', name: t('手机互联与投屏'), render: renderMobile },
   { g: t('设备'), pro: true, id: 'sessions', name: t('会话中心'), render: renderSessions },
   { g: t('设备'), pro: true, id: 'batch', name: t('批量任务'), render: renderBatch },
@@ -5413,7 +5413,13 @@ function neighborsCard() {
 // ★★ 「对方可见」关成静默时，UI 当场再弹一次责任确认（docs/设计.md 安全第 3 条），
 //   这句话必须出现在人点下去之前，不能只藏在后端返回里。
 
+// 选中的设备跨页记着（设备详情/批量任务都要用）；上次选的机器重开软件还在。
 let remoteSel = null;
+try { remoteSel = localStorage.getItem('netkit.sel') || null; } catch { /* 隐私模式就算了 */ }
+function rememberSel(id) {
+  remoteSel = id;
+  try { if (id) localStorage.setItem('netkit.sel', id); else localStorage.removeItem('netkit.sel'); } catch { }
+}
 
 async function renderRemote(root) {
   const r = await call('remote.device.list');
@@ -5426,23 +5432,68 @@ async function renderRemote(root) {
   root.appendChild(auditCard());
 }
 
+// 设备详情六子页：概览 / 终端 / 文件 / 桌面 / 剧本 / 审计。
+// ★ 一台设备一个门牌，里面的事按「干什么」分栏 —— 不再是五张卡挤一页滚不到底。
+const REMOTE_TABS = [
+  ['overview', t('概览'), t('这台是谁、常用操作都在这')],
+  ['term', t('终端'), t('交互式终端：敲命令像坐在那台机器前')],
+  ['files', t('文件'), t('先看远端有什么，再传 —— 不盲传')],
+  ['desk', t('桌面'), t('看对方屏幕，画质能降、剪贴板能通')],
+  ['playbook', t('剧本'), t('固定的一串检查录成剧本照着跑')],
+  ['audit', t('审计'), t('对这台做过的每件事的留痕')],
+];
+// 子页签也记着：上次停在哪个子页，回来还停在哪。
+let remoteTab = (() => {
+  try {
+    const v = localStorage.getItem('netkit.tab');
+    return REMOTE_TABS.some((x) => x[0] === v) ? v : 'overview';
+  } catch { return 'overview'; }
+})();
+
 async function renderRemoteWork(root) {
   const r = await call('remote.device.list');
   if (!r.ok) { root.appendChild($(t('<div class=\"card\">远程功能不可用：{0}</div>', [esc(r.message)]))); return; }
   const devices = r.values.devices || [];
   const sel = devices.find((d) => d.id === remoteSel) || null;
-  root.appendChild(devicePickCard(devices));
-  // 有活儿才现身：没挑设备时下面那两张卡除了占地方没有别的用处。
-  if (sel) root.appendChild(remoteOps(sel));
-  root.appendChild(playbookCard(devices, sel));
+  if (!sel) {
+    root.appendChild(devicePickCard(devices));
+    return;
+  }
+  // 子页签条：改的是本模块状态，切签不走整页重绘（终端会话不能断）。
+  const bar = document.createElement('div');
+  bar.className = 'devtabs';
+  bar.innerHTML = REMOTE_TABS.map(([id, name, tip]) =>
+    `<button class="devtab${remoteTab === id ? ' on' : ''}" data-tab="${id}" title="${esc(t(tip))}">${esc(t(name))}</button>`).join('');
+  const body = document.createElement('div');
+  body.style.marginTop = '12px';
+  bar.querySelectorAll('.devtab').forEach((b) => {
+    b.onclick = () => {
+      remoteTab = b.dataset.tab;
+      try { localStorage.setItem('netkit.tab', remoteTab); } catch { }
+      bar.querySelectorAll('.devtab').forEach((x) => x.classList.toggle('on', x === b));
+      drawTab();
+    };
+  });
+  const drawTab = async () => {
+    body.innerHTML = '';
+    if (remoteTab === 'overview') body.appendChild(remoteOps(sel));
+    else if (remoteTab === 'term') body.appendChild(shellCard(sel));
+    else if (remoteTab === 'files') body.appendChild(filesCard(sel));
+    else if (remoteTab === 'desk') body.appendChild(deskCard(sel));
+    else if (remoteTab === 'playbook') body.appendChild(playbookCard([sel], sel));
+    else if (remoteTab === 'audit') body.appendChild(auditCard(sel.id));
+  };
+  root.appendChild(bar);
+  root.appendChild(body);
+  await drawTab();
 }
 
 function devicePickCard(devices) {
-  const card = $(t('<div class=\"card\">\n    <h2>这一页要对哪台干活</h2>\n    <p class=\"hint\">登记、删除、看审计在「远程设备与审计」那页。这里只挑一台，下面每一项都会先弹框确认再动。</p>\n    <div class=\"row\" style=\"align-items:flex-end\">\n      <div style=\"min-width:280px\"><label>设备</label>\n        <select id=\"pick\">{0}</select></div>\n      <button class=\"btn primary\" id=\"go\"{1}>就这台</button>\n      <button class=\"btn\" id=\"clr\"{2}>取消选择</button>\n    </div>\n  </div>', [devices.length
+  const card = $(t('<div class=\"card\">\n    <h2>这一页要对哪台干活</h2>\n    <p class=\"hint\">登记、删除、打标签在「设备中心」那页。这里挑一台，进去之后按「干什么」分子页。</p>\n    <div class=\"row\" style=\"align-items:flex-end\">\n      <div style=\"min-width:280px\"><label>设备</label>\n        <select id=\"pick\">{0}</select></div>\n      <button class=\"btn primary\" id=\"go\"{1}>就这台</button>\n      <button class=\"btn\" id=\"clr\"{2}>取消选择</button>\n    </div>\n  </div>', [devices.length
           ? devices.map((d) => `<option value="${esc(d.id)}" ${d.id === remoteSel ? 'selected' : ''}>${esc(d.name || d.id)} · ${esc(OS_LABEL[d.os] || t('系统未知'))}</option>`).join('')
           : t('<option value=\"\">（还没有登记的设备）</option>'), devices.length ? '' : ' disabled', remoteSel ? '' : ' disabled']));
-  card.querySelector('#go').onclick = () => { remoteSel = card.querySelector('#pick').value; show(); };
-  card.querySelector('#clr').onclick = () => { remoteSel = null; show(); };
+  card.querySelector('#go').onclick = () => { rememberSel(card.querySelector('#pick').value); show(); };
+  card.querySelector('#clr').onclick = () => { rememberSel(null); show(); };
   return card;
 }
 
@@ -5694,37 +5745,72 @@ function confirmModal(title, htmlLines, okText) {
 const OS_LABEL = { windows: 'Windows', linux: 'Linux', darwin: 'macOS' };
 
 function deviceTable(devices) {
-  const card = $(t('<div class=\"card\">\n    <h2>登记的设备 <span class=\"pill\">{0}</span></h2>\n    <p class=\"hint\">凭据只落盘在本机 0600 的文件里，不出现在这里、也不进日志。点「操作」展开命令行 / 传文件 / 弹消息 / 开桌面。</p>\n    <div id=\"box\"></div>\n  </div>', [devices.length]));
+  const card = $(t('<div class=\"card\">\n    <h2>登记的设备 <span class=\"pill\">{0}</span></h2>\n    <p class=\"hint\">凭据只落盘在本机 0600 的文件里，不出现在这里、也不进日志。点「操作」进设备详情；标签用来分组过滤、批量圈机器（remote.device.group）。</p>\n    <div class=\"row\" style=\"margin-bottom:10px;align-items:center\">\n      <label style=\"margin:0\">按标签过滤</label>\n      <select id=\"tagf\" style=\"max-width:220px\"><option value=\"\">（全部）</option>{1}</select>\n      <span class=\"dim\" id=\"tagcnt\"></span>\n    </div>\n    <div id=\"box\"></div>\n  </div>', [devices.length, allTags(devices).map((x) => `<option value="${esc(x)}">${esc(x)}</option>`).join('')]));
   const box = card.querySelector('#box');
+  const tagf = card.querySelector('#tagf');
+  const cnt = card.querySelector('#tagcnt');
   if (!devices.length) {
     box.innerHTML = t('<div class=\"empty\">还没有登记设备。在下面填地址和账号加一台，SSH 通了就能诊断、传文件、开桌面。</div>');
     return card;
   }
-  const row = (d) => {
-    const host = d.identity && d.identity.hostname ? t(' <span class=\"dim\">（{0}）</span>', [esc(d.identity.hostname)]) : '';
-    const seen = d.lastSeen ? new Date(d.lastSeen).toLocaleString() : t('还没连过');
-    return t('<tr>\n      <td><b>{0}</b>{1}{2}</td>\n      <td>{3}</td>\n      <td class=\"dim\">{4}{5}</td>\n      <td class=\"dim\">{6}</td>\n      <td style=\"white-space:nowrap\">\n        <button class=\"btn primary\" data-act=\"sel\" data-id=\"{7}\">{8}</button>\n        <button class=\"btn\" data-act=\"probe\" data-id=\"{9}\">探测</button>\n        <button class=\"btn danger\" data-act=\"rm\" data-id=\"{10}\">删除</button>\n      </td></tr>', [esc(d.name || d.id), d.name ? `<br><code class="dim">${esc(d.id)}</code>` : '', host, esc(OS_LABEL[d.os] || t('未知')), esc(d.auth || ''), d.hostKeyKnown ? '' : t('<br><span class=\"dim\">主机密钥未记录</span>'), esc(seen), esc(d.id), d.id === remoteSel ? t('收起') : t('操作'), esc(d.id), esc(d.id)]);
-  };
-  box.innerHTML = t('<table><tr><th>设备</th><th>系统</th><th>认证</th><th>最近探测</th><th></th></tr>\n    {0}</table>', [devices.map(row).join('')]);
-  box.querySelectorAll('button[data-act]').forEach((b) => {
-    b.onclick = async () => {
-      const id = b.dataset.id;
-      if (b.dataset.act === 'sel') { remoteSel = remoteSel === id ? null : id; show(); return; }
-      if (b.dataset.act === 'rm') {
-        if (!confirm(t('把 {0} 从登记簿删掉（连同存的凭据）？', [id]))) return;
-        await call('remote.device.remove', { device: id });
-        if (remoteSel === id) remoteSel = null;
-        show(); return;
-      }
-      b.disabled = true; b.textContent = t('连接中…');
-      const r = await call('remote.device.probe', { device: id });
-      alert(r.ok ? r.note : t('探测失败：') + r.message);
-      show();
+  const paint = () => {
+    const f = tagf.value;
+    const list = f ? devices.filter((d) => (d.tags || []).includes(f)) : devices;
+    cnt.textContent = f ? t('匹配 {0}/{1} 台', [list.length, devices.length]) : '';
+    if (!list.length) {
+      box.innerHTML = t('<div class=\"empty\">没有打了「{0}」标签的设备。给设备打标签用每行的「标签」按钮。</div>', [f]);
+      return;
+    }
+    const row = (d) => {
+      const host = d.identity && d.identity.hostname ? t(' <span class=\"dim\">（{0}）</span>', [esc(d.identity.hostname)]) : '';
+      const seen = d.lastSeen ? new Date(d.lastSeen).toLocaleString() : t('还没连过');
+      const tags = (d.tags || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(' ');
+      return t('<tr>\n      <td><b>{0}</b>{1}{2}</td>\n      <td>{3}</td>\n      <td>{4}</td>\n      <td class=\"dim\">{5}{6}</td>\n      <td class=\"dim\">{7}</td>\n      <td style=\"white-space:nowrap\">\n        <button class=\"btn primary\" data-act=\"sel\" data-id=\"{8}\">{9}</button>\n        <button class=\"btn\" data-act=\"probe\" data-id=\"{10}\">探测</button>\n        <button class=\"btn\" data-act=\"tag\" data-id=\"{11}\">标签</button>\n        <button class=\"btn danger\" data-act=\"rm\" data-id=\"{12}\">删除</button>\n      </td></tr>', [esc(d.name || d.id), d.name ? `<br><code class="dim">${esc(d.id)}</code>` : '', host, esc(OS_LABEL[d.os] || t('未知')), tags || `<span class="dim">${esc(t('无标签'))}</span>`, esc(d.auth || ''), d.hostKeyKnown ? '' : t('<br><span class="dim">主机密钥未记录</span>'), esc(seen), esc(d.id), d.id === remoteSel ? t('收起') : t('操作'), esc(d.id), esc(d.id), esc(d.id)]);
     };
-  });
+    box.innerHTML = t('<table><tr><th>设备</th><th>系统</th><th>标签</th><th>认证</th><th>最近探测</th><th></th></tr>\n    {0}</table>', [list.map(row).join('')]);
+    box.querySelectorAll('button[data-act]').forEach((b) => {
+      b.onclick = async () => {
+        const id = b.dataset.id;
+        const d = devices.find((x) => x.id === id) || {};
+        if (b.dataset.act === 'sel') { rememberSel(remoteSel === id ? null : id); show(); return; }
+        if (b.dataset.act === 'tag') {
+          const v = prompt(t('给 {0} 打标签（逗号分隔，留空清空）：', [d.name || id]), (d.tags || []).join(', '));
+          if (v === null) return;
+          const want = v.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+          const add = want.filter((x) => !(d.tags || []).includes(x));
+          const remove = (d.tags || []).filter((x) => !want.includes(x));
+          if (!add.length && !remove.length) return;
+          const args = { device: id };
+          if (add.length) args.add = add;
+          if (remove.length) args.remove = remove;
+          const r = await call('remote.device.group', args);
+          if (!r.ok) { alert(t('改不了标签：') + r.message); return; }
+          show(); return;
+        }
+        if (b.dataset.act === 'rm') {
+          if (!confirm(t('把 {0} 从登记簿删掉（连同存的凭据）？', [id]))) return;
+          await call('remote.device.remove', { device: id });
+          if (remoteSel === id) rememberSel(null);
+          show(); return;
+        }
+        b.disabled = true; b.textContent = t('连接中…');
+        const r = await call('remote.device.probe', { device: id });
+        alert(r.ok ? r.note : t('探测失败：') + r.message);
+        show();
+      };
+    });
+  };
+  tagf.onchange = paint;
+  paint();
   return card;
 }
 
+// allTags 登记簿里出现过的全部标签（去重排序），给过滤下拉用。
+function allTags(devices) {
+  const s = new Set();
+  for (const d of devices) for (const x of d.tags || []) s.add(x);
+  return [...s].sort();
+}
 function addDeviceCard() {
   const card = $(t('<div class=\"card\">\n    <h2>登记一台设备</h2>\n    <p class=\"hint\">走 SSH。能用私钥就别用口令；不确定账号名就先猜一个，连不上时探测会把线索报回来。</p>\n    <div class=\"row\">\n      <div><label>地址 *</label><input id=\"host\" placeholder=\"192.168.3.82 或 fe80::1%en0\"></div>\n      <div style=\"max-width:110px\"><label>端口</label><input id=\"port\" placeholder=\"22\"></div>\n      <div><label>账号 *</label><input id=\"user\" placeholder=\"administrator / root / pc\"></div>\n      <div><label>备注名</label><input id=\"name\" placeholder=\"收银台那台\"></div>\n    </div>\n    <div class=\"row\">\n      <div><label>口令</label><input id=\"pw\" type=\"password\" placeholder=\"和私钥二选一\"></div>\n      <div><label>私钥路径（本机）</label><input id=\"key\" placeholder=\"/Users/me/.ssh/id_ed25519\"></div>\n    </div>\n    <div style=\"margin-top:12px\"><button class=\"btn primary\" id=\"add\">登记并探测</button></div>\n    <div class=\"out\" id=\"o\" style=\"display:none;margin-top:10px\"></div>\n  </div>'));
   const g = (s) => card.querySelector(s).value.trim();
@@ -5742,14 +5828,14 @@ function addDeviceCard() {
     const id = r.values.id;
     const p = await call('remote.device.probe', { device: id });
     say(p.ok ? p.note : t('登记成功，但探测失败：') + p.message);
-    remoteSel = id;
+    rememberSel(id);
     setTimeout(show, 1200);
   };
   return card;
 }
 
 function remoteOps(d) {
-  const card = $(t('<div class=\"card\">\n    <h2>操作 <code>{0}</code> <span class=\"dim\">{1}</span></h2>\n    <p class=\"hint\">下面每一项改系统的操作都会先弹框确认，且全程记入审计。</p>\n\n    <label>执行命令（远程诊断主力：看资源、抓日志、重启服务）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"cmd\" placeholder=\"{2}\">\n      <button class=\"btn primary\" id=\"bcmd\">执行</button>\n      <button class=\"btn\" id=\"bsess\">看会话</button>\n    </div>\n    <div class=\"out\" id=\"ocmd\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>给屏幕发消息（自动带发送方标识）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"msg\" placeholder=\"如：10 分钟后重启收银系统，请保存工作\">\n      <button class=\"btn\" id=\"bmsg\">发送</button>\n    </div>\n    <div class=\"out\" id=\"omsg\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>传文件（断点续传 + 整包 SHA256 复核）</label>\n    <div class=\"row\">\n      <div><label>本机路径</label><input id=\"flocal\" placeholder=\"/Users/me/升级包.bin\"></div>\n      <div><label>设备路径</label><input id=\"fremote\" placeholder=\"{3}\"></div>\n    </div>\n    <div style=\"display:flex;gap:8px;margin-top:8px\">\n      <button class=\"btn\" id=\"bpush\">推到设备 ↑</button>\n      <button class=\"btn\" id=\"bpull\">拉回本机 ↓</button>\n    </div>\n    <div class=\"out\" id=\"ofile\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>远程桌面</label>\n    <p class=\"hint\">网通自己开一个窗口看对方屏幕。把文件拖进那个窗口，会放到对方正在打开的文件夹；没开文件夹就放到桌面。</p>\n    <div style=\"display:flex;gap:8px\">\n      <button class=\"btn primary\" id=\"bview\">打开对方屏幕</button>\n      <button class=\"btn\" id=\"bviewstop\">停止</button>\n    </div>\n    <div class=\"out\" id=\"odesk\" style=\"display:none;margin-top:8px\"></div>\n    {5}\n  </div>', [esc(d.id), esc(OS_LABEL[d.os] || t('系统未知，先探测')), d.os === 'windows' ? 'ipconfig /all' : 'systemctl status nginx', d.os === 'windows' ? t('C:\\\\tmp\\\\升级包.bin') : t('/tmp/升级包.bin'), d.os === 'windows' ? t('（RDP 没开会替它开）') : '', d.hostKeyKnown ? t('\n    <label>主机密钥</label>\n    <div style=\"display:flex;gap:8px;align-items:center\">\n      <button class=\"btn danger\" id=\"bkey\">忘掉这台的主机密钥</button>\n      <span class=\"dim\">连不上说「密钥对不上」时才用：确认那台机器重装过系统/换过机器。密钥变了也可能是有人冒充它。</span>\n    </div>\n    <div class=\"out\" id=\"okey\" style=\"display:none;margin-top:8px\"></div>') : '']));
+  const card = $(t('<div class=\"card\">\n    <h2>操作 <code>{0}</code> <span class=\"dim\">{1}</span></h2>\n    <p class=\"hint\">下面每一项改系统的操作都会先弹框确认，且全程记入审计。</p>\n\n    <label>执行命令（远程诊断主力：看资源、抓日志、重启服务）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"cmd\" placeholder=\"{2}\">\n      <button class=\"btn primary\" id=\"bcmd\">执行</button>\n      <button class=\"btn\" id=\"bsess\">看会话</button>\n    </div>\n    <div class=\"out\" id=\"ocmd\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>给屏幕发消息（自动带发送方标识）</label>\n    <div style=\"display:flex;gap:8px\">\n      <input id=\"msg\" placeholder=\"如：10 分钟后重启收银系统，请保存工作\">\n      <button class=\"btn\" id=\"bmsg\">发送</button>\n    </div>\n    <div class=\"out\" id=\"omsg\" style=\"display:none;margin-top:8px\"></div>\n\n    <label>传文件（断点续传 + 整包 SHA256 复核）</label>\n    <div class=\"row\">\n      <div><label>本机路径</label><input id=\"flocal\" placeholder=\"/Users/me/升级包.bin\"></div>\n      <div><label>设备路径</label><input id=\"fremote\" placeholder=\"{3}\"></div>\n    </div>\n    <div style=\"display:flex;gap:8px;margin-top:8px\">\n      <button class=\"btn\" id=\"bpush\">推到设备 ↑</button>\n      <button class=\"btn\" id=\"bpull\">拉回本机 ↓</button>\n    </div>\n    <div class=\"out\" id=\"ofile\" style=\"display:none;margin-top:8px\"></div>\n    <p class=\"hint\">桌面挪到了子页签：去「桌面」那栏开屏幕窗口、调画质、通剪贴板。</p>\n    {5}\n  </div>', [esc(d.id), esc(OS_LABEL[d.os] || t('系统未知，先探测')), d.os === 'windows' ? 'ipconfig /all' : 'systemctl status nginx', d.os === 'windows' ? t('C:\\\\tmp\\\\升级包.bin') : t('/tmp/升级包.bin'), d.os === 'windows' ? t('（RDP 没开会替它开）') : '', d.hostKeyKnown ? t('\n    <label>主机密钥</label>\n    <div style=\"display:flex;gap:8px;align-items:center\">\n      <button class=\"btn danger\" id=\"bkey\">忘掉这台的主机密钥</button>\n      <span class=\"dim\">连不上说「密钥对不上」时才用：确认那台机器重装过系统/换过机器。密钥变了也可能是有人冒充它。</span>\n    </div>\n    <div class=\"out\" id=\"okey\" style=\"display:none;margin-top:8px\"></div>') : '']));
   const out = (id, s) => { const o = card.querySelector(id); o.style.display = 'block'; o.textContent = s; };
   const busy = async (btn, fn) => {
     const b = card.querySelector(btn);
@@ -5801,16 +5887,6 @@ function remoteOps(d) {
     transfer('remote.file.pull', { device: d.id, local: l, remote: rm });
   };
 
-  card.querySelector('#bview').onclick = () => {
-    out('#odesk', t('正在另开窗口…'));
-    if (!window.netkit || !window.netkit.openDesk) { out('#odesk', t('这个窗口开不了远程桌面')); return; }
-    window.netkit.openDesk(d.id);
-  };
-  card.querySelector('#bviewstop').onclick = async () => {
-    const r = await call('remote.desk.close', { device: d.id });
-    out('#odesk', r.ok ? r.note : t('停不掉：') + r.message);
-  };
-
   const keyBtn = card.querySelector('#bkey');
   if (keyBtn) keyBtn.onclick = async () => {
     if (!confirm(t('忘掉 {0} 的主机密钥？\n\n只在确认那台机器重装过系统/换过机器时做。下次连接会重新记录一把新密钥；如果其实没人换过机器，这一步等于把「有人在冒充它」这个信号抹掉了。', [d.id]))) return;
@@ -5820,14 +5896,250 @@ function remoteOps(d) {
   return card;
 }
 
-function auditCard() {
-  const card = $(t('<div class=\"card\">\n    <h2>审计日志</h2>\n    <p class=\"hint\">谁、何时、对哪台、做了什么、结果如何。静默模式只关屏幕提示，不关这里的留痕。</p>\n    <button class=\"btn\" id=\"load\">取最近 50 条</button>\n    <div id=\"box\" style=\"margin-top:10px\"></div>\n  </div>'));
+// ═══ 设备详情子页卡：终端 / 文件 / 桌面 ═══
+//
+// ★ remote.shell.* 的会话登记簿在后端，但没有 list 工具 —— 界面把自己开过的
+//   会话记在本地（会话中心靠这份名单点名），还活着没有用 remote.shell.read 探。
+const SHELL_LS = 'netkit.shells';
+
+function shellsLS() {
+  try { return JSON.parse(localStorage.getItem(SHELL_LS) || '[]') || []; } catch { return []; }
+}
+function shellsLSAdd(id, device) {
+  const list = shellsLS().filter((x) => x.id !== id);
+  list.push({ id, device, at: Date.now() });
+  localStorage.setItem(SHELL_LS, JSON.stringify(list.slice(-30)));
+}
+function shellsLSRemove(id) {
+  localStorage.setItem(SHELL_LS, JSON.stringify(shellsLS().filter((x) => x.id !== id)));
+}
+
+// shellCard 交互终端子页：开一路 PTY，输出轮询续读，键入直送。
+// ★ open 这一次要批准（整条终端算一次授权，之后敲的命令不再逐条弹框但全进审计）。
+function shellCard(d) {
+  const card = $(t('<div class="card">\n    <h2>终端 <code>{0}</code></h2>\n    <p class="hint">{1}</p>\n    <div class="row">\n      <button class="btn primary" id="open">{2}</button>\n      <button class="btn danger" id="close" disabled>{3}</button>\n      <button class="btn" id="cc" disabled>Ctrl-C</button>\n      <span class="dim" id="st"></span>\n    </div>\n    <pre id="term" class="term" style="margin:10px 0 0"></pre>\n    <div style="display:flex;gap:8px;margin-top:8px">\n      <input id="in" placeholder="{4}" style="flex:1" disabled>\n      <button class="btn primary" id="send" disabled>{5}</button>\n    </div>\n  </div>', [esc(d.id), esc(t('开一条交互式终端。批准发生在「开」那一下 —— 之后敲的每条命令不再逐条弹框，但全部记入审计。')), esc(t('开终端')), esc(t('关掉这条终端')), esc(t('敲命令，回车发出去；终端开着才认')), esc(t('发送'))]));
+  const term = card.querySelector('#term');
+  const st = card.querySelector('#st');
+  const inEl = card.querySelector('#in');
+  let sess = null; let offset = 0; let timer = null;
+
+  const stopPoll = () => { if (timer) { clearInterval(timer); timer = null; } };
+  const setLive = (on) => {
+    card.querySelector('#open').disabled = on;
+    card.querySelector('#close').disabled = !on;
+    card.querySelector('#cc').disabled = !on;
+    inEl.disabled = !on;
+    card.querySelector('#send').disabled = !on;
+  };
+  const paint = (text) => {
+    term.textContent += text;
+    if (term.textContent.length > 400000) term.textContent = term.textContent.slice(-300000);
+    term.scrollTop = term.scrollHeight;
+  };
+
+  const poll = async () => {
+    const r = await call('remote.shell.read', { session: sess, offset });
+    if (!r.ok) { stopPoll(); st.textContent = t('读不到了：{0}', [r.message]); setLive(false); return; }
+    offset = r.values.offset;
+    if (r.values.output) paint(r.values.output);
+    if (r.values.done) {
+      stopPoll(); setLive(false); shellsLSRemove(sess);
+      st.textContent = t('远端把终端关了（exit 或会话结束）。上面是最后的输出。');
+      sess = null;
+    }
+  };
+  const start = (id) => {
+    sess = id; offset = 0; term.textContent = '';
+    shellsLSAdd(id, d.id);
+    setLive(true);
+    st.textContent = t('终端开着 —— 每次敲的命令都进审计。');
+    stopPoll();
+    timer = setInterval(poll, 500);
+    poll();
+    inEl.focus();
+  };
+  // 上次在这台开的会话还活着就接着用（页面切走再回来不掉会话）。
+  (async () => {
+    const rec = shellsLS().find((x) => x.device === d.id);
+    if (!rec) return;
+    const r = await call('remote.shell.read', { session: rec.id, offset: 1e15 });
+    if (r.ok && !r.values.done) {
+      sess = rec.id; offset = r.values.offset;
+      setLive(true);
+      st.textContent = t('接着上次那路终端（会话 {0}）。', [rec.id]);
+      term.textContent = t('（历史输出从这儿起，往上翻不回来了 —— 要看全的重新开一条。）') + '\n';
+      timer = setInterval(poll, 500);
+    } else shellsLSRemove(rec.id);
+  })();
+
+  card.querySelector('#open').onclick = async () => {
+    st.textContent = t('开终端中…（等你批准）');
+    const r = await call('remote.shell.open', { device: d.id });
+    if (!r.ok) { st.textContent = t('开不了：') + r.message; return; }
+    start(r.values.session);
+  };
+  card.querySelector('#close').onclick = async () => {
+    if (!sess) return;
+    stopPoll();
+    const r = await call('remote.shell.close', { session: sess });
+    shellsLSRemove(sess); sess = null;
+    setLive(false);
+    st.textContent = r.ok ? t('终端已关。') : r.message;
+  };
+  card.querySelector('#cc').onclick = () => { if (sess) call('remote.shell.write', { session: sess, data: '\u0003' }); };
+  const send = () => {
+    if (!sess) return;
+    const v = inEl.value;
+    inEl.value = '';
+    call('remote.shell.write', { session: sess, data: v + '\n' });
+  };
+  card.querySelector('#send').onclick = send;
+  inEl.onkeydown = (e) => { if (e.key === 'Enter') send(); };
+  return card;
+}
+
+// filesCard 文件子页：先看远端目录（remote.file.list），再传（push/pull），
+// 建目录/改名/删除都在这页 —— 改的东西逐项走批准。
+function filesCard(d) {
+  const card = $(t('<div class="card">\n    <h2>文件 <code>{0}</code></h2>\n    <p class="hint">{1}</p>\n    <div class="row" style="align-items:center">\n      <button class="btn" id="up">↑ {2}</button>\n      <input id="path" value="." style="flex:1;font-family:ui-monospace,Menlo,monospace">\n      <button class="btn" id="go">{3}</button>\n      <button class="btn" id="mk">{4}</button>\n      <button class="btn" id="refresh">{5}</button>\n    </div>\n    <div id="box" style="margin-top:10px"><div class="empty">{6}</div></div>\n    <div class="row" style="margin-top:14px;align-items:flex-end">\n      <div style="flex:1"><label>{7}</label><input id="lp" placeholder="{8}"></div>\n      <div style="flex:1"><label>{9}</label><input id="rn" placeholder="{10}"></div>\n      <button class="btn primary" id="push">↑ {11}</button>\n    </div>\n    <div class="out" id="o" style="display:none;margin-top:10px;white-space:pre-wrap"></div>\n  </div>', [esc(d.id), esc(t('先看远端有什么再传 —— 路径点得出来，不再盲传。删除/改名/建目录每次都走批准框。')), esc(t('上一级')), esc(t('打开')), esc(t('新建文件夹')), esc(t('刷新')), esc(t('读取中…')), esc(t('本机文件路径（推上去）')), esc(t('/Users/me/升级包.bin')), esc(t('落到远端哪个名字（留空=原名）')), esc(t('升级包.bin')), esc(t('推到当前目录'))]));
+  const box = card.querySelector('#box');
+  const pathEl = card.querySelector('#path');
+  const o = card.querySelector('#o');
+  const say = (s) => { o.style.display = 'block'; o.textContent = s; };
+  let cwd = '.';
+
+  const load = async () => {
+    box.innerHTML = `<div class="empty">${esc(t('读取中…'))}</div>`;
+    const r = await call('remote.file.list', { device: d.id, path: cwd });
+    if (!r.ok) { box.innerHTML = `<div class="empty">${esc(r.message)}</div>`; return; }
+    cwd = r.values.path === '.' ? (r.values.home || '.') : r.values.path;
+    pathEl.value = cwd;
+    const es = r.values.entries || [];
+    if (!es.length) { box.innerHTML = `<div class="empty">${esc(t('这个目录是空的'))}</div>`; return; }
+    const row = (e) => {
+      const full = (cwd === '/' ? '' : cwd) + '/' + e.name;
+      const acts = e.dir
+        ? `<button class="btn sm" data-act="cd" data-p="${esc(full)}">${esc(t('进入'))}</button>
+           <button class="btn sm danger" data-act="rm" data-p="${esc(full)}" data-dir="1">${esc(t('删除'))}</button>`
+        : `<button class="btn sm" data-act="pull" data-p="${esc(full)}">${esc(t('下载到本机'))}</button>
+           <button class="btn sm" data-act="mv" data-p="${esc(full)}">${esc(t('改名'))}</button>
+           <button class="btn sm danger" data-act="rm" data-p="${esc(full)}">${esc(t('删除'))}</button>`;
+      return t('<tr><td><b>{0}</b></td><td class="dim mono">{1}</td><td class="dim mono">{2}</td><td class="dim mono">{3}</td><td style="white-space:nowrap">{4}</td></tr>',
+        [esc(e.name) + (e.dir ? ' /' : ''), e.dir ? '—' : fmtBytes(e.size), esc(e.mode), esc(e.mtime), acts]);
+    };
+    box.innerHTML = t('<table><tr><th>{0}</th><th>{1}</th><th>{2}</th><th>{3}</th><th></th></tr>\n{4}</table>',
+      [t('名称'), t('大小'), t('权限'), t('修改时间'), es.map(row).join('')]);
+    box.querySelectorAll('button[data-act]').forEach((b) => {
+      b.onclick = async () => {
+        const p = b.dataset.p;
+        if (b.dataset.act === 'cd') { cwd = p; load(); return; }
+        if (b.dataset.act === 'rm') {
+          const recursive = b.dataset.dir === '1';
+          if (!confirm(t('删掉远端的 {0}？{1}', [p, recursive ? t('目录非空时要连里面的东西一起删（不可恢复）。') : '']))) return;
+          const r = await call('remote.file.remove', { device: d.id, path: p, recursive });
+          say(r.ok ? r.note : t('删不掉：') + r.message);
+          if (r.ok) load();
+          return;
+        }
+        if (b.dataset.act === 'mv') {
+          const to = prompt(t('把 {0} 改名/挪到：', [p]), p);
+          if (!to || to === p) return;
+          const r = await call('remote.file.rename', { device: d.id, from: p, to });
+          say(r.ok ? r.note : t('改不了：') + r.message);
+          if (r.ok) load();
+          return;
+        }
+        if (b.dataset.act === 'pull') {
+          const local = prompt(t('拉到本机哪个路径（完整路径，会覆盖同名）：'), t('下载目录/{0}', [p.split('/').pop()]));
+          if (!local) return;
+          say(t('拉取中…（等待批准）'));
+          const r = await call('remote.file.pull', { device: d.id, remote: p, local });
+          say(r.ok ? r.note : t('拉取失败：') + r.message);
+        }
+      };
+    });
+  };
+
+  card.querySelector('#go').onclick = () => { cwd = pathEl.value.trim() || '.'; load(); };
+  pathEl.onkeydown = (e) => { if (e.key === 'Enter') card.querySelector('#go').onclick(); };
+  card.querySelector('#up').onclick = () => {
+    if (cwd.endsWith('/')) cwd = cwd.slice(0, -1);
+    const i = cwd.lastIndexOf('/');
+    cwd = i <= 0 ? '/' : cwd.slice(0, i);
+    load();
+  };
+  card.querySelector('#refresh').onclick = load;
+  card.querySelector('#mk').onclick = async () => {
+    const p = prompt(t('在 {0} 下新建文件夹，叫什么：', [cwd === '.' ? (t('家目录')) : cwd]));
+    if (!p) return;
+    const r = await call('remote.file.mkdir', { device: d.id, path: (cwd === '/' ? '' : cwd) + '/' + p });
+    say(r.ok ? r.note : t('建不了：') + r.message);
+    if (r.ok) load();
+  };
+  card.querySelector('#push').onclick = async () => {
+    const lp = card.querySelector('#lp').value.trim();
+    if (!lp) { say(t('本机路径要填')); return; }
+    const rn = card.querySelector('#rn').value.trim() || lp.split('/').pop();
+    say(t('推送中…（等待批准；断了再点一次会续传）'));
+    const r = await call('remote.file.push', { device: d.id, local: lp, remote: (cwd === '/' ? '' : cwd) + '/' + rn });
+    say(r.ok ? r.note : t('推送失败：') + r.message);
+    if (r.ok) load();
+  };
+  load();
+  return card;
+}
+
+// deskCard 桌面子页：开/停屏幕窗口；画质三档（remote.desk.options）；
+// 剪贴板取/送（remote.desk.clipboard.set 是 mutate，走批准）。
+function deskCard(d) {
+  const card = $(t('<div class="card">\n    <h2>桌面 <code>{0}</code></h2>\n    <p class="hint">{1}</p>\n    <div class="row" style="align-items:flex-end">\n      <div><label>{2}</label>\n        <select id="q">\n          <option value="82,1280">{3}</option>\n          <option value="55,1024">{4}</option>\n          <option value="35,800">{5}</option>\n          <option value="90,1920">{6}</option>\n        </select></div>\n      <button class="btn primary" id="open">{7}</button>\n      <button class="btn" id="applyq">{8}</button>\n      <button class="btn danger" id="stop">{9}</button>\n    </div>\n    <div class="out" id="odesk" style="display:none;margin-top:8px"></div>\n    <label style="margin-top:14px">{10}</label>\n    <div class="row">\n      <button class="btn" id="cbget">{11}</button>\n      <button class="btn primary" id="cbset">{12}</button>\n    </div>\n    <textarea id="cbtxt" rows="3" style="width:100%;margin-top:6px;font-family:ui-monospace,Menlo,monospace"></textarea>\n    <div class="out" id="ocb" style="display:none;margin-top:6px;white-space:pre-wrap"></div>\n  </div>', [esc(d.id), esc(t('NetKit 自己开一个窗口看对方屏幕。文件拖进那个窗口会放到对方正打开的文件夹；画质在弱网就降一档。')), esc(t('画质')), esc(t('标准（82 / 1280 宽）')), esc(t('流畅（55 / 1024 宽）—— 弱网用这个')), esc(t('最低（35 / 800 宽）')), esc(t('高清（90 / 1920 宽）')), esc(t('打开对方屏幕')), esc(t('只调画质')), esc(t('停止')), esc(t('剪贴板（对方机器的）')), esc(t('取过来')), esc(t('把下面这段送过去'))]));
+  const out = (id, s) => { const e = card.querySelector(id); e.style.display = 'block'; e.textContent = s; };
+  card.querySelector('#open').onclick = () => {
+    out('#odesk', t('正在另开窗口…'));
+    if (!window.netkit || !window.netkit.openDesk) { out('#odesk', t('这个窗口开不了远程桌面')); return; }
+    window.netkit.openDesk(d.id);
+    setTimeout(async () => {
+      const [q, w] = card.querySelector('#q').value.split(',').map(Number);
+      const r = await call('remote.desk.options', { device: d.id, quality: q, maxWidth: w });
+      if (r.ok) out('#odesk', t('窗口已开，画质按上面选的调好了。') + ' ' + r.note);
+      else out('#odesk', t('窗口已开（画质没调成：') + r.message + '）');
+    }, 1500);
+  };
+  card.querySelector('#applyq').onclick = async () => {
+    const [q, w] = card.querySelector('#q').value.split(',').map(Number);
+    const r = await call('remote.desk.options', { device: d.id, quality: q, maxWidth: w });
+    out('#odesk', r.ok ? r.note : t('调不了：') + r.message);
+  };
+  card.querySelector('#stop').onclick = async () => {
+    const r = await call('remote.desk.close', { device: d.id });
+    out('#odesk', r.ok ? r.note : t('停不掉：') + r.message);
+  };
+  card.querySelector('#cbget').onclick = async () => {
+    out('#ocb', t('取剪贴板中…'));
+    const r = await call('remote.desk.clipboard', { device: d.id });
+    if (!r.ok) { out('#ocb', t('取不到：') + r.message); return; }
+    card.querySelector('#cbtxt').value = r.values.text || '';
+    out('#ocb', r.values.empty ? t('对方的剪贴板是空的') : t('已取过来，放在下面框里。'));
+  };
+  card.querySelector('#cbset').onclick = async () => {
+    const v = card.querySelector('#cbtxt').value;
+    if (!v) { out('#ocb', t('框里是空的，先贴一段进来')); return; }
+    out('#ocb', t('送出中…（等待批准）'));
+    const r = await call('remote.desk.clipboard.set', { device: d.id, text: v });
+    out('#ocb', r.ok ? r.note : t('送不过去：') + r.message);
+  };
+  return card;
+}
+function auditCard(onlyDevice) {
+  const card = $(t('<div class=\"card\">\n    <h2>审计日志{0}</h2>\n    <p class=\"hint\">谁、何时、对哪台、做了什么、结果如何。静默模式只关屏幕提示，不关这里的留痕。</p>\n    <button class=\"btn\" id=\"load\">取最近 50 条</button>\n    <div id=\"box\" style=\"margin-top:10px\"></div>\n  </div>', [onlyDevice ? ' <span class="pill">' + esc(onlyDevice) + '</span>' : '']));
   card.querySelector('#load').onclick = async () => {
     const box = card.querySelector('#box');
-    const r = await call('remote.audit.tail', { n: 50 });
+    const r = await call('remote.audit.tail', { n: 200 });
     if (!r.ok) { box.innerHTML = `<div class="empty">${esc(r.message)}</div>`; return; }
-    const es = (r.values.entries || []).slice().reverse();
-    if (!es.length) { box.innerHTML = t('<div class=\"empty\">还没有记录</div>'); return; }
+    let es = (r.values.entries || []).slice().reverse();
+    if (onlyDevice) es = es.filter((e) => e.target === onlyDevice);
+    if (!es.length) { box.innerHTML = t('<div class="empty">{0}</div>', [onlyDevice ? t('这台还没有记录') : t('还没有记录')]); return; }
+    if (es.length > 50) es = es.slice(0, 50);
     box.innerHTML = t('<table><tr><th>时间</th><th>谁</th><th>动作</th><th>对哪台</th><th>细节</th><th>结果</th></tr>\n      {0}</table>', [es.map((e) => `<tr>
         <td class="dim" style="white-space:nowrap">${esc(new Date(e.at).toLocaleString())}</td>
         <td class="dim">${esc(e.actor || '')}</td>
@@ -9781,22 +10093,158 @@ function skelPage(root, spec) {
   root.appendChild(card);
 }
 function renderSessions(root) {
-  skelPage(root, {
-    title: t('会话中心'),
-    why: t('正在开着的终端、文件传输、桌面窗口应该在一个地方全看见、随手能断 —— 这要等后端把会话管理做成工具。'),
-    tools: 'remote.sessions.*',
-    go: t('去看现在连着的设备'),
-    to: 'remote',
-  });
+  const card = $(`<div class="card">
+    <h2>${esc(t('会话中心'))}</h2>
+    <p class="hint">${esc(t('这台 NetKit 开出去的终端会话在一个地方点名：还活着的接着用、不要的一键关掉。下面再带一版最近动作的审计，谁在什么时候动了哪台，一眼扫完。'))}</p>
+    <div id="list" style="margin-top:10px"></div>
+    <h2 style="margin-top:18px">${esc(t('最近动作'))}</h2>
+    <button class="btn" id="audit">${esc(t('取最近 12 条'))}</button>
+    <div id="ab" style="margin-top:10px"></div>
+  </div>`);
+  const list = card.querySelector('#list');
+  const paint = async () => {
+    const recs = shellsLS();
+    if (!recs.length) {
+      list.innerHTML = t('<div class="empty">{0}</div>', [t('没有开着的终端。到设备详情的「终端」子页去开一条。')]);
+      return;
+    }
+    // 每条用 offset 顶到底去探活：回来的 done=false 就是活着，报错/已关的当场摘出名单。
+    const rows = [];
+    const dead = [];
+    for (const x of recs) {
+      const r = await call('remote.shell.read', { session: x.id, offset: 1e15 });
+      const alive = r.ok && !r.values.done;
+      if (!alive) { dead.push(x.id); continue; }
+      rows.push(t('<tr><td><code>{0}</code></td><td>{1}</td><td class="dim">{2}</td><td><span class="pill ok">{3}</span></td><td style="white-space:nowrap"><button class="btn sm" data-goto="{4}">{5}</button> <button class="btn sm danger" data-kill="{6}">{7}</button></td></tr>',
+        [esc(x.id), esc(x.device), esc(new Date(x.at).toLocaleString()), t('活着'), esc(x.device), t('去终端'), esc(x.id), t('关掉')]));
+    }
+    if (dead.length) {
+      localStorage.setItem(SHELL_LS, JSON.stringify(shellsLS().filter((x) => !dead.includes(x.id))));
+    }
+    if (!rows.length) {
+      list.innerHTML = t('<div class="empty">{0}</div>', [t('名单里的会话都已经关了（刚才清掉了）。')]);
+      return;
+    }
+    list.innerHTML = t('<table><tr><th>{0}</th><th>{1}</th><th>{2}</th><th>{3}</th><th></th></tr>\n{4}</table>',
+      [t('会话'), t('设备'), t('开于'), t('状态'), rows.join('')]);
+    list.querySelectorAll('button[data-goto]').forEach((b) => {
+      b.onclick = () => { rememberSel(b.dataset.goto); goto('remote-work'); };
+    });
+    list.querySelectorAll('button[data-kill]').forEach((b) => {
+      b.onclick = async () => {
+        await call('remote.shell.close', { session: b.dataset.kill });
+        paint();
+      };
+    });
+  };
+  card.querySelector('#audit').onclick = async () => {
+    const ab = card.querySelector('#ab');
+    const r = await call('remote.audit.tail', { n: 12 });
+    if (!r.ok) { ab.innerHTML = `<div class="empty">${esc(r.message)}</div>`; return; }
+    const es = (r.values.entries || []).slice().reverse();
+    if (!es.length) { ab.innerHTML = `<div class="empty">${esc(t('还没有记录'))}</div>`; return; }
+    ab.innerHTML = t('<table><tr><th>{0}</th><th>{1}</th><th>{2}</th><th>{3}</th><th>{4}</th></tr>\n{5}</table>',
+      [t('时间'), t('动作'), t('对哪台'), t('细节'), t('结果'),
+      es.map((e) => `<tr>
+        <td class="dim" style="white-space:nowrap">${esc(new Date(e.at).toLocaleString())}</td>
+        <td><code>${esc(e.action || '')}</code></td>
+        <td>${esc(e.target || '')}</td>
+        <td class="dim">${esc((e.detail || '').slice(0, 60))}</td>
+        <td class="${String(e.result).startsWith('failed') ? 'bad' : 'dim'}">${esc(e.result || '')}</td>
+      </tr>`).join('')]);
+  };
+  paint();
+  root.appendChild(card);
 }
+
+// batchSel 批量任务页勾过的机器（切页回来不丢）。
+let batchSel = {};
+
 function renderBatch(root) {
-  skelPage(root, {
-    title: t('批量任务'),
-    why: t('同一批命令对一批机器各跑一遍、结果并成一摊能对账的表 —— 要等后端把批量执行做成工具。'),
-    tools: 'remote.exec.batch',
-    go: t('先对一台机器干活'),
-    to: 'remote-work',
-  });
+  const card = $(`<div class="card">
+    <h2>${esc(t('批量任务'))}</h2>
+    <p class="hint">${esc(t('同一批命令对多台各跑一遍，并行收结果（最多 4 台同时在跑）。批准框会把机器清单摊开 —— 每台的执行和审计同单台 remote.exec，一条不少。'))}</p>
+    <label>${esc(t('跑什么'))}</label>
+    <textarea id="cmd" rows="2" style="width:100%;font-family:ui-monospace,Menlo,monospace" placeholder="${esc(t('如：df -h /data ｜ Windows 用 cmd 语法，如 ipconfig /all'))}"></textarea>
+    <div class="row" style="align-items:flex-end;margin-top:8px">
+      <div style="max-width:140px"><label>${esc(t('每台等多久'))}</label>
+        <select id="wait"><option value="60">60 ${esc(t('秒'))}</option><option value="180">180 ${esc(t('秒'))}</option><option value="600">600 ${esc(t('秒'))}</option></select></div>
+      <button class="btn primary" id="run">${esc(t('对勾选的机器跑'))}</button>
+      <button class="btn" id="tagall">${esc(t('按标签全选/反选'))}</button>
+    </div>
+    <label style="margin-top:14px">${esc(t('对哪些机器跑'))}</label>
+    <div id="devs" style="margin-top:6px"></div>
+    <div id="prog" style="margin-top:14px"></div>
+  </div>`);
+  const devs = card.querySelector('#devs');
+  const prog = card.querySelector('#prog');
+  let r = null;
+  (async () => {
+    const lr = await call('remote.device.list');
+    if (!lr.ok) { devs.innerHTML = `<div class="empty">${esc(lr.message)}</div>`; return; }
+    const list = lr.values.devices || [];
+    if (!list.length) { devs.innerHTML = t('<div class="empty">{0}</div>', [t('还没有登记设备 —— 到设备中心加一台。')]); return; }
+    const tags = allTags(list);
+    const paint = () => {
+      devs.innerHTML = t('<table><tr><th>{0}</th><th>{1}</th><th>{2}</th><th>{3}</th></tr>\n{4}</table>',
+        ['', t('设备'), t('系统'), t('标签'),
+        list.map((d) => `<tr>
+          <td><input type="checkbox" data-id="${esc(d.id)}" ${batchSel[d.id] ? 'checked' : ''}></td>
+          <td><b>${esc(d.name || d.id)}</b> <code class="dim">${esc(d.id)}</code></td>
+          <td class="dim">${esc(OS_LABEL[d.os] || t('未知'))}</td>
+          <td>${(d.tags || []).map((x) => `<span class="pill">${esc(x)}</span>`).join(' ') || `<span class="dim">${esc(t('无标签'))}</span>`}</td>
+        </tr>`).join('')]);
+      devs.querySelectorAll('input[data-id]').forEach((c) => {
+        c.onchange = () => { batchSel[c.dataset.id] = c.checked; };
+      });
+      const tagBtn = card.querySelector('#tagall');
+      tagBtn.onclick = () => {
+        const t2 = prompt(t('输入一个标签，勾上/取消打了它的全部设备（现有：{0}）：', [tags.join('、') || t('还没有标签')]));
+        if (!t2) return;
+        const hit = list.filter((d) => (d.tags || []).includes(t2));
+        if (!hit.length) { alert(t('没有打了「{0}」标签的设备', [t2])); return; }
+        const anyOff = hit.some((d) => !batchSel[d.id]);
+        for (const d of hit) batchSel[d.id] = anyOff;
+        paint();
+      };
+    };
+    paint();
+
+    card.querySelector('#run').onclick = async () => {
+      const cmd = card.querySelector('#cmd').value.trim();
+      if (!cmd) { prog.innerHTML = `<div class="empty">${esc(t('命令是空的'))}</div>`; return; }
+      const targets = Object.keys(batchSel).filter((k) => batchSel[k]);
+      if (!targets.length) { prog.innerHTML = `<div class="empty">${esc(t('一台都没勾'))}</div>`; return; }
+      prog.innerHTML = t('<div class="empty">{0}</div>', [t('等批准…（机器清单会摊开在批准框里）')]);
+      const rr = await call('remote.task.run', { devices: targets, command: cmd, timeoutSec: Number(card.querySelector('#wait').value) });
+      if (!rr.ok) { prog.innerHTML = `<div class="empty">${esc(t('起不了：') + rr.message)}</div>`; return; }
+      prog.innerHTML = t('<p class="hint">{0}</p>', [rr.note]);
+      poll(rr.values.task);
+    };
+
+    let timer = null;
+    const poll = async (id) => {
+      if (timer) clearInterval(timer);
+      const draw = async () => {
+        const s = await call('remote.task.status', { task: id });
+        if (!s.ok) { clearInterval(timer); prog.innerHTML += t('<p class="hint" style="color:var(--gold)">{0}</p>', [t('进度拉不到：') + s.message]); return; }
+        const v = s.values;
+        const rows = (v.results || []).map((x) => `<tr>
+          <td>${esc(x.device)}</td>
+          <td><span class="pill ${x.ok ? 'ok' : 'bad'}">${esc(x.ok ? t('完成') : t('失败'))}</span>${x.exitCode ? ` <span class="dim">exit=${esc(x.exitCode)}</span>` : ''}</td>
+          <td class="dim">${esc((x.stdout || x.err || x.stderr || '').slice(0, 200).replace(/\n/g, ' ↵ '))}</td>
+        </tr>`).join('');
+        prog.innerHTML = t('<div class="row" style="align-items:center;gap:10px"><b>{0}</b> <span class="dim">{1}：{2}/{3} 台有结果，其中 {4} 台成功</span>{5}</div>\n      <table><tr><th>{6}</th><th>{7}</th><th>{8}</th></tr>\n      {9}</table>',
+          [esc(v.command), v.done ? t('跑完了') : t('还在跑…'), esc(v.finished), esc(v.total), esc(v.ok),
+           v.done ? '' : ` <span class="pill">${esc(t('每两秒刷新一次'))}</span>`,
+           t('设备'), t('结果'), t('输出（截前 200 字）'), rows]);
+        if (v.done) clearInterval(timer);
+      };
+      await draw();
+      timer = setInterval(draw, 2000);
+    };
+  })();
+  root.appendChild(card);
 }
 function renderBridge(root) {
   skelPage(root, {
