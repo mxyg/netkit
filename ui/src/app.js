@@ -1175,6 +1175,30 @@ function startRunWatch() {
  */
 const BATCH_RUNS = [];   // 本会话起过的批量任务（后端没有列任务的工具，会话内登记是唯一诚实的来路）
 
+/* 面板里每类任务一枚笔划图标：颜色一律 currentColor 跟主题走，
+ * 分类按工具名前缀判 —— 不在表里的回退到清单图标，不猜。 */
+const TK_ICONS = {
+  capture: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="10" r="2.3"/><path d="M4.2 5.6a5.5 5.5 0 0 1 7.6 0"/></svg>',
+  peer: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="3.6" width="7.4" height="5.6" rx="1.2"/><path d="M4.4 12.4h7.2a2.6 2.6 0 0 0 2.6-2.6V6.6"/></svg>',
+  dhcp: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><rect x="2.5" y="3.5" width="11" height="9" rx="1.6"/><path d="M5 7h6M5 9.5h3.6"/></svg>',
+  pulse: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1.8 8.6h2.9l1.5-3.6 2.6 6 1.5-2.4h3.9"/></svg>',
+  thru: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.3h9M9.3 3l2.4 2.3-2.4 2.3"/><path d="M13.5 10.7h-9M6.7 8.4l-2.4 2.3 2.4 2.3"/></svg>',
+  share: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 4.7a1.5 1.5 0 0 1 1.5-1.5h2.4l1.5 1.8h4.7a1.5 1.5 0 0 1 1.5 1.5v4.8a1.5 1.5 0 0 1-1.5 1.5H3.7a1.5 1.5 0 0 1-1.5-1.5z"/></svg>',
+  phone: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><rect x="4.6" y="2.4" width="6.8" height="11.2" rx="1.6"/><path d="M7 11.4h2"/></svg>',
+  batch: '<svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M5.6 4.4h8M5.6 8h8M5.6 11.6h8"/><circle cx="2.7" cy="4.4" r=".9" fill="currentColor" stroke="none"/><circle cx="2.7" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="2.7" cy="11.6" r=".9" fill="currentColor" stroke="none"/></svg>',
+};
+function taskIconFor(tool) {
+  const k = tool.startsWith('net.capture.peer') ? 'peer'
+    : tool.startsWith('net.capture') ? 'capture'
+    : tool.startsWith('net.dhcp') ? 'dhcp'
+    : tool.startsWith('net.quality') ? 'pulse'
+    : tool.startsWith('net.throughput') ? 'thru'
+    : tool.startsWith('net.fileshare') ? 'share'
+    : tool.startsWith('net.portal') ? 'phone'
+    : 'batch';
+  return TK_ICONS[k];
+}
+
 function paintTaskBadge() {
   const btn = document.getElementById('taskbtn');
   if (!btn) return;
@@ -1189,27 +1213,60 @@ function closeTaskPanel() {
 
 async function buildTaskPanel(host) {
   host.innerHTML = '';
+
+  // 头部：标题 + 收起钮
+  const head = document.createElement('div');
+  head.className = 'tk-head';
   const h = document.createElement('h3');
-  h.textContent = t('此刻在跑的长任务');
-  host.append(h);
+  h.textContent = t('任务中心');
+  const x = document.createElement('button');
+  x.type = 'button';
+  x.className = 'tk-x';
+  x.textContent = '×';
+  x.title = t('收起');
+  x.onclick = closeTaskPanel;
+  head.append(h, x);
+  host.appendChild(head);
 
-  if (!runningNow.length && !BATCH_RUNS.length) {
-    host.appendChild($(t('<p class="hint">{0}</p>', [t('此刻没有在跑的。抓包、DHCP、对测口这类开起来就一直在跑的事，都会出现在这里 —— 数据是后端亲口报的，每 5 秒刷一次。')])));
-    return;
-  }
+  const nLive = runningNow.length;
+  const nBatch = BATCH_RUNS.filter((t2) => !t2.done).length;
+  const n = nLive + nBatch;
 
-  // 后端在跑的：去看 / 停。停是 mutate —— 走 call() 的批准框，跟页内停是同一条路。
+  // 重心：一个大数字 —— 此刻有几件事在跑。这个数是后端亲口报的（探针 + 批量进度），
+  // 空闲就画 0，不装忙。右边一颗「再刷一次」：探针本 5 秒一轮，这是手动插队。
+  const hero = document.createElement('div');
+  hero.className = 'tk-hero';
+  const num = document.createElement('div');
+  num.className = 'tk-num' + (n ? '' : ' idle');
+  num.textContent = String(n);
+  const lab = document.createElement('div');
+  lab.className = 'tk-numlabel';
+  lab.textContent = n ? t('项长任务在跑') : t('此刻没有在跑的长任务');
+  const re = document.createElement('button');
+  re.type = 'button';
+  re.className = 'btn sub';
+  re.textContent = t('再刷一次');
+  re.onclick = async () => { re.disabled = true; await refreshRunning(); buildTaskPanel(host); };
+  hero.append(num, lab, re);
+  host.appendChild(hero);
+
+  // 后端在跑的：图标 + 名称 + 所属页，右侧「去看 / 停」。停是 mutate —— 走 call() 的批准框。
   for (const c of runningNow) {
     const row = document.createElement('div');
-    row.className = 'caprow';
-    const chip = document.createElement('span');
-    chip.className = 'runchip';
-    chip.textContent = c.word;
+    row.className = 'tk-row';
+    const ico = document.createElement('span');
+    ico.className = 'tk-ico';
+    ico.innerHTML = taskIconFor(c.tool);
+    const main = document.createElement('div');
+    main.className = 'tk-main';
+    const b = document.createElement('b');
+    b.textContent = c.word;
     const page = PAGES.find((p) => p.id === c.page);
-    const sum = document.createElement('span');
-    sum.className = 'sum';
-    sum.textContent = page ? page.name : c.page;
-    row.append(chip, sum);
+    const sub = document.createElement('span');
+    sub.className = 'tk-sub';
+    sub.textContent = page ? page.name : c.page;
+    main.append(b, sub);
+    row.append(ico, main);
     const go = document.createElement('button');
     go.type = 'button';
     go.className = 'btn sub';
@@ -1219,7 +1276,7 @@ async function buildTaskPanel(host) {
     if (c.stop) {
       const stop = document.createElement('button');
       stop.type = 'button';
-      stop.className = 'btn sub';
+      stop.className = 'btn sub stop';
       stop.textContent = t('停');
       stop.onclick = async () => {
         stop.disabled = true;
@@ -1234,29 +1291,46 @@ async function buildTaskPanel(host) {
     host.appendChild(row);
   }
 
-  // 批量任务：只报进度。后端没有取消工具，这里就不放取消钮 —— 界面不编能力。
+  // 批量任务：真进度条（finished/total 是后端报的），图标行 + 条 + 进度话。
+  // 后端没有取消工具，这里就不放取消钮 —— 界面不编能力。
   if (BATCH_RUNS.length) {
-    const sub = document.createElement('h3');
+    const sub = document.createElement('div');
+    sub.className = 'tk-sec';
     sub.textContent = t('批量任务（这一会话起过的）');
     host.appendChild(sub);
     for (const tsk of BATCH_RUNS) {
       const row = document.createElement('div');
-      row.className = 'caprow';
-      const code = document.createElement('code');
-      code.textContent = tsk.id;
+      row.className = 'tk-row';
+      const ico = document.createElement('span');
+      ico.className = 'tk-ico';
+      ico.innerHTML = TK_ICONS.batch;
+      const main = document.createElement('div');
+      main.className = 'tk-main';
+      const b = document.createElement('b');
+      b.textContent = (tsk.command || tsk.id).slice(0, 44);
+      b.title = tsk.id;
+      const bar = document.createElement('div');
+      bar.className = 'tk-bar';
+      const fill = document.createElement('i');
+      bar.appendChild(fill);
       const sum = document.createElement('span');
-      sum.className = 'sum';
+      sum.className = 'tk-sub';
       try {
         const s = await call('remote.task.status', { task: tsk.id });
         if (s.ok) {
           const v = s.values || {};
           tsk.done = !!v.done;
-          sum.textContent = `${(v.command || '').slice(0, 40)} · ${v.finished ?? 0}/${v.total ?? 0} ${t('台')} · ${v.ok ?? 0} ${t('成功')}${v.done ? '' : ' · ' + t('还在跑…')}`;
+          tsk.command = v.command || tsk.command || '';
+          b.textContent = (tsk.command || tsk.id).slice(0, 44);
+          const fin = v.finished ?? 0, tot = v.total ?? 0;
+          fill.style.width = (tot ? Math.round((fin / tot) * 100) : 0) + '%';
+          sum.textContent = `${fin}/${tot} ${t('台')} · ${v.ok ?? 0} ${t('成功')}${tsk.done ? ' · ' + t('已完成') : ' · ' + t('还在跑…')}`;
         } else {
           sum.textContent = t('进度问不到：') + (s.message || '');
         }
       } catch (_) { sum.textContent = t('进度问不到。'); }
-      row.append(code, sum);
+      main.append(b, bar, sum);
+      row.append(ico, main);
       const go = document.createElement('button');
       go.type = 'button';
       go.className = 'btn sub';
@@ -1267,6 +1341,12 @@ async function buildTaskPanel(host) {
     }
     paintTaskBadge();
   }
+
+  // 底注：滞后说明照写 —— 不装实时。
+  const foot = document.createElement('p');
+  foot.className = 'tk-foot';
+  foot.textContent = t('结果最多滞后 5 秒 —— 以各页自己那块为准。');
+  host.appendChild(foot);
 }
 
 function toggleTaskPanel() {
